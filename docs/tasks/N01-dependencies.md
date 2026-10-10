@@ -1,6 +1,6 @@
 # N01: Compile and pin the graphics/engine tuple
 
-Implementation status: not_started. This card is a plan, not evidence of completion.
+Implementation status: validated (10 October 2026). See `docs/status/PROGRESS.md` for evidence.
 
 - Dependencies: N00.
 - Read: [01-research.md](../01-research.md), [07-build-release.md](../07-build-release.md); [agent workflow](../08-agent-workflow.md).
