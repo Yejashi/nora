@@ -1,6 +1,6 @@
 # N02: Prove fixed-cell text placement
 
-Implementation status: not_started. This card is a plan, not evidence of completion.
+Implementation status: N02a `validated` (headless per-cell tests in `tests/text_placement.rs`, 9/9); N02b not started. This card is a plan, not evidence of completion.
 
 - Dependencies: N01.
 - Read: [05-rendering.md](../05-rendering.md), [11-risks.md](../11-risks.md); [agent workflow](../08-agent-workflow.md).

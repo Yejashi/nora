@@ -4,8 +4,10 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Current state
 
-- Active feature: none.
-- Next task: `N02-text-spike` (earliest ready task after N01 completes; N03 also ready).
+- Active feature: `N02-text-spike`, split into two slices (card allows):
+  - **N02a** — `validated`: headless per-cell shaping/placement tests in `tests/text_placement.rs` (9/9 pass; details below).
+  - **N02b** (not started): offscreen wgpu render of a tiny cell grid via per-cell `TextArea`s, pixel readback + PPM image, ink-clip check, cache strategy/accounting.
+- Next task after N02: `N03-engine-adapter` (also ready).
 - Accepted default: Rust + alacritty_terminal + winit + wgpu; text adapter subject to the N02 gate.
 - Target: Linux native Wayland and X11.
 - Git remote/branch: `origin` = github.com:Yejashi/nora.git, branch `main`, default branch.
@@ -13,6 +15,13 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Completed implementation increments
 
+- **N02a-text-spike (slice 1 of N02)** — status: `validated`.
+  - Committed in this increment; remote-head hash recorded after push verification.
+  - Observable behavior: `tests/text_placement.rs` (9 tests) proves the per-cell model on pinned glyphon 0.12.0 / cosmic-text 0.19.0: one cosmic `Buffer` per cell cluster; cell origins are pure terminal math (`col * cell_w`, `row * cell_h`); narrow and combining clusters ≤ 1 cell (±0.5 px); CJK and Ethiopic clusters within (1, 2] cells with per-cluster provenance pinned to the three test fonts; scales 1.0/1.25/1.5/2.0 scale glyph size but not cell math; unchanged cells keep bit-identical geometry with no re-shape on frame 2; an 80×24 grid (1920 single-cell buffers) shows zero drift (min = max = 12.00 px advance at a 20 px font).
+  - Measured (debug build, this machine): 1920 single-cell shapes in 178.8 ms — the CPU shaping cost the per-cell model pays; presentation cost is the N02b concern.
+  - API discoveries (verified against pinned sources): `FontSystem::new_with_fonts` is not hermetic — cosmic-text calls `db.load_system_fonts()` first, so system faces (DejaVu, …) coexist in the db; family matches resolve to the system-scan copies whose `Source` is `SharedFile(path, _)` (fontdb 0.23), not `Source::File` — provenance checks must handle both arms. A CJK glyph at 20 px (~20 px advance) intentionally overflows one mono cell (~12 px); that overflow motivates the two-cell allocation, it is not a bug.
+  - Pinned test fonts: `/usr/share/fonts/noto/NotoSansMono-Regular.ttf`, `/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc`, `/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf`.
+  - Validation: `cargo fmt --all -- --check` clean; `cargo build` OK; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test` → 15 passed (lib 1, engine 4, font_stack 1, text_placement 9).
 - **N01-dependencies** — status: `validated`.
   - Commit: `chore(deps): pin compatible terminal graphics stack (N01)` on `main`; remote-head hash recorded at the next increment (never fabricate the hash of the commit being authored).
   - Observable behavior: `nora` (no args) opens a native window, prints platform/adapter/surface metadata and stays open until closed; `nora --smoke` runs one automated open (800x600) → resize to 640x480 → minimize → 250 ms settle → close cycle, exiting 0 on success and 1 on startup failure or timeout.
@@ -40,9 +49,9 @@ When recording a task, use: ID; observable behavior; validation commands/results
 
 ## Last verified Git state
 
-- Previous increment N00: commit `c3a6707`, remote `origin/main` = `c3a67072922d357c1ec35025d4c6d68e6aba2fda` (verified via `git ls-remote`).
-- N01: committed in this increment; the remote-head hash is recorded at the next increment after push verification.
+- N00: commit `c3a6707`; N01: commit `a8beb8a` — remote `origin/main` = `a8beb8ae136c7acc997fc24eeea88bffcda9773b` (verified via `git ls-remote` after the N01 push).
+- N02a: committed in this increment; the remote-head hash is recorded at the next increment after push verification.
 
 ## Next action
 
-Read `docs/10-roadmap.md`, then the `N02` task card and only its listed documents/source files; implement the fixed-cell text adapter spike (smallest adapter that draws terminal cells without layout drift).
+Implement N02b: offscreen wgpu render of a tiny cell grid via per-cell `TextArea`s, pixel readback + PPM image, ink-clip check against `TextBounds`, cache strategy/accounting; then close the N02 gate (glyphon raster passes on the pinned tuple).
