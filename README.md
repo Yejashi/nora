@@ -18,7 +18,7 @@ Before implementation, configure the repository's intended Git remote and workin
 
 Use the complete message in [INITIAL_AGENT_PROMPT.md](INITIAL_AGENT_PROMPT.md). The agent should first read [AGENTS.md](AGENTS.md), [the workflow](docs/08-agent-workflow.md), [the status file](docs/status/PROGRESS.md), and the next task card. It should then implement one small increment, validate it, commit it, and push it before taking the next task.
 
-On the Tellico cluster, run it as a single agent from the repository root: `opencode-tellico 0 --solo` (optionally `--think xhigh` for the N01–N04 spikes). The default orchestrate lead cannot run `cargo` or commit, and the roadmap is sequential, so solo is the fit.
+On the Tellico cluster, run it as a single agent from the repository root: `opencode-tellico 0 --solo`, at the default medium thinking; use `/think-xhigh` for an individual hard design or debugging question rather than a whole session. The default orchestrate lead cannot run `cargo` or commit, and the roadmap is sequential, so solo is the fit.
 
 **A completed feature always gets a commit and push.** An authentication or remote failure is a reported blocker, not permission to claim completion or continue piling up unpushed features. Do not force-push.
 
