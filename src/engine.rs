@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{
@@ -33,7 +34,10 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape};
 
 /// Headless terminal engine with ordered event capture.
 pub struct Engine {
-    term: Term<Recorder>,
+    /// Shared term: owned by the engine and, for PTY sessions, also driven
+    /// by the pinned event loop on its own thread (the deliberately
+    /// encapsulated synchronization boundary).
+    term: Arc<FairMutex<Term<Recorder>>>,
     processor: vte::ansi::Processor<vte::ansi::StdSyncHandler>,
     rows: usize,
     cols: usize,
@@ -82,9 +86,10 @@ pub enum EventRecord {
     ChildExit(ExitStatus),
 }
 
-/// Ordered event sink shared between the engine and its owner.
+/// Ordered event sink shared between the engine, its owner, and any PTY
+/// event loop driven against the engine's term.
 #[derive(Clone, Default)]
-struct Recorder {
+pub struct Recorder {
     events: Arc<Mutex<Vec<EventRecord>>>,
 }
 
@@ -203,8 +208,9 @@ impl Engine {
         };
         let size = Size { rows, cols };
         let recorder = Recorder::default();
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, recorder.clone())));
         Self {
-            term: Term::new(config, &size, recorder.clone()),
+            term,
             processor: vte::ansi::Processor::<vte::ansi::StdSyncHandler>::new(),
             rows,
             cols,
@@ -222,26 +228,42 @@ impl Engine {
         self.cols
     }
 
+    /// The shared term handle: for PTY sessions the pinned event loop
+    /// drives the same [`Term`] on its own thread (the deliberately
+    /// encapsulated synchronization boundary).
+    pub fn term_handle(&self) -> Arc<FairMutex<Term<Recorder>>> {
+        Arc::clone(&self.term)
+    }
+
+    /// A clone of the shared recorder, so an event loop driven against
+    /// this engine's term appends its events to the same ordered stream
+    /// as the engine's own events.
+    pub fn recorder(&self) -> Recorder {
+        self.recorder.clone()
+    }
+
     /// Feed raw PTY bytes into the engine, preserving parser state.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.processor.advance(&mut self.term, bytes);
+        let mut term = self.term.lock();
+        self.processor.advance(&mut *term, bytes);
     }
 
     /// Current terminal modes.
     pub fn modes(&self) -> TermMode {
-        *self.term.mode()
+        *self.term.lock().mode()
     }
 
     /// Cursor position in viewport coordinates (0-based row, column).
     pub fn cursor(&self) -> Option<(usize, usize)> {
-        let point = self.term.grid().cursor.point;
+        let point = self.term.lock().grid().cursor.point;
         // Zero scrollback: display_offset is always 0.
         point_to_viewport(0, point).map(|p| (p.line, p.column.0))
     }
 
     /// Take one owned snapshot of the screen, consuming one damage report.
     pub fn snapshot(&mut self) -> Snapshot {
-        let damage = self.term.damage();
+        let mut term = self.term.lock();
+        let damage = term.damage();
         let damage = match damage {
             TermDamage::Full => Damage::Full,
             TermDamage::Partial(lines) => Damage::Partial(
@@ -255,7 +277,7 @@ impl Engine {
             ),
         };
 
-        let content = self.term.renderable_content();
+        let content = term.renderable_content();
         let cells: Vec<CellText> = content
             .display_iter
             .map(|cell| {
@@ -284,7 +306,7 @@ impl Engine {
             colors: *content.colors,
             damage,
         };
-        self.term.reset_damage();
+        term.reset_damage();
         snapshot
     }
 
@@ -296,6 +318,17 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         events.clone()
+    }
+
+    /// Atomically take all events captured so far, in arrival order,
+    /// leaving the recorder empty.
+    pub fn drain_events(&self) -> Vec<EventRecord> {
+        let mut events = self
+            .recorder
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut events)
     }
 
     /// PTY reply bytes (DSR and similar queries) in arrival order.

@@ -3,11 +3,13 @@
 //! N04a introduced [`io::BoundedWriter`], a byte-budgeted pending-write
 //! queue that caps queued application and parser-reply bytes and returns
 //! capacity as writes complete. N04b adds [`Session`]: a headless session
-//! pairing the N03 [`crate::engine::Engine`] with that writer.
+//! pairing the N03 [`crate::engine::Engine`] with that writer. N05a adds
+//! [`pty::PtySession`]: the same bounded outbound I/O over a real PTY
+//! child whose output drives the engine through the pinned event loop.
 //!
-//! The session is headless: parser replies are produced synchronously by
-//! the parser inside [`Session::feed`] and enqueued in the same call, so
-//! replies never block under the engine lock — by construction.
+//! The headless session is synchronous: parser replies are produced
+//! inside [`Session::feed`] and enqueued in the same call, so replies
+//! never block under the engine lock — by construction.
 
 use std::collections::VecDeque;
 
@@ -16,6 +18,9 @@ use crate::engine::Engine;
 use io::{BoundedWriter, WriterConfig, WriterError};
 
 pub mod io;
+pub mod pty;
+
+pub use pty::{LaunchSpec, PtyError, PtySession, SessionEvent, SessionId};
 
 /// Reply-byte accounting for one parser turn ([`Session::feed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +32,7 @@ pub struct FeedResult {
     pub replies_rejected: usize,
 }
 
-/// One enqueued run tracked by [`Session`], in writer-queue order.
+/// One enqueued run tracked by a session, in writer-queue order.
 struct Run {
     /// Whether the run occupies the reply carve-out.
     reply: bool,
@@ -35,28 +40,112 @@ struct Run {
     len: usize,
 }
 
-/// A headless terminal session: N03 [`Engine`] + N04a [`BoundedWriter`].
+/// Shared reply-acceptance ledger for [`Session`] and [`pty::PtySession`].
 ///
-/// [`Session::feed`] runs one parser turn and then drains every event the
-/// turn produced: parser replies are enqueued in order and non-reply
-/// events are consumed and discarded (UI routing is a later card).
-///
-/// Replies are accepted atomically: a reply is enqueued only if it fits
-/// wholly in the remaining reply headroom, otherwise it is rejected in
-/// full and shown in [`FeedResult`]. The session mirrors the writer's
-/// reply capacity (the writer does not expose per-kind headroom) so that
-/// capacity completed by [`Session::flush`] becomes available to later
-/// replies in the same turn order.
-pub struct Session {
-    engine: Engine,
-    writer: BoundedWriter,
+/// [`BoundedWriter`] is byte-granular and exposes no per-kind headroom, so
+/// the ledger mirrors the strict reply carve-out: a reply is accepted only
+/// if it fits wholly in the remaining headroom (otherwise rejected in
+/// full — never split mid-stream), accepted bytes are tracked per run, and
+/// bytes completed by `flush` are credited back per kind. Rejections are
+/// counted (visible, never silent).
+struct ReplyLedger {
     /// `min(reserved_bytes, max_bytes)`, the strict reply carve-out.
-    reply_budget: usize,
+    budget: usize,
     /// Reply bytes currently queued in the writer.
-    queued_replies: usize,
+    queued: usize,
     /// Kind-tagged mirror of the writer queue (oldest first), used to
     /// account completed bytes per kind.
     runs: VecDeque<Run>,
+    /// Total reply bytes rejected (budget full or writer closed).
+    rejected: usize,
+}
+
+impl ReplyLedger {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            queued: 0,
+            runs: VecDeque::new(),
+            rejected: 0,
+        }
+    }
+
+    /// Reply bytes still available to new replies.
+    fn headroom(&self) -> usize {
+        self.budget - self.queued
+    }
+
+    /// Accept one reply atomically against `writer`; returns the accepted
+    /// byte count (rejections accumulate in the ledger).
+    fn accept(&mut self, writer: &mut BoundedWriter, reply: &str) -> usize {
+        let accepted = if reply.len() <= self.headroom() {
+            // Fits wholly; the strict carve-out guarantees the writer
+            // accepts all of it (0 only when closed).
+            match writer.enqueue_reply(reply.as_bytes()) {
+                Ok(n) => n,
+                Err(WriterError::Closed) => 0,
+                // Sink errors surface in `flush` only.
+                Err(WriterError::Io(_)) => 0,
+            }
+        } else {
+            // Atomic: reject the whole reply rather than enqueue a
+            // fragment the protocol stream could not complete.
+            0
+        };
+        if accepted > 0 {
+            self.queued += accepted;
+            self.runs.push_back(Run {
+                reply: true,
+                len: accepted,
+            });
+        }
+        self.rejected += reply.len() - accepted;
+        accepted
+    }
+
+    /// Record an accepted application run (it does not occupy the
+    /// carve-out, but it occupies the writer queue).
+    fn track_app(&mut self, len: usize) {
+        self.runs.push_back(Run { reply: false, len });
+    }
+
+    /// Release `completed` bytes from the head of the tracked runs,
+    /// crediting the reply headroom for any reply bytes completed.
+    fn complete(&mut self, mut completed: usize) {
+        while completed > 0 {
+            let run = self
+                .runs
+                .front_mut()
+                .expect("completed bytes were enqueued first");
+            let take = run.len.min(completed);
+            if run.reply {
+                self.queued -= take;
+            }
+            run.len -= take;
+            completed -= take;
+            if run.len == 0 {
+                self.runs.pop_front();
+            }
+        }
+    }
+
+    /// Drop all tracked state (the writer was cancelled).
+    fn release(&mut self) {
+        self.runs.clear();
+        self.queued = 0;
+    }
+}
+
+/// A headless terminal session: N03 [`Engine`] + N04a [`BoundedWriter`].
+///
+/// [`Session::feed`] runs one parser turn and then drains every event the
+/// turn produced: parser replies are accepted atomically through the
+/// shared [`ReplyLedger`] and non-reply events are consumed and discarded
+/// (UI routing is a later card).
+pub struct Session {
+    engine: Engine,
+    writer: BoundedWriter,
+    ledger: ReplyLedger,
 }
 
 impl Session {
@@ -66,9 +155,7 @@ impl Session {
         Self {
             engine: Engine::new(rows, cols),
             writer: BoundedWriter::new(cap),
-            reply_budget: cap.reserved_bytes.min(cap.max_bytes),
-            queued_replies: 0,
-            runs: VecDeque::new(),
+            ledger: ReplyLedger::new(cap.reserved_bytes.min(cap.max_bytes)),
         }
     }
 
@@ -76,8 +163,8 @@ impl Session {
     /// turn produced, in order. Returns this turn's reply accounting.
     pub fn feed(&mut self, bytes: &[u8]) -> FeedResult {
         self.engine.feed(bytes);
+        let rejected_before = self.ledger.rejected;
         let mut enqueued = 0;
-        let mut rejected = 0;
         // `Engine::replies` accumulates (does not consume), so the drain
         // is: process everything captured since the last turn, clear the
         // recorder, and re-check until nothing is pending.
@@ -87,35 +174,13 @@ impl Session {
                 break;
             }
             for reply in pending {
-                let accepted = if reply.len() <= self.reply_headroom() {
-                    // Fits wholly; the strict carve-out guarantees the
-                    // writer accepts all of it (0 only when closed).
-                    match self.writer.enqueue_reply(reply.as_bytes()) {
-                        Ok(n) => n,
-                        Err(WriterError::Closed) => 0,
-                        // Sink errors surface in `flush` only.
-                        Err(WriterError::Io(_)) => 0,
-                    }
-                } else {
-                    // Atomic: reject the whole reply rather than enqueue
-                    // a fragment the protocol stream could not complete.
-                    0
-                };
-                if accepted > 0 {
-                    self.queued_replies += accepted;
-                    self.runs.push_back(Run {
-                        reply: true,
-                        len: accepted,
-                    });
-                }
-                enqueued += accepted;
-                rejected += reply.len() - accepted;
+                enqueued += self.ledger.accept(&mut self.writer, &reply);
             }
             self.engine.clear_events();
         }
         FeedResult {
             replies_enqueued: enqueued,
-            replies_rejected: rejected,
+            replies_rejected: self.ledger.rejected - rejected_before,
         }
     }
 
@@ -132,7 +197,7 @@ impl Session {
         limit: usize,
     ) -> Result<usize, WriterError> {
         let completed = self.writer.flush(sink, limit)?;
-        self.complete(completed);
+        self.ledger.complete(completed);
         Ok(completed)
     }
 
@@ -140,33 +205,7 @@ impl Session {
     /// returns the bytes released (0 on subsequent calls).
     pub fn close(&mut self) -> usize {
         let released = self.writer.cancel();
-        self.runs.clear();
-        self.queued_replies = 0;
+        self.ledger.release();
         released
-    }
-
-    /// Reply bytes still available to new replies.
-    fn reply_headroom(&self) -> usize {
-        self.reply_budget - self.queued_replies
-    }
-
-    /// Release `completed` bytes from the head of the tracked runs,
-    /// crediting the reply headroom for any reply bytes completed.
-    fn complete(&mut self, mut completed: usize) {
-        while completed > 0 {
-            let run = self
-                .runs
-                .front_mut()
-                .expect("completed bytes were enqueued first");
-            let take = run.len.min(completed);
-            if run.reply {
-                self.queued_replies -= take;
-            }
-            run.len -= take;
-            completed -= take;
-            if run.len == 0 {
-                self.runs.pop_front();
-            }
-        }
     }
 }
