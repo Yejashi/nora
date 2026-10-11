@@ -4,14 +4,59 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Current state
 
-- Last completed feature: `N02-text-spike` — both slices `validated` (N02a: headless per-cell shaping/placement in `tests/text_placement.rs`, 9/9; N02b: offscreen wgpu render of a cell grid via per-cell `TextArea`s in `tests/text_render.rs`, 1/1). N02 gate closed: the per-cell glyphon adapter is accepted on the pinned tuple; no ADR required.
-- Active feature: `N03-engine-adapter` (single increment, card acceptance in full):
-  - `src/lib.rs` (new lib target) + `src/engine.rs`: `Engine` adapter — `Engine::new(rows, cols)` (headless, no scrollback: `total_lines == rows`), `feed` (one long-lived `vte::ansi::Processor` → parser state preserved across chunks), `modes()`, `cursor()`, owned `snapshot()` (consumes `TermDamage`), ordered `Recorder` sink (`EventListener` → owned `EventRecord`; PTY replies = `Event::PtyWrite`).
-  - `tests/engine_adapter.rs`: replay fixtures — overwrite/CUP, wrap, SGR flags+color, alternate screen (?1049) isolation+restore, UTF-8 split invariance at every byte boundary, split escape sequences, ordered replies (DSR, OSC title), seeded random chunking vs single-feed baseline.
-  - Compatibility status matrix → `docs/06-compatibility.md` ("Compatibility matrix to maintain" table).
-  - Decisions: `Engine` owns `Term` directly; the `FairMutex` boundary arrives with the session worker (architecture: `session` owns engine sync). Snapshots carry pinned value types (`TermMode`, `Flags`, `vte` `Color`) by copy — the documented sync boundary.
-  - Status: checks green, uncommitted (tree: uncommitted). Round 1 reported by both workers: worker-1 — `cargo fmt` clean after one reflow of the `Config` literal in `src/engine.rs`; clippy `-D warnings`, build OK, `cargo test` 24/24 (new `tests/engine_adapter.rs` 8/8). worker-0 — N04 readiness spike: PTY→loop path is an internal unbounded mpsc (`Msg::Input/Resize/Shutdown`); pending writes sit in a private unbounded `State::write_list` with private `Writing` progress (no public accessors); no per-byte drain acks and no write-side byte caps exist (read-side caps only: `READ_BUFFER_SIZE`, `MAX_LOCKED_READ`); `Notify::notify` is fire-and-forget; PTY I/O errors kill the loop silently (`event_loop.rs:299`) so the `spawn` `JoinHandle` resolving is the loop-death signal; child exit arrives as `Event::ChildExit(ExitStatus)`; `Pty::Drop` SIGHUPs and waits (shutdown serviceable); `tty::EventedPty` is public (fake-pty capable) and `Pty::from_fd` takes arbitrary child fds. N04 must self-reserve write bytes (un-acked until `ChildExit`/loop death) and bound sends with its own in-flight ticket.
-  - Round 2 (dispatched): worker-1 — commit brief: rerun full check set, stage exactly the N03 files + `docs/status/PROGRESS.md` + `docs/06-compatibility.md`, commit, push, verify. worker-0 — independent read-only review of the N03 diff (correctness, bounds, rule compliance).
+- Last completed feature: `N03-engine-adapter` — `validated`, commit `9cdb72a`, push verified (`origin/main` = `9cdb72a` via `git ls-remote`).
+- Active feature: `N04-bounded-io` (card slices: readiness spike → N04a byte reservation/pending writer → N04b parser callback + shutdown recovery):
+  - Spike (done, worker-0, pinned alacritty_terminal 0.26.0 sources): PTY→loop path is an internal unbounded mpsc (`Msg::Input/Resize/Shutdown`); pending writes in a private unbounded `State::write_list`, private `Writing` progress — no public accessors; no per-byte drain acks and no write-side byte caps (read-side caps only: `READ_BUFFER_SIZE`, `MAX_LOCKED_READ`); `Notify::notify` fire-and-forget; PTY I/O errors kill the loop silently (`event_loop.rs:299`) → the `spawn` `JoinHandle` resolving is the loop-death signal; child exit = `Event::ChildExit(ExitStatus)`; `Pty::Drop` SIGHUPs + waits (shutdown serviceable); `tty::EventedPty` public (fake-pty capable), `Pty::from_fd` takes arbitrary child fds. Conclusion: nora drives its own bounded writer over the PTY (architecture §Bounded I/O: `session/io.rs`); reservation released on sink completion / cancel / exit.
+  - N04a (reported green; commit round in progress): `src/session/io.rs` — `BoundedWriter` (one ordered queue of kind-tagged chunks, budgets computed once in `new`, one sink call per `flush` over a scratch buffer bounded by `max_bytes`, sink `Err` keeps all attempted bytes queued) + `src/lib.rs` wires `pub mod session;`. `tests/session_writer.rs` 9/9. Check set green: fmt/clippy(-D warnings)/build clean, `cargo test` 33/33. Lead reconciled one fixture slip (strict carve-out formula kept; tests 4–6 `max_bytes` 10→12). Note: `WriterError` carries a manual `PartialEq` (variant equality) — public API identical to the fixed signatures. Commit round: worker-1 (cargo + git), worker-0 read-only spike of the pinned engine's reply-producing sequences for N04b fixtures.
+  - N04a shared signatures (lead decision, verbatim in both briefs):
+    ```rust
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WriterConfig {
+        /// Caps all queued bytes (app + reply).
+        pub max_bytes: usize,
+        /// Strict carve-out of `max_bytes` that only reply bytes may occupy.
+        /// Effective reply budget = min(reserved_bytes, max_bytes); the app
+        /// budget is the rest, so a large paste never starves replies.
+        pub reserved_bytes: usize,
+    }
+
+    #[derive(Debug, PartialEq)]
+    pub enum WriterError {
+        /// The writer has been closed (cancel/shutdown).
+        Closed,
+        /// Terminal sink error.
+        Io(std::io::Error),
+    }
+
+    /// Bounded, ordered pending-write queue with a strict reply carve-out.
+    pub struct BoundedWriter { /* private fields */ }
+
+    impl BoundedWriter {
+        pub fn new(cap: WriterConfig) -> Self;
+        /// Accept ordered application bytes. Returns bytes accepted
+        /// (0..=bytes.len(), possibly partial; 0 when the app budget is
+        /// full). Accepted bytes are never dropped. Err(Closed) if closed.
+        pub fn enqueue(&mut self, bytes: &[u8]) -> Result<usize, WriterError>;
+        /// Accept ordered parser/control reply bytes from the reserved
+        /// budget. Same return semantics as `enqueue`.
+        pub fn enqueue_reply(&mut self, bytes: &[u8]) -> Result<usize, WriterError>;
+        /// Send up to `limit` queued bytes, oldest first, to `sink` in one
+        /// call. `sink` returns the bytes it completed; the un-completed
+        /// remainder stays queued at the head, in order. Returns bytes
+        /// completed. A sink error keeps all attempted bytes queued and
+        /// propagates as `Err(Io)`. Err(Closed) if closed.
+        pub fn flush<F: FnMut(&[u8]) -> std::io::Result<usize>>(&mut self, sink: &mut F, limit: usize)
+            -> Result<usize, WriterError>;
+        /// Bytes still reserved (queued app + reply). Always ≤ `max_bytes`.
+        pub fn outstanding(&self) -> usize;
+        /// Discard all queued bytes, release all capacity, close the writer.
+        /// Idempotent: returns bytes released (0 on second call).
+        pub fn cancel(&mut self) -> usize;
+    }
+    ```
+  - N04a acceptance: fake blocked writer never exceeds the declared cap; capacity returned on write completion / cancel / exit; ordering preserved across partial writes and WouldBlock; reply carve-out prevents reply starvation; shutdown serviceable; no unbounded downstream queue.
+  - N04b (next round): `src/session/mod.rs` gains headless `Session { engine: Engine, writer: BoundedWriter }` (PTY arrives with N05): `Session::new(rows, cols, WriterConfig)`, `feed(&mut self, &[u8]) -> FeedResult { replies_enqueued: usize, replies_rejected: usize }` (one parser turn: engine feed, then drain ordered `EventRecord::PtyWrite` replies into `enqueue_reply`; visible rejection when the reply budget is exhausted), `outstanding()`, `close() -> usize` (idempotent, releases everything; later feeds reject replies as closed). Tests: `tests/session_bounded.rs` (query flood at a small reserved budget, reply ordering, shutdown with pending bytes).
+  - Test file layout (lead decision): `tests/session_writer.rs` (N04a), `tests/session_bounded.rs` (N04b).
 - Accepted default: Rust + alacritty_terminal + winit + wgpu; text adapter subject to the N02 gate.
 - Target: Linux native Wayland and X11.
 - Git remote/branch: `origin` = github.com:Yejashi/nora.git, branch `main`, default branch.
@@ -19,6 +64,13 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Completed implementation increments
 
+- **N03-engine-adapter** — status: `validated`.
+  - Commit `9cdb72a` ("feat(engine): add headless terminal adapter and replay tests (N03)"); remote `origin/main` = `9cdb72a273782e372d3671ed4d4de421ed63007d` verified via `git ls-remote` after push.
+  - Observable behavior: `nora` lib target exposes `engine::Engine` — headless adapter over pinned alacritty_terminal 0.26.0: `Engine::new(rows, cols)` (zero scrollback: `total_lines == rows`), `feed` (one long-lived `vte::ansi::Processor`; parser state preserved across chunks), `modes()`, `cursor()`, owned `snapshot()` consuming exactly one `TermDamage` report (first is `Damage::Full`), ordered `Recorder` sink (`EventListener` → owned `EventRecord`; PTY replies = `EventRecord::PtyWrite`) exposed via `events()`/`replies()`/`clear_events()`.
+  - `tests/engine_adapter.rs` (8 tests): overwrite/CUP preserving other cells; pending wrap; SGR flags+colors until reset; ?1049 alternate-screen isolation and byte-exact restore; UTF-8 split invariance at every byte boundary (18-byte stream, 17 split points) and split escape sequence; ordered DSR/OSC-title reply capture; seeded SplitMix64 random chunking (64 runs, chunks 1–5) vs single-feed baseline.
+  - Validation (worker-1, rerun in commit round): `cargo fmt --all -- --check` clean (one `Config` literal reflow in `src/engine.rs`); `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo build` OK; `cargo test` 24/24.
+  - Independent review (worker-0): pass, 3 minor notes — `Snapshot::eq` excludes `colors` (palette changes invisible to snapshot equality; no fixture feeds palette changes); the wrap fixture is single-feed (cross-feed pending-wrap covered incidentally by random chunking); a no-op `snapshot()` reports `Partial` including the cursor cell (the pinned engine damages the cursor cell unconditionally, `term/mod.rs:479`) — keep in mind for N04+ damage coalescing.
+  - Compatibility: engine-level evidence rows recorded in `docs/06-compatibility.md` (Text/UTF-8, cursor/erase/style, screens, queries — engine semantics only; PTY-level proof pending N04+).
 - **N02b-text-spike (slice 2 of N02)** — status: `validated`; committed in this increment, remote head verified after push.
   - Observable behavior: `tests/text_render.rs` (1 test) renders a 5×2 cell grid (60×48 px, pure-black background) on the pinned tuple to a plain offscreen wgpu texture (no surface — headless via `InstanceDescriptor::new_without_display_handle`; wgpu 30 has no offscreen surface for this use), one cosmic `Buffer` per cell cluster and one `TextArea` per cell with `bounds` = the cell allocation: narrow `A`, combining `e\u{301}`, wide CJK `你` (span 2), box drawing `─` (span 1), Ethiopic `ᴀ`-class `ሀ` (span 2) via the pinned mono/CJK/Ethiopic faces. Every inked pixel lies inside its cell allocation (no column drift between terminal math and shaped geometry); PPM written to `/tmp/opencode/n02b_grid.ppm`.
   - Cache strategy (executable proof; replaces the initial SwashCache check): glyphon 0.12's `prepare` rasterizes misses via `SwashCache::get_image_uncached` and never writes `SwashCache.image_cache` — the persistent cache is `TextAtlas`' per-content `glyph_cache` (pub(crate), unbounded `LruCache` protected by `glyphs_in_use`), and the hit path (`GpuCacheStatus::InAtlas`) skips rasterization entirely. Proof: frame 3 re-renders the unchanged cells through a hermetic faceless `FontSystem` (`new_with_locale_and_db_and_fallback` with an empty `fontdb::Database`) — a miss would need to resolve a face and none exists, so the glyph would drop; frames 2 and 3 are both pixel-identical to frame 1, so every steady-state glyph was served from the atlas cache.
@@ -52,7 +104,7 @@ When recording a task, use: ID; observable behavior; validation commands/results
 
 ## Blockers and limitations
 
-- No terminal content rendered yet; the text adapter was proven at N02, the engine adapter arrives at N03.
+- No terminal content rendered yet (rendering arrives at N08+); headless engine adapter pushed at N03.
 - Native X11 evidence pending (no X11 session in this environment).
 - End-to-end session write/event limits not implemented.
 - No performance evidence yet.
@@ -62,7 +114,8 @@ When recording a task, use: ID; observable behavior; validation commands/results
 - N00: commit `c3a6707`; N01: commit `a8beb8a` — remote `origin/main` = `a8beb8ae136c7acc997fc24eeea88bffcda9773b` (verified via `git ls-remote` after the N01 push).
 - N02a: commit `402594a`; remote `origin/main` = `402594a2af5d4ca7d8d8f1c6944b0f901fe9c230` (verified via `git ls-remote` after the push).
 - N02b: commit `a4fc206`; remote `origin/main` = `a4fc206e11436354f626003c173b2de7b9c446d0` (verified via `git ls-remote` after the N02b push).
+- N03: commit `9cdb72a`; remote `origin/main` = `9cdb72a273782e372d3671ed4d4de421ed63007d` (verified via `git ls-remote` after the N03 push).
 
 ## Next action
 
-Implement N03-engine-adapter: read `docs/tasks/N03-engine-adapter.md` first; slice the terminal engine adapter (alacritty_terminal → renderable cell state, terminal state kept out of GPU/platform modules).
+N04-bounded-io: N04a Round 3 in flight (see Active feature): worker-1 implements `src/session/io.rs` + integrates + runs the full check set; worker-0 writes `tests/session_writer.rs` against the fixed signatures. Integration → commit round (`feat(session): add bounded pending writer (N04a)`) → N04b.
