@@ -1,6 +1,6 @@
 # Incremental agent workflow
 
-The implementation agent has a 128k context window. Treat that as a ceiling, not a preload target. Small features, selective reads and durable state are required by the owner.
+The implementation agent has a 128k context window. Treat that as a ceiling, not a preload target. Small features, selective reads and durable state are required by the owner. When the session is an `orchestrate-tellico` lead with two node-pinned workers, the lead keeps its own window for planning and integration and spends the workers' windows on reading, implementation and checks; see `AGENTS.md`, "Parallel work with orchestrate-tellico".
 
 ## Session entry
 

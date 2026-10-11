@@ -15,7 +15,7 @@ All cards begin unimplemented. Follow dependencies; do not jump into extensions 
 | Kitty-style graphics | N32–N34 | Engine hook gate, bounded subset, capability-by-capability expansion |
 | Other later features | N35–N36 | Opt-in shell integration; owner-selected future platform work |
 
-N02 and N03 may be tackled in either order after N01, but a single agent still completes and pushes one increment before starting another. The table is not an instruction to spawn other agents. N35 is independent of graphics once v0.1 is assessed. N36 is a planning placeholder until a specific future goal is selected.
+N02 and N03 may be tackled in either order after N01, but one increment is completed and pushed before the next card opens. In an `orchestrate-tellico` session the lead may run two workers in parallel inside one card under the rules in `AGENTS.md` ("Parallel work with orchestrate-tellico"); the table is never a license to implement two cards at once. N35 is independent of graphics once v0.1 is assessed. N36 is a planning placeholder until a specific future goal is selected.
 
 If a gate fails, record evidence and resolve the smallest blocking dependency/ADR before continuing downstream work. If a large card needs slices, add Nxxa/Nxxb to progress with explicit acceptance and dependency; never use the card's broad scope as an excuse for a giant change.
 
