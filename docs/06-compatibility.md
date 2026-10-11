@@ -22,6 +22,8 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | IME | Preedit UI and one commit; proper candidate area | Native tests and event replay |
 | Graphics | Explicitly unsupported in v0.1 | No positive support claim; bounded ignore/recovery |
 
+**Engine-level evidence so far (headless, N03).** The following rows have passing fixtures in `tests/engine_adapter.rs`: Text/UTF-8 — whole/split (every byte boundary) and seeded random-chunk replay; Cursor/erase/style — overwrite/CUP, pending wrap, SGR flags+colors until reset; Screens/scrolling — ?1049 alternate-screen isolation and restore; Queries — DSR and OSC-title replies captured in order via `Recorder`. These prove engine semantics only; PTY-level proof (exact reply bytes/timeouts, TUI runs) and all other rows remain open until N04+. Full per-row status tracking starts at N04 in `docs/status/COMPATIBILITY.md`.
+
 When an upstream capability fails, isolate an adapter bug from engine limitations. Fix integration first. Engine patches require a pinned diff, tests and reconciliation notes.
 
 ## Streaming and replies

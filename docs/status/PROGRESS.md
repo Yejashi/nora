@@ -5,7 +5,13 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 ## Current state
 
 - Last completed feature: `N02-text-spike` — both slices `validated` (N02a: headless per-cell shaping/placement in `tests/text_placement.rs`, 9/9; N02b: offscreen wgpu render of a cell grid via per-cell `TextArea`s in `tests/text_render.rs`, 1/1). N02 gate closed: the per-cell glyphon adapter is accepted on the pinned tuple; no ADR required.
-- Next task: `N03-engine-adapter` (also ready).
+- Active feature: `N03-engine-adapter` (single increment, card acceptance in full):
+  - `src/lib.rs` (new lib target) + `src/engine.rs`: `Engine` adapter — `Engine::new(rows, cols)` (headless, no scrollback: `total_lines == rows`), `feed` (one long-lived `vte::ansi::Processor` → parser state preserved across chunks), `modes()`, `cursor()`, owned `snapshot()` (consumes `TermDamage`), ordered `Recorder` sink (`EventListener` → owned `EventRecord`; PTY replies = `Event::PtyWrite`).
+  - `tests/engine_adapter.rs`: replay fixtures — overwrite/CUP, wrap, SGR flags+color, alternate screen (?1049) isolation+restore, UTF-8 split invariance at every byte boundary, split escape sequences, ordered replies (DSR, OSC title), seeded random chunking vs single-feed baseline.
+  - Compatibility status matrix → `docs/06-compatibility.md` ("Compatibility matrix to maintain" table).
+  - Decisions: `Engine` owns `Term` directly; the `FairMutex` boundary arrives with the session worker (architecture: `session` owns engine sync). Snapshots carry pinned value types (`TermMode`, `Flags`, `vte` `Color`) by copy — the documented sync boundary.
+  - Status: checks green, uncommitted (tree: uncommitted). Round 1 reported by both workers: worker-1 — `cargo fmt` clean after one reflow of the `Config` literal in `src/engine.rs`; clippy `-D warnings`, build OK, `cargo test` 24/24 (new `tests/engine_adapter.rs` 8/8). worker-0 — N04 readiness spike: PTY→loop path is an internal unbounded mpsc (`Msg::Input/Resize/Shutdown`); pending writes sit in a private unbounded `State::write_list` with private `Writing` progress (no public accessors); no per-byte drain acks and no write-side byte caps exist (read-side caps only: `READ_BUFFER_SIZE`, `MAX_LOCKED_READ`); `Notify::notify` is fire-and-forget; PTY I/O errors kill the loop silently (`event_loop.rs:299`) so the `spawn` `JoinHandle` resolving is the loop-death signal; child exit arrives as `Event::ChildExit(ExitStatus)`; `Pty::Drop` SIGHUPs and waits (shutdown serviceable); `tty::EventedPty` is public (fake-pty capable) and `Pty::from_fd` takes arbitrary child fds. N04 must self-reserve write bytes (un-acked until `ChildExit`/loop death) and bound sends with its own in-flight ticket.
+  - Round 2 (dispatched): worker-1 — commit brief: rerun full check set, stage exactly the N03 files + `docs/status/PROGRESS.md` + `docs/06-compatibility.md`, commit, push, verify. worker-0 — independent read-only review of the N03 diff (correctness, bounds, rule compliance).
 - Accepted default: Rust + alacritty_terminal + winit + wgpu; text adapter subject to the N02 gate.
 - Target: Linux native Wayland and X11.
 - Git remote/branch: `origin` = github.com:Yejashi/nora.git, branch `main`, default branch.
@@ -55,7 +61,7 @@ When recording a task, use: ID; observable behavior; validation commands/results
 
 - N00: commit `c3a6707`; N01: commit `a8beb8a` — remote `origin/main` = `a8beb8ae136c7acc997fc24eeea88bffcda9773b` (verified via `git ls-remote` after the N01 push).
 - N02a: commit `402594a`; remote `origin/main` = `402594a2af5d4ca7d8d8f1c6944b0f901fe9c230` (verified via `git ls-remote` after the push).
-- N02b: committed in this increment; the remote-head hash is verified after the push.
+- N02b: commit `a4fc206`; remote `origin/main` = `a4fc206e11436354f626003c173b2de7b9c446d0` (verified via `git ls-remote` after the N02b push).
 
 ## Next action
 
