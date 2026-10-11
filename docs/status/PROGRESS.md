@@ -4,7 +4,7 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Current state
 
-- Last completed feature: `N03-engine-adapter` — `validated`, commit `9cdb72a`, push verified (`origin/main` = `9cdb72a` via `git ls-remote`).
+- Last completed feature: `N04a-bounded-writer` (slice 1 of N04) — `validated`, commit `10f47ae`, push verified.
 - Active feature: `N04-bounded-io` (card slices: readiness spike → N04a byte reservation/pending writer → N04b parser callback + shutdown recovery):
   - Spike (done, worker-0, pinned alacritty_terminal 0.26.0 sources): PTY→loop path is an internal unbounded mpsc (`Msg::Input/Resize/Shutdown`); pending writes in a private unbounded `State::write_list`, private `Writing` progress — no public accessors; no per-byte drain acks and no write-side byte caps (read-side caps only: `READ_BUFFER_SIZE`, `MAX_LOCKED_READ`); `Notify::notify` fire-and-forget; PTY I/O errors kill the loop silently (`event_loop.rs:299`) → the `spawn` `JoinHandle` resolving is the loop-death signal; child exit = `Event::ChildExit(ExitStatus)`; `Pty::Drop` SIGHUPs + waits (shutdown serviceable); `tty::EventedPty` public (fake-pty capable), `Pty::from_fd` takes arbitrary child fds. Conclusion: nora drives its own bounded writer over the PTY (architecture §Bounded I/O: `session/io.rs`); reservation released on sink completion / cancel / exit.
   - N04a (reported green; commit round in progress): `src/session/io.rs` — `BoundedWriter` (one ordered queue of kind-tagged chunks, budgets computed once in `new`, one sink call per `flush` over a scratch buffer bounded by `max_bytes`, sink `Err` keeps all attempted bytes queued) + `src/lib.rs` wires `pub mod session;`. `tests/session_writer.rs` 9/9. Check set green: fmt/clippy(-D warnings)/build clean, `cargo test` 33/33. Lead reconciled one fixture slip (strict carve-out formula kept; tests 4–6 `max_bytes` 10→12). Note: `WriterError` carries a manual `PartialEq` (variant equality) — public API identical to the fixed signatures. Commit round: worker-1 (cargo + git), worker-0 read-only spike of the pinned engine's reply-producing sequences for N04b fixtures.
@@ -55,7 +55,28 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
     }
     ```
   - N04a acceptance: fake blocked writer never exceeds the declared cap; capacity returned on write completion / cancel / exit; ordering preserved across partial writes and WouldBlock; reply carve-out prevents reply starvation; shutdown serviceable; no unbounded downstream queue.
-  - N04b (next round): `src/session/mod.rs` gains headless `Session { engine: Engine, writer: BoundedWriter }` (PTY arrives with N05): `Session::new(rows, cols, WriterConfig)`, `feed(&mut self, &[u8]) -> FeedResult { replies_enqueued: usize, replies_rejected: usize }` (one parser turn: engine feed, then drain ordered `EventRecord::PtyWrite` replies into `enqueue_reply`; visible rejection when the reply budget is exhausted), `outstanding()`, `close() -> usize` (idempotent, releases everything; later feeds reject replies as closed). Tests: `tests/session_bounded.rs` (query flood at a small reserved budget, reply ordering, shutdown with pending bytes).
+  - Reply-byte spike (done, worker-0, pinned 0.26.0 `src/term/mod.rs:1336,1341`): DSR-5 `\x1b[5n` → `"\x1b[0n"` (4 bytes); DSR-6 `\x1b[6n` → `"\x1b[{row+1};{col+1}R"`, e.g. `"\x1b[1;1R"` (6 bytes) at origin; replies are synchronous inside `Processor::advance` — every parser turn that completes a DSR produces its reply in the same turn.
+  - N04b (Round 4 reported green — 39/39 tests, check set clean; commit round in progress; worker-0 review in flight): `Session { engine: Engine, writer: BoundedWriter }` — `feed` drains all pending engine events every turn via `replies()`/`clear_events()` (no `src/engine.rs` changes); non-reply events are consumed and discarded (UI routing later); rejection visible via `FeedResult`; "replies don't block under the engine lock" holds by construction (headless), stated in the module doc. Shared signatures (lead decision, verbatim in both briefs):
+    ```rust
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FeedResult {
+        pub replies_enqueued: usize,
+        pub replies_rejected: usize,
+    }
+    pub struct Session { /* private */ }
+    impl Session {
+        pub fn new(rows: usize, cols: usize, cap: WriterConfig) -> Self;
+        pub fn feed(&mut self, bytes: &[u8]) -> FeedResult;
+        pub fn outstanding(&self) -> usize;
+        pub fn flush<F: FnMut(&[u8]) -> std::io::Result<usize>>(&mut self, sink: &mut F, limit: usize)
+            -> Result<usize, WriterError>;
+        pub fn close(&mut self) -> usize;
+    }
+    ```
+  - N04b acceptance: reply bytes (DSR) route through the bounded writer in order; split queries across feeds still reply once; a DSR flood at a small reserved budget rejects visibly (never dropped silently) and later small queries reject instead of dropping app bytes; `close()` releases everything and later replies reject as closed; `flush` after `close()` → `Err(WriterError::Closed)`.
+  - Lead reconciliation (test 3 order): the brief listed the 11th DSR-6 feed after the flush, but then the queue is empty and the feed would be *accepted* (`{6,0}`); the test correctly runs feed-11 → flush so the three assertions (`{12,48}`, `{0,6}`, flush `Ok(12)` recording exactly 2 replies) hold simultaneously. Fixtures as written by worker-0 stand.
+  - Lead reconciliation (Round 4): (a) reply acceptance is **atomic at the `Session` layer** — a reply is enqueued only if it fits wholly in the remaining reply headroom, else rejected in full (the `BoundedWriter` stays byte-granular; `Session` mirrors headroom via `queued_replies` + kind-tagged `runs`, credited back on `flush` completion). The `{12,48}` flood fixture demands this: 16 is not a multiple of 6, and byte-granular partial acceptance would split a reply mid-stream and report `{16,44}`. (b) worker-1 fixed `tests/session_bounded.rs` flood-length assert 30 → 40 (10 × 4-byte DSR-6 = 40; brief miscount) — behavioral assertions untouched. (c) `feed` after `close()` still feeds the engine; its replies reject as closed → `replies_rejected`.
+  - N05 plan (lead draft, post-commit; spike findings pinned 0.26.0, worker-0): **N05a pty driver** — `src/session/pty.rs`: `PtySession::spawn(LaunchSpec { program, args, cwd, env }, rows, cols, WriterConfig) -> io::Result<PtySession>`; `Engine` gains `term_handle() -> Arc<FairMutex<Term>>` (the deliberately encapsulated sync boundary — the pinned `EventLoop::new(terminal, listener, pty, drain_on_exit, ref_test)` wants the same term the engine owns, `event_loop.rs:63`); spawn = `Pty::new(&Options { shell: Some(Shell::new(prog, args)), working_directory, env, drain_on_exit: false }, WindowSize { num_lines, num_cols, cell_width: 0, cell_height: 0 }, window_id)` (`tty/unix.rs:195`; caller mints `window_id` as the session generation identity) then `EventLoop::new(...).spawn()` on a dedicated thread; app bytes → N04a `BoundedWriter` → `Msg::Input` via `channel().send` (`event_loop.rs:84,390`); resize → `Msg::Resize`; child exit → `Event::ChildExit(ExitStatus)`; loop death = `spawn` JoinHandle resolving; `drain_on_exit: false`, `ref_test: false`. **N05b launch & readiness** — headless readiness handshake over the PTY (no public facility in the crate — card mandates handshake/timeouts, no sleeps), tagged-I/O Rust child helper, direct argv for `-- COMMAND ARG...` (no shell interpolation — `Shell::new` passes argv straight to `Command::new`, `tty/unix.rs:215-218`), failed-launch cleanup (spawn `Err` = `"Failed to spawn command '<prog>': <err>"`; note: failed spawn leaks one global SIGCHLD hook slot per attempt, `tty/unix.rs:283-286`; bad `cwd` is silently ignored — validate `cwd` in nora before spawn), spawn env precondition: `$USER/$HOME/$SHELL` set or a passwd entry (`tty/unix.rs:213`). Test surfaces: fake `EventedPty` (two registered fds: token 0 I/O, token 1 child events) and real `Pty::from_fd` pair for headless PTY tests.
   - Test file layout (lead decision): `tests/session_writer.rs` (N04a), `tests/session_bounded.rs` (N04b).
 - Accepted default: Rust + alacritty_terminal + winit + wgpu; text adapter subject to the N02 gate.
 - Target: Linux native Wayland and X11.
@@ -64,6 +85,12 @@ Plan created: 10 October 2026. Implementation started at N00 on 10 October 2026.
 
 ## Completed implementation increments
 
+- **N04a-bounded-writer (slice 1 of N04)** — status: `validated`.
+  - Commit `10f47ae` ("feat(session): add bounded pending writer (N04a)"); remote `origin/main` = `10f47ae3d70bdb739b794a83959401d95eeafcec` verified via `git ls-remote` after push.
+  - Observable behavior: `nora::session::io::BoundedWriter` — bounded, ordered pending-write queue. `WriterConfig { max_bytes, reserved_bytes }` is a strict carve-out (app budget = `max − min(reserved, max)`, reply budget = `min(reserved, max)`); `enqueue`/`enqueue_reply` accept ordered bytes with partial acceptance (accepted bytes never dropped); `flush` makes one sink call, oldest first, un-completed remainder stays queued, a sink `Err` keeps all attempted bytes queued and propagates `WriterError::Io`; `outstanding()` ≤ `max_bytes` always; `cancel()` is idempotent and closes (later ops → `Err(Closed)`).
+  - `tests/session_writer.rs` (9 tests): app-budget cap; strict reply carve-out; ordered app+reply flush; partial write keeps head in order; WouldBlock keeps bytes queued; sink `Io` error keeps bytes queued; blocked writer never exceeds the cap (1000-iteration loop); cancel releases all and closes; empty enqueue is a no-op.
+  - Validation (worker-1, rerun in commit round): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build` all clean; `cargo test` 33/33.
+  - Lead reconciliation: test fixtures 4–6 assumed 8-byte app headroom under a 10/4 config; the strict carve-out formula was kept and the fixtures moved to `max_bytes: 12`. `WriterError` uses a manual `PartialEq` (variant equality) — public API unchanged.
 - **N03-engine-adapter** — status: `validated`.
   - Commit `9cdb72a` ("feat(engine): add headless terminal adapter and replay tests (N03)"); remote `origin/main` = `9cdb72a273782e372d3671ed4d4de421ed63007d` verified via `git ls-remote` after push.
   - Observable behavior: `nora` lib target exposes `engine::Engine` — headless adapter over pinned alacritty_terminal 0.26.0: `Engine::new(rows, cols)` (zero scrollback: `total_lines == rows`), `feed` (one long-lived `vte::ansi::Processor`; parser state preserved across chunks), `modes()`, `cursor()`, owned `snapshot()` consuming exactly one `TermDamage` report (first is `Damage::Full`), ordered `Recorder` sink (`EventListener` → owned `EventRecord`; PTY replies = `EventRecord::PtyWrite`) exposed via `events()`/`replies()`/`clear_events()`.
@@ -115,7 +142,8 @@ When recording a task, use: ID; observable behavior; validation commands/results
 - N02a: commit `402594a`; remote `origin/main` = `402594a2af5d4ca7d8d8f1c6944b0f901fe9c230` (verified via `git ls-remote` after the push).
 - N02b: commit `a4fc206`; remote `origin/main` = `a4fc206e11436354f626003c173b2de7b9c446d0` (verified via `git ls-remote` after the N02b push).
 - N03: commit `9cdb72a`; remote `origin/main` = `9cdb72a273782e372d3671ed4d4de421ed63007d` (verified via `git ls-remote` after the N03 push).
+- N04a: commit `10f47ae`; remote `origin/main` = `10f47ae3d70bdb739b794a83959401d95eeafcec` (verified via `git ls-remote` after the N04a push).
 
 ## Next action
 
-N04-bounded-io: N04a Round 3 in flight (see Active feature): worker-1 implements `src/session/io.rs` + integrates + runs the full check set; worker-0 writes `tests/session_writer.rs` against the fixed signatures. Integration → commit round (`feat(session): add bounded pending writer (N04a)`) → N04b.
+N04-bounded-io: N04b Round 4 in flight (see Active feature): worker-1 implements `Session` in `src/session/mod.rs` + integrates + runs the full check set; worker-0 writes `tests/session_bounded.rs` against the fixed signatures. Then commit round (`feat(session): route engine replies through the bounded writer (N04b)`), which closes N04 (card slices all satisfied: spike, N04a, N04b) → N05-pty-session.
