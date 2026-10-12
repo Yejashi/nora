@@ -228,3 +228,118 @@ fn termination_event_carries_generation_identity() {
     let _first = session.close();
     assert_eq!(session.close(), 0, "second close must release nothing");
 }
+
+/// N05b: a child that stops reading must never make nora's own state grow
+/// or block. The helper prints `STOPPED` only after receiving >= 4096
+/// bytes, so once it is visible the PTY buffer is full and the pinned
+/// loop's private write queue absorbs the rest — nora-side bytes must
+/// stay at zero the whole time (the loop-internal queue is unbounded
+/// inside the crate and is deliberately not asserted).
+#[test]
+fn backpressure_with_stop_reading_child() {
+    let cap = WriterConfig {
+        max_bytes: 64 * 1024,
+        reserved_bytes: 16 * 1024,
+    };
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["stop".to_string(), "4096".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap,
+    )
+    .expect("helper spawns over a real PTY");
+
+    // 32 KiB + newline: ~4x the typical kernel PTY buffer, newline last so
+    // canonical mode delivers the full line to the stopped reader.
+    let mut payload = vec![b'A'; 32 * 1024];
+    payload.push(b'\n');
+    assert_eq!(
+        session.feed(&payload),
+        Ok(32769),
+        "the whole payload must fit the app budget"
+    );
+    session
+        .flush(cap.max_bytes)
+        .expect("flush must forward the payload to the loop channel promptly");
+    assert_eq!(session.outstanding(), 0);
+
+    // The helper prints STOPPED only after receiving >= 4096 bytes, so this
+    // also proves the loop kept delivering while the PTY filled up.
+    pump(&mut session, |text, _events| text.contains("STOPPED"))
+        .expect("helper stopped reading after 4096 bytes within the deadline");
+
+    // Bounded 1 s stall window: flush must stay prompt and nora-side bytes
+    // must stay at zero while the child merely stalls.
+    let window_end = Instant::now() + Duration::from_secs(1);
+    let mut stalled_events: Vec<SessionEvent> = Vec::new();
+    while Instant::now() < window_end {
+        session
+            .flush(cap.max_bytes)
+            .expect("flush must stay prompt while the child is stalled");
+        assert_eq!(
+            session.outstanding(),
+            0,
+            "nora-side bytes must stay bounded while the child stalls"
+        );
+        stalled_events.append(&mut session.poll_events());
+        thread::sleep(POLL);
+    }
+    assert!(
+        !stalled_events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Terminated { .. })),
+        "a merely-stalled child must not surface as Terminated"
+    );
+
+    // close() ends the session; the helper then sees EOF on stdin and exits
+    // 0. The post-close status is a documented race: close() sends
+    // Msg::Shutdown, which can end the loop before the child's SIGCHLD is
+    // observed, so accept Some(0) for a clean ChildExit or None when the
+    // loop died first.
+    session.close();
+    let id = session.id();
+    pump(&mut session, |_text, events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Terminated { session, status }
+                    if *session == id
+                        && (status.is_none()
+                            || status.as_ref().and_then(|s| s.code()) == Some(0))
+            )
+        })
+    })
+    .expect("session must terminate after close within the deadline");
+
+    assert_eq!(session.close(), 0, "second close must release nothing");
+}
+
+/// N05b: the spawn window size must reach the child's actual TIOCGWINSZ.
+#[test]
+fn window_size_reaches_child() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["ws".to_string(), "24".to_string(), "80".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        nora::session::pty::DEFAULT_CAP,
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("WS:24;80"))
+        .expect("child observed the 24x80 window size within the deadline");
+
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("helper exited 0 within the deadline");
+
+    session.close();
+}

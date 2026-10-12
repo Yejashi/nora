@@ -7,7 +7,8 @@
 //! application bytes go through the shared [`BoundedWriter`] and are
 //! forwarded to the child as ordered `Msg::Input`; parser replies are
 //! accepted atomically through the shared [`ReplyLedger`]; loop end
-//! surfaces as exactly one [`SessionEvent::Terminated`].
+//! surfaces as [`SessionEvent::Terminated`] on every poll after the loop
+//! thread has ended.
 
 use std::borrow::Cow;
 use std::io;
@@ -24,6 +25,13 @@ use crate::engine::{Engine, EventRecord, Recorder};
 
 use super::ReplyLedger;
 use super::io::{BoundedWriter, WriterConfig, WriterError};
+
+/// Default per-session write budgets (policy values, 03:86-89): 1 MiB
+/// total, 64 KiB reserved for parser replies.
+pub const DEFAULT_CAP: WriterConfig = WriterConfig {
+    max_bytes: 1024 * 1024,
+    reserved_bytes: 64 * 1024,
+};
 
 /// Launch parameters for a PTY child.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +102,8 @@ pub enum SessionEvent {
 /// The loop thread owns all PTY I/O. The main thread owns the bounded
 /// outbound writer and the shared [`ReplyLedger`]: `feed`/`flush` keep
 /// app bytes and parser replies in one ordered, byte-budgeted stream, and
-/// `poll_events` reports loop end as exactly one `Terminated`.
+/// `poll_events` reports loop end as `Terminated` on every poll after the
+/// loop thread has ended.
 pub struct PtySession {
     id: SessionId,
     engine: Engine,
@@ -104,8 +113,6 @@ pub struct PtySession {
     loop_handle: Option<JoinHandle<(EventLoop<Pty, Recorder>, State)>>,
     /// Exit status recorded from the loop's `ChildExit` event, if any.
     child_status: Option<ExitStatus>,
-    /// Whether the `Terminated` event has been emitted (exactly once).
-    terminated_emitted: bool,
     /// Whether `Msg::Shutdown` has been sent.
     shutdown_sent: bool,
 }
@@ -168,7 +175,6 @@ impl PtySession {
             sender,
             loop_handle: Some(loop_handle),
             child_status: None,
-            terminated_emitted: false,
             shutdown_sent: false,
         })
     }
@@ -237,20 +243,20 @@ impl PtySession {
         }
     }
 
-    /// Events emitted so far, in order (non-blocking drain).
+    /// Non-blocking poll: drains pending records and, once the loop thread
+    /// has ended, reports the terminal state as `Terminated` on every call —
+    /// the state is observable at any later tick (a caller may first notice
+    /// the loop's end on a poll that does not inspect events). `status` is
+    /// `Some` once the loop's `ChildExit` record has been drained (it always
+    /// precedes loop end for a clean exit), else `None` (the loop died from
+    /// an I/O or registration error).
     pub fn poll_events(&mut self) -> Vec<SessionEvent> {
         self.process_events();
         let mut events = Vec::new();
-        if !self.terminated_emitted && self.terminated() {
-            // The loop thread has returned: its final events (notably
-            // `ChildExit`) are now visible in the shared stream, so drain
-            // once more before reporting.
-            self.process_events();
-            let status = self.child_status.take();
-            self.terminated_emitted = true;
+        if self.terminated() {
             events.push(SessionEvent::Terminated {
                 session: self.id,
-                status,
+                status: self.child_status,
             });
         }
         events
@@ -264,11 +270,9 @@ impl PtySession {
         }
     }
 
-    /// Block until the loop thread ends; exit status if a clean child exit.
-    ///
-    /// Note: the exit status is one-shot across surfaces — if `poll_events`
-    /// has already emitted `Terminated`, `join` returns `None` for a clean
-    /// exit.
+    /// Block until the loop thread ends; the child's exit status if a clean
+    /// child exit was observed. The status is state, not a one-shot: it is
+    /// also carried by every `Terminated` after loop end.
     pub fn join(&mut self) -> Option<ExitStatus> {
         if let Some(handle) = self.loop_handle.take() {
             let _ = handle.join();
