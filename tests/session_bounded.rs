@@ -21,6 +21,7 @@
 
 use std::io;
 
+use nora::engine::{Engine, EventRecord};
 use nora::session::io::{WriterConfig, WriterError};
 use nora::session::{FeedResult, Session};
 
@@ -632,4 +633,108 @@ fn unknown_osc_is_silent() {
     let mut rec = Rec::default();
     assert_eq!(flush_into(&mut session, 256, &mut rec), Ok(0));
     assert_eq!(rec.calls, 0, "an unknown OSC must produce no bytes");
+}
+
+// ---------------------------------------------------------------------------
+// N06b: recorder caps and coalescing (Engine/Recorder level — the headless
+// session drains between turns, so the caps are observed across feeds
+// before a drain), plus the main-thread title fold.
+// ---------------------------------------------------------------------------
+
+/// The recorder holds at most 256 records (drop-oldest FIFO). One feed
+/// with 300 distinguishable DSR-6 position replies leaves exactly the
+/// newest 256 pending; the oldest 44 were evicted.
+#[test]
+fn recorder_caps_at_256_records_dropping_oldest() {
+    let mut engine = Engine::new(24, 80);
+    let mut stream = Vec::new();
+    for i in 0..300u16 {
+        // A CUP to a distinct cell followed by a DSR-6 position report
+        // makes every reply distinct and order-identifiable.
+        stream.extend(format!("\x1b[{};{}H\x1b[6n", i / 80 + 1, i % 80 + 1).into_bytes());
+    }
+    engine.feed(&stream);
+
+    let drained = engine.drain_events();
+    assert_eq!(drained.len(), 256, "the entry cap is 256 records");
+    assert_eq!(
+        drained.first(),
+        Some(&EventRecord::PtyWrite("\x1b[1;45R".to_string())),
+        "the oldest 44 records must be evicted first"
+    );
+    assert_eq!(
+        drained.last(),
+        Some(&EventRecord::PtyWrite("\x1b[4;60R".to_string()))
+    );
+}
+
+/// The byte cap (1 MiB of String-owned bytes) keeps a single over-cap
+/// record alone, and the byte counter resets on drain: after a >1 MiB
+/// title is drained, the next small records are accepted without
+/// spurious eviction (which would occur if the counter were stale).
+#[test]
+fn recorder_byte_cap_and_counter_reset() {
+    let mut engine = Engine::new(24, 80);
+    let big = "x".repeat(1024 * 1024 + 1); // just over the 1 MiB cap
+    let osc = format!("\x1b]2;{big}\x07");
+    engine.feed(osc.as_bytes());
+
+    // A single record alone over the cap is retained intact.
+    let drained = engine.drain_events();
+    assert_eq!(drained, vec![EventRecord::Title(big.clone())]);
+
+    engine.feed(b"\x1b[5n");
+    engine.feed(b"\x1b[5n");
+    let drained = engine.drain_events();
+    assert_eq!(
+        drained.len(),
+        2,
+        "no spurious eviction after the >1 MiB drain"
+    );
+}
+
+/// Titles coalesce to the latest before eviction: three title feeds
+/// without a drain leave one pending record with the latest value.
+#[test]
+fn titles_coalesce_to_latest_before_drain() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(b"\x1b]2;first\x07");
+    engine.feed(b"\x1b]2;second\x07");
+    engine.feed(b"\x1b]2;third\x07");
+
+    let drained = engine.drain_events();
+    assert_eq!(drained, vec![EventRecord::Title("third".to_string())]);
+}
+
+/// Bells coalesce to one: three BEL feeds without a drain leave a single
+/// pending bell.
+#[test]
+fn bells_coalesce_to_one_before_drain() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(b"\x07");
+    engine.feed(b"\x07");
+    engine.feed(b"\x07");
+
+    let drained = engine.drain_events();
+    assert_eq!(drained, vec![EventRecord::Bell]);
+}
+
+/// The headless session folds titles on the main thread: the title
+/// starts unset, the last title wins, and an empty OSC title (the
+/// pinned vte emits it as `Title("")`, not a `ResetTitle`) is stored as
+/// an empty title.
+#[test]
+fn headless_session_title_folds_latest_wins() {
+    let mut session = session();
+    assert_eq!(session.title(), None);
+
+    session.feed(b"\x1b]0;hello\x07");
+    assert_eq!(session.title(), Some("hello".to_string()));
+
+    // Latest wins.
+    session.feed(b"\x1b]2;world\x07");
+    assert_eq!(session.title(), Some("world".to_string()));
+
+    session.feed(b"\x1b]2;\x07");
+    assert_eq!(session.title(), Some(String::new()));
 }

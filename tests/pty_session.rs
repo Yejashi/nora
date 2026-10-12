@@ -513,3 +513,53 @@ fn window_size_reaches_child() {
 
     session.close();
 }
+
+/// N06b: a child that sets its window title over the real PTY surfaces
+/// the title through `session.title()` (folded on the main thread by
+/// `poll_events`), and the child still exits 0 (deadline-bounded, P1
+/// shape).
+#[test]
+fn child_title_surfaces_as_session_title() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["title".to_string(), "nora child".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    // The title arrives between poll ticks; poll until the fold surfaces
+    // it (deadline-bounded, P1 shape).
+    let deadline = Instant::now() + DEADLINE;
+    while session.title().is_none() {
+        if Instant::now() > deadline {
+            panic!("deadline exceeded waiting for the child title");
+        }
+        session.poll_events();
+        thread::sleep(POLL);
+    }
+    assert_eq!(session.title(), Some("nora child".to_string()));
+
+    // The child exits 0 after sending the title; observe `Terminated`
+    // through the same deadline-bounded pump shape.
+    let deadline = Instant::now() + DEADLINE;
+    let mut exited = false;
+    while !exited {
+        if Instant::now() > deadline {
+            panic!("deadline exceeded waiting for the child exit");
+        }
+        exited = session
+            .poll_events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Terminated { status: Some(status), .. } if status.code() == Some(0)));
+        thread::sleep(POLL);
+    }
+
+    session.join();
+    session.close();
+}

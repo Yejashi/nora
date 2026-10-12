@@ -125,6 +125,11 @@ pub struct PtySession {
     child_status: Option<ExitStatus>,
     /// Whether `Msg::Shutdown` has been sent.
     shutdown_sent: bool,
+    /// Last title set by the terminal (latest wins), `None` when the
+    /// title was reset or never set. Folded on the main thread from
+    /// drained [`EventRecord::Title`]/[`EventRecord::ResetTitle`]
+    /// records; no cross-thread mutation of shared state.
+    title: Option<String>,
 }
 
 impl PtySession {
@@ -215,12 +220,19 @@ impl PtySession {
             loop_handle: Some(loop_handle),
             child_status: None,
             shutdown_sent: false,
+            title: None,
         })
     }
 
     /// This session's generation identity.
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// The last title set by the terminal, if any (folded on the main
+    /// thread; see the struct docs).
+    pub fn title(&self) -> Option<String> {
+        self.title.clone()
     }
 
     /// App bytes into the writer's app budget (partial acceptance,
@@ -358,6 +370,13 @@ impl PtySession {
     /// the status, and other events are discarded.
     fn process_events(&mut self) {
         for record in self.engine.drain_events() {
+            // Fold presentation state on the main thread: latest title
+            // wins; a reset clears it.
+            match &record {
+                EventRecord::Title(t) => self.title = Some(t.clone()),
+                EventRecord::ResetTitle => self.title = None,
+                _ => {}
+            }
             match record {
                 EventRecord::ChildExit(status) if self.child_status.is_none() => {
                     self.child_status = Some(status);

@@ -127,6 +127,11 @@ fn run_session(spec: LaunchSpec, explicit: bool) -> ExitCode {
         }
     };
     let status = session.join();
+    // Surface the last title set by the child, if any (N06b), on stderr
+    // so it never mixes with terminal output.
+    if let Some(title) = session.title() {
+        eprintln!("title: {title}");
+    }
     session.close();
     let code = if explicit {
         // Propagate the child's exit status; a signal death (or a loop

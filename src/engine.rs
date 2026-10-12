@@ -27,7 +27,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::{COUNT, Colors};
 use alacritty_terminal::term::{
-    ClipboardType, Config, Term, TermDamage, TermMode, point_to_viewport,
+    ClipboardType, Config, Osc52, Term, TermDamage, TermMode, point_to_viewport,
 };
 use alacritty_terminal::vte;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
@@ -137,17 +137,89 @@ impl PartialEq for EventRecord {
 
 impl Eq for EventRecord {}
 
+/// Hard entry cap for the recorder (drop-oldest FIFO).
+const MAX_RECORDS: usize = 256;
+/// Hard byte cap for the recorder (drop-oldest FIFO): the sum of the
+/// String-owned field lengths of the pending records.
+const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// The recorder's shared state: the ordered pending records and their
+/// total String-owned byte count, bounded in entries and bytes.
+#[derive(Clone, Debug, Default)]
+struct RecorderState {
+    events: Vec<EventRecord>,
+    bytes: usize,
+}
+
+/// Per-record byte cost for the recorder cap: the sum of that variant's
+/// String-owned field lengths (unit and Arc-only variants cost nothing).
+/// `PtyWrite` holds owned reply bytes (String) and counts toward the
+/// byte cap exactly like the other String-owned variants.
+fn event_record_cost(record: &EventRecord) -> usize {
+    match record {
+        EventRecord::Title(text) => text.len(),
+        EventRecord::ClipboardStore(_, text) => text.len(),
+        EventRecord::PtyWrite(text) => text.len(),
+        _ => 0,
+    }
+}
+
 /// Ordered event sink shared between the engine, its owner, and any PTY
 /// event loop driven against the engine's term.
+///
+/// Pending state is bounded: at most [`MAX_RECORDS`] records and
+/// [`MAX_RECORD_BYTES`] String-owned bytes (drop-oldest FIFO). Replaceable
+/// presentation state coalesces before eviction: a new title replaces a
+/// pending undrained title (latest wins), and a bell while one is pending
+/// is skipped.
 #[derive(Clone, Default)]
 pub struct Recorder {
-    events: Arc<Mutex<Vec<EventRecord>>>,
+    events: Arc<Mutex<RecorderState>>,
 }
 
 impl EventListener for Recorder {
     fn send_event(&self, event: Event) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.push(to_record(event));
+        let mut state = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let record = to_record(event);
+
+        // Coalesce replaceable presentation state before eviction.
+        match &record {
+            EventRecord::Title(_) => {
+                // Latest title wins: replace the pending undrained
+                // title. The pending record's cost is part of
+                // `state.bytes` (the sum over all pending records), so
+                // the delta is exact.
+                let cost = event_record_cost(&record);
+                if let Some(pos) = state
+                    .events
+                    .iter()
+                    .rev()
+                    .position(|r| matches!(r, EventRecord::Title(_)))
+                {
+                    let pos = state.events.len() - 1 - pos;
+                    let pending = std::mem::replace(&mut state.events[pos], record);
+                    state.bytes = state.bytes - event_record_cost(&pending) + cost;
+                    return;
+                }
+            }
+            EventRecord::Bell if state.events.iter().any(|r| matches!(r, EventRecord::Bell)) => {
+                return;
+            }
+            _ => {}
+        }
+
+        // Bounded retention: drop oldest first. A single record over the
+        // byte cap evicts everything else and remains alone.
+        state.bytes += event_record_cost(&record);
+        state.events.push(record);
+        // Never evict the last remaining record: a single record over the
+        // byte cap evicts everything else and remains alone.
+        while state.events.len() > 1
+            && (state.events.len() > MAX_RECORDS || state.bytes > MAX_RECORD_BYTES)
+        {
+            let oldest = state.events.remove(0);
+            state.bytes -= event_record_cost(&oldest);
+        }
     }
 }
 
@@ -253,8 +325,11 @@ impl Engine {
     pub fn new(rows: usize, cols: usize) -> Self {
         // Zero history: grid lines equal viewport rows, so display_offset is
         // always 0 and cursor/viewport math is the identity.
+        // OSC 52 store/load are denied: the pinned term emits no events and
+        // no replies for clipboard queries while `Osc52::Disabled`.
         let config = Config {
             scrolling_history: 0,
+            osc52: Osc52::Disabled,
             ..Default::default()
         };
         let size = Size { rows, cols };
@@ -375,33 +450,36 @@ impl Engine {
 
     /// All events captured so far, in arrival order.
     pub fn events(&self) -> Vec<EventRecord> {
-        let events = self
+        let state = self
             .recorder
             .events
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        events.clone()
+        state.events.clone()
     }
 
     /// Atomically take all events captured so far, in arrival order,
     /// leaving the recorder empty.
     pub fn drain_events(&self) -> Vec<EventRecord> {
-        let mut events = self
+        let mut state = self
             .recorder
             .events
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut events)
+        let events = std::mem::take(&mut state.events);
+        state.bytes = 0;
+        events
     }
 
     /// PTY reply bytes (DSR and similar queries) in arrival order.
     pub fn replies(&self) -> Vec<String> {
-        let events = self
+        let state = self
             .recorder
             .events
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        events
+        state
+            .events
             .iter()
             .filter_map(|event| match event {
                 EventRecord::PtyWrite(bytes) => Some(bytes.clone()),
@@ -412,11 +490,12 @@ impl Engine {
 
     /// Drop all captured events and replies.
     pub fn clear_events(&self) {
-        let mut events = self
+        let mut state = self
             .recorder
             .events
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        events.clear();
+        state.events.clear();
+        state.bytes = 0;
     }
 }

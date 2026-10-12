@@ -211,6 +211,11 @@ pub struct Session {
     size: WindowSize,
     writer: BoundedWriter,
     ledger: ReplyLedger,
+    /// Last title set by the terminal (latest wins), `None` when the
+    /// title was reset or never set. Folded on the main thread from
+    /// drained [`EventRecord::Title`]/[`EventRecord::ResetTitle`]
+    /// records; no cross-thread mutation of shared state.
+    title: Option<String>,
 }
 
 impl Session {
@@ -229,6 +234,7 @@ impl Session {
             },
             writer: BoundedWriter::new(cap),
             ledger: ReplyLedger::new(cap.reserved_bytes.min(cap.max_bytes)),
+            title: None,
         }
     }
 
@@ -242,6 +248,13 @@ impl Session {
         // pending stream in arrival order; every record is resolved to
         // a reply (or discarded for non-reply variants) in that order.
         for record in self.engine.drain_events() {
+            // Fold presentation state on the main thread: latest title
+            // wins; a reset clears it.
+            match &record {
+                EventRecord::Title(t) => self.title = Some(t.clone()),
+                EventRecord::ResetTitle => self.title = None,
+                _ => {}
+            }
             if let Some(reply) = resolve_record(&self.engine, self.size, record) {
                 enqueued += self.ledger.accept(&mut self.writer, &reply);
             }
@@ -250,6 +263,12 @@ impl Session {
             replies_enqueued: enqueued,
             replies_rejected: self.ledger.rejected - rejected_before,
         }
+    }
+
+    /// The last title set by the terminal, if any (folded on the main
+    /// thread; see the struct docs).
+    pub fn title(&self) -> Option<String> {
+        self.title.clone()
     }
 
     /// Bytes still reserved by the session writer.

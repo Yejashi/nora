@@ -11,6 +11,8 @@
 //!   winsize on stdin (arguments nominal, ignored), exit 0;
 //! - `dying <q-hex>`: print `READY`, wait 100 ms, write the hex-decoded
 //!   query bytes to stdout, exit 0;
+//! - `title <t>`: print `READY`, wait 100 ms, write `\x1b]0;<t>\x07` to
+//!   stdout, exit 0;
 //! - `check <marker> <q-hex> <expect-hex>`: print `READY`, write the
 //!   hex-decoded query bytes to stdout, then read stdin in chunks until the
 //!   contiguous hex-decoded expect bytes are seen (print `CHECK:<marker>`,
@@ -56,6 +58,16 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let query = hex_decode(args.get(1).map(String::as_str).unwrap_or(""));
             let _ = out.write_all(&query);
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        Some("title") => {
+            ready(&mut out);
+            // Let READY reach the screen through the loop's normal master
+            // read before the title goes out and the child exits.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let title = args.get(1).map(String::as_str).unwrap_or("");
+            let _ = out.write_all(format!("\x1b]0;{title}\x07").as_bytes());
             let _ = out.flush();
             std::process::exit(0);
         }

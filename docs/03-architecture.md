@@ -94,6 +94,8 @@ These are starting proposals, not established measurements. Validate configurabi
 | Glyph cache | 64 MiB CPU + 64 MiB GPU target per instance | Account actual allocated atlas pages; evict/rebuild at a frame boundary |
 | History | 10,000 rows and a target 64 MiB/session | Lower row limit based on geometry/accounting; audit exceptional engine allocations |
 
+Flood audit (N06b) for the protocol-event queue row: the pinned vte parser (`features = ["std", "ansi"]`) accumulates an open OSC payload in an unbounded `Vec<u8>` (`osc_raw`, vte-0.15.0/src/lib.rs:62-64) — bytes are pushed unconditionally while an OSC stays open and the buffer is cleared only at `osc_end` — so a client can hold arbitrary in-flight bytes in the parser before any event exists. Retention after parsing is bounded: the shared `Recorder` keeps at most 256 records and 1 MiB of String-owned bytes (drop-oldest FIFO), with replaceable presentation state coalesced before eviction (latest title wins; a bell while one is pending is skipped). Sub-cap evictions are unaccounted (no `ReplyLedger` rejection); the main thread drains the queue between feeds, so the cap bounds post-parse retention, not in-flight parser bytes.
+
 A row limit does not strictly bound memory when cells can carry extra text or links. Audit parser strings, combining marks, hyperlink storage, history extras and third-party font caches. Enforce caps using supported APIs or a documented minimal patch. If a strict cap is impossible, record the specific exception; do not label it bounded. The resource audit is a release gate, not a fixed-size-of-Cell approximation presented as a guarantee.
 
 ## Resize, font and shutdown lifecycle

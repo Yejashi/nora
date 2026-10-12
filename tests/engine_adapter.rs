@@ -196,13 +196,15 @@ fn events_and_replies_are_captured_in_order() {
     engine.feed(b"\x1b[6n"); // DSR: cursor position
     engine.feed(b"\x1b]2;world\x07"); // OSC 2: window title
 
+    // N06b: titles coalesce to the latest before eviction, so the two
+    // title feeds collapse to `Title("world")` in the first title's
+    // position; the records keep their relative order.
     assert_eq!(
         engine.events(),
         vec![
-            EventRecord::Title("hello".to_string()),
+            EventRecord::Title("world".to_string()),
             EventRecord::PtyWrite("\x1b[0n".to_string()),
             EventRecord::PtyWrite("\x1b[1;1R".to_string()),
-            EventRecord::Title("world".to_string()),
         ]
     );
     assert_eq!(
@@ -313,4 +315,36 @@ impl SplitMix64 {
     fn chunk_size(&mut self, max: usize) -> usize {
         (self.next() % max as u64 + 1) as usize
     }
+}
+
+/// N06b: the pinned term's config sets `Osc52::Disabled`, so an OSC 52
+/// store is denied before decoding — zero records, zero replies. (The
+/// pre-flip default `Osc52::OnlyCopy` recorded exactly one
+/// `ClipboardStore` for this stream; the precedent fixture is
+/// `events_and_replies_are_captured_in_order`.)
+#[test]
+fn osc52_store_is_denied_when_disabled() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"); // OSC 52 store, ST-terminated
+    assert_eq!(
+        engine.drain_events(),
+        Vec::<EventRecord>::new(),
+        "a denied OSC 52 store must record nothing"
+    );
+    assert_eq!(engine.replies(), Vec::<String>::new());
+}
+
+/// N06b: an OSC 52 load query (`\x1b]52;c?\x07` → pinned
+/// `Term::clipboard_load`, vte-0.15.0 `ansi.rs:1483-1491`) is denied the
+/// same way — no `ClipboardLoad` record, no reply bytes.
+#[test]
+fn osc52_load_query_is_denied_when_disabled() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(b"\x1b]52;c?\x07"); // OSC 52 load query for the clipboard
+    assert_eq!(
+        engine.drain_events(),
+        Vec::<EventRecord>::new(),
+        "a denied OSC 52 load must record nothing"
+    );
+    assert_eq!(engine.replies(), Vec::<String>::new());
 }
