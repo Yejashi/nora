@@ -41,6 +41,9 @@ pub struct Engine {
     processor: vte::ansi::Processor<vte::ansi::StdSyncHandler>,
     rows: usize,
     cols: usize,
+    /// Per-capture monotonic snapshot epoch (starts at 0; the first
+    /// [`Engine::snapshot`] is epoch 1).
+    snapshot_epoch: u64,
     recorder: Recorder,
 }
 
@@ -253,6 +256,31 @@ pub struct CellText {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    /// Zerowidth (combining) characters stacked on this cell, in arrival
+    /// order.
+    pub zerowidth: Vec<char>,
+    /// SGR 58 underline color, if set.
+    pub underline_color: Option<Color>,
+    /// Hyperlink identity `(id, uri)`, if set (owned, engine-free).
+    pub hyperlink: Option<(String, String)>,
+}
+
+impl CellText {
+    /// Display width in columns, derived from the pinned wide-char flags:
+    /// a full wide char spans 2, a wide-char spacer spans 0, everything
+    /// else spans 1.
+    pub fn width(&self) -> u16 {
+        if self.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else if self
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            0
+        } else {
+            1
+        }
+    }
 }
 
 /// One owned screen snapshot with viewport metadata.
@@ -260,6 +288,8 @@ pub struct CellText {
 pub struct Snapshot {
     pub rows: usize,
     pub cols: usize,
+    /// Per-capture monotonic identity (the first snapshot is epoch 1).
+    pub epoch: u64,
     /// Row-major: `cells[row * cols + col]`.
     pub cells: Vec<CellText>,
     /// Cursor in viewport coordinates.
@@ -272,6 +302,8 @@ pub struct Snapshot {
     pub damage: Damage,
 }
 
+/// Content identity only: [`Snapshot::epoch`] is deliberately not compared,
+/// so two captures of the same screen are equal.
 impl PartialEq for Snapshot {
     fn eq(&self, other: &Self) -> bool {
         self.rows == other.rows
@@ -291,6 +323,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("rows", &self.rows)
             .field("cols", &self.cols)
+            .field("epoch", &self.epoch)
             .field("cells", &self.cells)
             .field("cursor", &self.cursor)
             .field("cursor_shape", &self.cursor_shape)
@@ -340,8 +373,22 @@ impl Engine {
             processor: vte::ansi::Processor::<vte::ansi::StdSyncHandler>::new(),
             rows,
             cols,
+            snapshot_epoch: 0,
             recorder,
         }
+    }
+
+    /// Resize the viewport to `rows` × `cols`.
+    ///
+    /// The pinned `Term::resize` marks the terminal fully damaged, so the
+    /// next [`Engine::snapshot`] reports [`Damage::Full`].
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        let size = Size { rows, cols };
+        let mut term = self.term.lock();
+        term.resize(size);
+        drop(term);
+        self.rows = rows;
+        self.cols = cols;
     }
 
     /// Viewport height in rows.
@@ -416,6 +463,8 @@ impl Engine {
         };
 
         let content = term.renderable_content();
+        // Cell extras are copied to owned, engine-free data under the term
+        // guard, via the pinned `Cell` accessors.
         let cells: Vec<CellText> = content
             .display_iter
             .map(|cell| {
@@ -427,6 +476,16 @@ impl Engine {
                     fg: cell.cell.fg,
                     bg: cell.cell.bg,
                     flags: cell.cell.flags,
+                    zerowidth: cell
+                        .cell
+                        .zerowidth()
+                        .map(|s| s.to_vec())
+                        .unwrap_or_default(),
+                    underline_color: cell.cell.underline_color(),
+                    hyperlink: cell
+                        .cell
+                        .hyperlink()
+                        .map(|h| (h.id().to_string(), h.uri().to_string())),
                 }
             })
             .collect();
@@ -434,9 +493,13 @@ impl Engine {
         let cursor = point_to_viewport(content.display_offset, content.cursor.point)
             .map(|p| (p.line, p.column.0));
 
+        // Increment before assignment: the first snapshot is epoch 1.
+        self.snapshot_epoch += 1;
+
         let snapshot = Snapshot {
             rows: self.rows,
             cols: self.cols,
+            epoch: self.snapshot_epoch,
             cells,
             cursor,
             cursor_shape: content.cursor.shape,
