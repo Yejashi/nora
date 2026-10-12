@@ -9,8 +9,8 @@
 
 /// Status of acquiring the current surface texture (N08b2 maps the
 /// pinned wgpu `CurrentSurfaceTexture` variants 1:1 into these;
-/// `Validation` carries the message, matching the pinned
-/// `Validation(String)` variant).
+/// wgpu's `Validation` is payload-less, so nora carries the message
+/// in its own `String` payload at that boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceStatus {
     /// Acquired a usable texture.
@@ -43,8 +43,8 @@ pub struct RenderState {
     /// The window's surface is zero-sized: rendering is skipped until
     /// a non-zero resize arrives.
     pub zero_size: bool,
-    /// Failed-surface retry budget consumed so far; at `3` the next
-    /// failure exits with `ExitFail`.
+    /// Failed-surface retry budget consumed so far; the failure that
+    /// brings this to `3` exits with `ExitFail`.
     pub surface_retry: u8,
 }
 

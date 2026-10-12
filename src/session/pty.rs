@@ -232,7 +232,7 @@ impl PtySession {
     /// terminal fully damaged, so the next [`Engine::snapshot`]
     /// reports `Damage::Full`), then enqueue a fresh
     /// `TextAreaSizeRequest` through the shared recorder — the same
-    /// event path as the request at spawn (pty.rs:171): the next
+    /// event path as the child's CSI 14t query reply (N06): the next
     /// `process_events` resolves it against this session's own
     /// updated `WindowSize` (nominal cell geometry, as at spawn) and
     /// credits the reply through the ledger as usual (no new reply
