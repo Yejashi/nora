@@ -41,9 +41,69 @@ use wgpu::{
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
-const MONO_PATH: &str = "/usr/share/fonts/noto/NotoSansMono-Regular.ttf";
-const CJK_PATH: &str = "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc";
-const ETHIOPIC_PATH: &str = "/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf";
+/// Resolve a pinned test font at runtime: env override first, then the first
+/// existing candidate. NixOS store paths change with generations, so the
+/// candidate list carries both the original pinned paths (previous machine)
+/// and the current NixOS store paths.
+fn resolve_font(env_var: &str, candidates: &[&str]) -> String {
+    if let Ok(p) = std::env::var(env_var)
+        && !p.is_empty()
+    {
+        return p;
+    }
+    for c in candidates {
+        if std::path::Path::new(c).is_file() {
+            return c.to_string();
+        }
+    }
+    panic!("no candidate test font available for {env_var}: {candidates:?}");
+}
+
+static MONO_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static CJK_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ETHIOPIC_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn mono_path() -> &'static str {
+    MONO_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_MONO",
+                &[
+                    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+                    "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSansMono.ttf",
+                ],
+            )
+        })
+        .as_str()
+}
+
+fn cjk_path() -> &'static str {
+    CJK_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_CJK",
+                &[
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/nix/store/i0nxswc8ljllp6lnha7vpmr3w2l33khj-noto-fonts-cjk-sans-2.004/share/fonts/opentype/noto-cjk/NotoSansCJK-VF.otf.ttc",
+                ],
+            )
+        })
+        .as_str()
+}
+
+fn ethiopic_path() -> &'static str {
+    ETHIOPIC_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_ETHIOPIC",
+                &[
+                    "/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf",
+                    "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSerifEthiopic.ttf",
+                ],
+            )
+        })
+        .as_str()
+}
 
 /// 20 px font in a 24 px row — same baseline as N02a/N02b.
 const FONT_SIZE: f32 = 20.0;
@@ -400,9 +460,9 @@ fn cursor_fill_visibility() {
 
 fn font_system() -> FontSystem {
     FontSystem::new_with_fonts([
-        fontdb::Source::File(MONO_PATH.into()),
-        fontdb::Source::File(CJK_PATH.into()),
-        fontdb::Source::File(ETHIOPIC_PATH.into()),
+        fontdb::Source::File(mono_path().into()),
+        fontdb::Source::File(cjk_path().into()),
+        fontdb::Source::File(ethiopic_path().into()),
     ])
 }
 

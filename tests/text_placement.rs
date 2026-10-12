@@ -13,10 +13,13 @@
 //! - Only dirty cells are shaped; unchanged cells keep bit-identical geometry
 //!   across frames (no re-shape, no drift).
 //!
-//! Pinned test fonts (OFL, paths on this machine):
-//! - Latin + box drawing: `/usr/share/fonts/noto/NotoSansMono-Regular.ttf`
-//! - CJK wide: `/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc`
-//! - Ethiopic fallback: `/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf`
+//! Pinned test fonts (OFL), resolved at runtime from a candidate list —
+//! either the originally pinned path or the current NixOS store path — and
+//! overridable via NORA_TEST_FONT_MONO / NORA_TEST_FONT_CJK /
+//! NORA_TEST_FONT_ETHIOPIC:
+//! - Latin + box drawing: Noto Sans Mono (`mono_path()`)
+//! - CJK wide: Noto Sans CJK (`cjk_path()`)
+//! - Ethiopic fallback: Noto Serif Ethiopic (`ethiopic_path()`)
 //!
 //! GPU atlas/raster cache accounting is the N02b concern; this file is pure
 //! CPU shaping plus placement arithmetic, no device or surface involved.
@@ -25,9 +28,69 @@ use std::time::Instant;
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, fontdb};
 
-const MONO_PATH: &str = "/usr/share/fonts/noto/NotoSansMono-Regular.ttf";
-const CJK_PATH: &str = "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc";
-const ETHIOPIC_PATH: &str = "/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf";
+/// Resolve a pinned test font at runtime: env override first, then the first
+/// existing candidate. NixOS store paths change with generations, so the
+/// candidate list carries both the original pinned paths (previous machine)
+/// and the current NixOS store paths.
+fn resolve_font(env_var: &str, candidates: &[&str]) -> String {
+    if let Ok(p) = std::env::var(env_var)
+        && !p.is_empty()
+    {
+        return p;
+    }
+    for c in candidates {
+        if std::path::Path::new(c).is_file() {
+            return c.to_string();
+        }
+    }
+    panic!("no candidate test font available for {env_var}: {candidates:?}");
+}
+
+static MONO_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static CJK_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ETHIOPIC_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn mono_path() -> &'static str {
+    MONO_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_MONO",
+                &[
+                    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+                    "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSansMono.ttf",
+                ],
+            )
+        })
+        .as_str()
+}
+
+fn cjk_path() -> &'static str {
+    CJK_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_CJK",
+                &[
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/nix/store/i0nxswc8ljllp6lnha7vpmr3w2l33khj-noto-fonts-cjk-sans-2.004/share/fonts/opentype/noto-cjk/NotoSansCJK-VF.otf.ttc",
+                ],
+            )
+        })
+        .as_str()
+}
+
+fn ethiopic_path() -> &'static str {
+    ETHIOPIC_PATH
+        .get_or_init(|| {
+            resolve_font(
+                "NORA_TEST_FONT_ETHIOPIC",
+                &[
+                    "/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf",
+                    "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSerifEthiopic.ttf",
+                ],
+            )
+        })
+        .as_str()
+}
 
 /// Base cell geometry: 20 px font in a 24 px row (1.2 line height).
 const FONT_SIZE: f32 = 20.0;
@@ -40,9 +103,9 @@ fn cell_origin(col: u32, row: u32, cell_w: f32, cell_h: f32) -> (f32, f32) {
 
 fn font_system() -> FontSystem {
     FontSystem::new_with_fonts([
-        fontdb::Source::File(MONO_PATH.into()),
-        fontdb::Source::File(CJK_PATH.into()),
-        fontdb::Source::File(ETHIOPIC_PATH.into()),
+        fontdb::Source::File(mono_path().into()),
+        fontdb::Source::File(cjk_path().into()),
+        fontdb::Source::File(ethiopic_path().into()),
     ])
 }
 
@@ -129,7 +192,7 @@ fn pinned_fonts_resolve_and_own_every_face() {
     // (cosmic-text calls `db.load_system_fonts()`), so the db is not
     // hermetic: DejaVu, Liberation and friends coexist. The gate is that
     // every pinned face is present and file-backed.
-    for pinned in [MONO_PATH, CJK_PATH, ETHIOPIC_PATH] {
+    for pinned in [mono_path(), cjk_path(), ethiopic_path()] {
         assert!(
             faces
                 .iter()
@@ -185,7 +248,7 @@ fn combining_cluster_stays_within_one_cell() {
         adv <= cell_w + 0.5,
         "combining cluster advance {adv} px must fit one cell of {cell_w} px"
     );
-    assert_eq!(cluster_font_path(&fs, &buffer), MONO_PATH);
+    assert_eq!(cluster_font_path(&fs, &buffer), mono_path());
 }
 
 #[test]
@@ -208,7 +271,7 @@ fn cjk_cluster_is_wide_and_spans_within_two_cells() {
         adv <= 2.0 * cell_w + 0.5,
         "CJK advance {adv} px must fit two cells of {cell_w} px"
     );
-    assert_eq!(cluster_font_path(&fs, &buffer), CJK_PATH);
+    assert_eq!(cluster_font_path(&fs, &buffer), cjk_path());
 }
 
 #[test]
@@ -231,7 +294,7 @@ fn ethiopic_fallback_cluster_spans_within_two_cells() {
         adv <= 2.0 * cell_w + 0.5,
         "Ethiopic advance {adv} px must fit two cells of {cell_w} px"
     );
-    assert_eq!(cluster_font_path(&fs, &buffer), ETHIOPIC_PATH);
+    assert_eq!(cluster_font_path(&fs, &buffer), ethiopic_path());
 }
 
 #[test]

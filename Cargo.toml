@@ -2,7 +2,7 @@
 name = "nora"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.95"
 description = "A fast, efficient, maintainable Linux desktop terminal"
 license = "MIT"
 
