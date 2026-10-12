@@ -10,10 +10,19 @@
 //! The headless session is synchronous: parser replies are produced
 //! inside [`Session::feed`] and enqueued in the same call, so replies
 //! never block under the engine lock — by construction.
+//!
+//! N06a routes every drained engine event through the shared
+//! [`resolve_record`]: `PtyWrite` bytes and the formatter-based query
+//! events (color, text-area size, clipboard load) become reply strings
+//! that both session types accept atomically through the shared
+//! [`ReplyLedger`].
 
 use std::collections::VecDeque;
 
-use crate::engine::Engine;
+use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::vte::ansi::Rgb;
+
+use crate::engine::{Engine, EventRecord};
 
 use io::{BoundedWriter, WriterConfig, WriterError};
 
@@ -21,6 +30,58 @@ pub mod io;
 pub mod pty;
 
 pub use pty::{LaunchSpec, PtyError, PtySession, SessionEvent, SessionId};
+
+/// Nominal headless cell width in pixels (no UI window exists yet, so
+/// pixel-size replies report columns times this value).
+pub const NOMINAL_CELL_WIDTH: u16 = 8;
+
+/// Nominal headless cell height in pixels (no UI window exists yet, so
+/// pixel-size replies report rows times this value).
+pub const NOMINAL_CELL_HEIGHT: u16 = 16;
+
+/// Resolve one drained event record into a reply string.
+///
+/// `PtyWrite` is already engine-formatted. `ColorRequest` applies the
+/// engine's formatter to the raw color table, where unset slots resolve
+/// to their defaults (no seeding). `TextAreaSizeRequest` applies the
+/// engine's formatter to `size` — the session's own window geometry, so
+/// replies never cross sessions. `ClipboardLoad` formats an empty
+/// clipboard (no clipboard state yet — unreachable under
+/// `Osc52::Disabled` until N06b). `ClipboardStore` and every other
+/// variant produces no reply (UI routing is a later card).
+pub(crate) fn resolve_record(
+    engine: &Engine,
+    size: WindowSize,
+    record: EventRecord,
+) -> Option<String> {
+    match record {
+        EventRecord::PtyWrite(reply) => Some(reply),
+        EventRecord::ColorRequest(index, format) => {
+            Some(format(engine.color(index).unwrap_or(default_color(index))))
+        }
+        EventRecord::TextAreaSizeRequest(format) => Some(format(size)),
+        EventRecord::ClipboardLoad(_, format) => Some(format("")),
+        _ => None,
+    }
+}
+
+/// Default for an unset color-table slot, applied at resolution time.
+fn default_color(index: usize) -> Rgb {
+    match index {
+        256 => Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }, // foreground
+        257 => Rgb { r: 0, g: 0, b: 0 }, // background
+        258 => Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }, // cursor
+        _ => Rgb { r: 0, g: 0, b: 0 },
+    }
+}
 
 /// Reply-byte accounting for one parser turn ([`Session::feed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,11 +200,15 @@ impl ReplyLedger {
 /// A headless terminal session: N03 [`Engine`] + N04a [`BoundedWriter`].
 ///
 /// [`Session::feed`] runs one parser turn and then drains every event the
-/// turn produced: parser replies are accepted atomically through the
-/// shared [`ReplyLedger`] and non-reply events are consumed and discarded
-/// (UI routing is a later card).
+/// turn produced: each record is resolved through the shared
+/// [`resolve_record`] and the resulting replies are accepted atomically
+/// through the shared [`ReplyLedger`]; non-reply events are consumed and
+/// discarded (UI routing is a later card).
 pub struct Session {
     engine: Engine,
+    /// The session's own window geometry (rows/cols + nominal cell
+    /// sizes); size replies resolve against it.
+    size: WindowSize,
     writer: BoundedWriter,
     ledger: ReplyLedger,
 }
@@ -154,6 +219,14 @@ impl Session {
     pub fn new(rows: usize, cols: usize, cap: WriterConfig) -> Self {
         Self {
             engine: Engine::new(rows, cols),
+            // Nominal headless geometry: pixel-size replies report
+            // rows/cols times the nominal cell size.
+            size: WindowSize {
+                num_lines: rows as u16,
+                num_cols: cols as u16,
+                cell_width: NOMINAL_CELL_WIDTH,
+                cell_height: NOMINAL_CELL_HEIGHT,
+            },
             writer: BoundedWriter::new(cap),
             ledger: ReplyLedger::new(cap.reserved_bytes.min(cap.max_bytes)),
         }
@@ -165,18 +238,13 @@ impl Session {
         self.engine.feed(bytes);
         let rejected_before = self.ledger.rejected;
         let mut enqueued = 0;
-        // `Engine::replies` accumulates (does not consume), so the drain
-        // is: process everything captured since the last turn, clear the
-        // recorder, and re-check until nothing is pending.
-        loop {
-            let pending = self.engine.replies();
-            if pending.is_empty() {
-                break;
-            }
-            for reply in pending {
+        // One atomic pass: `Engine::drain_events` takes the whole
+        // pending stream in arrival order; every record is resolved to
+        // a reply (or discarded for non-reply variants) in that order.
+        for record in self.engine.drain_events() {
+            if let Some(reply) = resolve_record(&self.engine, self.size, record) {
                 enqueued += self.ledger.accept(&mut self.writer, &reply);
             }
-            self.engine.clear_events();
         }
         FeedResult {
             replies_enqueued: enqueued,

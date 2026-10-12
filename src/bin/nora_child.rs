@@ -9,6 +9,12 @@
 //!   been seen, print `STOPPED`, then read until EOF, exit 0;
 //! - `ws <rows> <cols>`: print `WS:<rows>;<cols>` from the actual terminal
 //!   winsize on stdin (arguments nominal, ignored), exit 0;
+//! - `dying <q-hex>`: print `READY`, wait 100 ms, write the hex-decoded
+//!   query bytes to stdout, exit 0;
+//! - `check <marker> <q-hex> <expect-hex>`: print `READY`, write the
+//!   hex-decoded query bytes to stdout, then read stdin in chunks until the
+//!   contiguous hex-decoded expect bytes are seen (print `CHECK:<marker>`,
+//!   exit 0) or stdin reaches EOF first (print `CHECKFAIL:<marker>`, exit 0);
 //! - anything else: echo fallback.
 
 use std::io::{self, BufRead, Read, Write};
@@ -42,6 +48,23 @@ fn main() {
             stop(&mut out, limit);
         }
         Some("ws") => winsize(&mut out),
+        Some("dying") => {
+            ready(&mut out);
+            // Let READY reach the screen through the loop's normal master
+            // read before the query goes out and the child exits (N06a
+            // decision 9).
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let query = hex_decode(args.get(1).map(String::as_str).unwrap_or(""));
+            let _ = out.write_all(&query);
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        Some("check") => {
+            let marker = args.get(1).map(String::as_str).unwrap_or("?");
+            let query = hex_decode(args.get(2).map(String::as_str).unwrap_or(""));
+            let expect = hex_decode(args.get(3).map(String::as_str).unwrap_or(""));
+            check(&mut out, marker, &query, &expect);
+        }
         Some(_) => echo(&mut out),
     }
 }
@@ -91,6 +114,66 @@ fn winsize(out: &mut impl Write) {
     unsafe { libc::ioctl(0, libc::TIOCGWINSZ as libc::c_ulong, &mut size) };
     let _ = writeln!(out, "WS:{};{}", size.ws_row, size.ws_col);
     let _ = out.flush();
+}
+
+/// Decode pairs of hex digits into bytes (non-hex pairs are ignored).
+fn hex_decode(hex: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks(2) {
+        if let Ok(pair) = std::str::from_utf8(pair) {
+            out.extend(u8::from_str_radix(pair, 16).ok());
+        }
+    }
+    out
+}
+
+/// `READY`, then the query bytes, then wait on stdin for `expect` as a
+/// contiguous byte sequence: `CHECK:<marker>` when seen, `CHECKFAIL:<marker>`
+/// when stdin reaches EOF first; exit 0 either way.
+fn check(out: &mut impl Write, marker: &str, query: &[u8], expect: &[u8]) {
+    ready(out);
+    let _ = out.write_all(query);
+    let _ = out.flush();
+    let mut input = io::stdin().lock();
+    let mut seen: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut found = false;
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&chunk[..n]);
+        if contains_sequence(&seen, expect) {
+            found = true;
+            break;
+        }
+        // Keep only a tail that can still complete a match, so a long-lived
+        // stream never grows the buffer without bound.
+        let keep = expect.len().saturating_sub(1);
+        if seen.len() > keep {
+            seen.drain(..seen.len() - keep);
+        }
+    }
+    if found {
+        let _ = writeln!(out, "CHECK:{marker}");
+    } else {
+        let _ = writeln!(out, "CHECKFAIL:{marker}");
+    }
+    let _ = out.flush();
+}
+
+/// True when `buffer` contains `needle` as a contiguous subsequence (an
+/// empty needle is found anywhere).
+fn contains_sequence(buffer: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    buffer.windows(needle.len()).any(|window| window == needle)
 }
 
 /// `READY`, then echo each stdin line as `E:<line>`; exit 0 on EOF.

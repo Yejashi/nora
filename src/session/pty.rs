@@ -9,9 +9,16 @@
 //! accepted atomically through the shared [`ReplyLedger`]; loop end
 //! surfaces as [`SessionEvent::Terminated`] on every poll after the loop
 //! thread has ended.
+//!
+//! N06a: every drained record is resolved through the shared
+//! [`super::resolve_record`] (`PtyWrite` bytes, color, size and
+//! clipboard-load query events) and the resulting replies are accepted
+//! atomically through the shared [`ReplyLedger`], against this
+//! session's own window geometry.
 
 use std::borrow::Cow;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +30,8 @@ use alacritty_terminal::tty::{self, Options, Pty, Shell};
 
 use crate::engine::{Engine, EventRecord, Recorder};
 
-use super::ReplyLedger;
 use super::io::{BoundedWriter, WriterConfig, WriterError};
+use super::{NOMINAL_CELL_HEIGHT, NOMINAL_CELL_WIDTH, ReplyLedger, resolve_record};
 
 /// Default per-session write budgets (policy values, 03:86-89): 1 MiB
 /// total, 64 KiB reserved for parser replies.
@@ -109,6 +116,9 @@ pub struct PtySession {
     engine: Engine,
     writer: BoundedWriter,
     ledger: ReplyLedger,
+    /// The session's own window geometry, as passed to `tty::new`;
+    /// size replies resolve against it, so they never cross sessions.
+    size: WindowSize,
     sender: EventLoopSender,
     loop_handle: Option<JoinHandle<(EventLoop<Pty, Recorder>, State)>>,
     /// Exit status recorded from the loop's `ChildExit` event, if any.
@@ -121,9 +131,10 @@ impl PtySession {
     /// Mint the id; pre-validate cwd (`PtyError::BadCwd`); spawn the child
     /// (pinned `tty::new` + `EventLoop::new` with `drain_on_exit: true`
     /// and `ref_test: false`) on the engine's shared term handle; run the
-    /// loop on a dedicated thread; wire `Event::PtyWrite` → atomic reply
-    /// headroom (shared [`ReplyLedger`]), `ChildExit` →
-    /// `Terminated(Some(status))`, other events discarded.
+    /// loop on a dedicated thread; route every drained record through
+    /// the shared [`resolve_record`] → atomic reply headroom (shared
+    /// [`ReplyLedger`]), `ChildExit` → `Terminated(Some(status))`, other
+    /// events discarded.
     pub fn spawn(
         spec: LaunchSpec,
         rows: usize,
@@ -148,15 +159,42 @@ impl PtySession {
             env: spec.env.into_iter().collect(),
             drain_on_exit: true,
         };
+        // Nominal headless cell geometry: pixel-size replies report
+        // rows/cols times the nominal cell size.
         let size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
-            // Zero cell sizes are safe: the pinned loop forwards rows and
-            // columns to the child; pixel sizes stay 0.
-            cell_width: 0,
-            cell_height: 0,
+            cell_width: NOMINAL_CELL_WIDTH,
+            cell_height: NOMINAL_CELL_HEIGHT,
         };
         let pty = tty::new(&options, size, id.0).map_err(PtyError::Spawn)?;
+
+        // The pinned `tty::new` sets only IUTF8 on the master
+        // (alacritty_terminal-0.26.0/src/tty/unix.rs:207-210); the slave's
+        // line discipline stays canonical+echo. Raw is the emulator
+        // baseline — children set their own termios like real clients
+        // (N06a decision 8). Best-effort: a termios probe failure must
+        // not fail session start.
+        let fd = pty.file().as_raw_fd();
+        // SAFETY: `libc::termios` is a plain `#[repr(C)]` struct of
+        // integer fields; zero bytes is a valid bit pattern for every
+        // field. `tcgetattr` overwrites the struct before any field is
+        // read, and `tcsetattr` runs only after it succeeded. The fd is
+        // the session's own PTY master, open for I/O.
+        let _raw = unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) == 0 {
+                termios.c_iflag = libc::IUTF8;
+                termios.c_oflag = 0;
+                termios.c_lflag = 0;
+                termios.c_cflag |= libc::CS8 | libc::CLOCAL | libc::CREAD;
+                termios.c_cc[libc::VMIN] = 1;
+                termios.c_cc[libc::VTIME] = 0;
+                libc::tcsetattr(fd, libc::TCSANOW, &termios) == 0
+            } else {
+                false
+            }
+        };
 
         // `drain_on_exit: true`: on child exit the pinned loop can process
         // the exit token before reading master bytes that arrived in the
@@ -172,6 +210,7 @@ impl PtySession {
             engine,
             writer,
             ledger,
+            size,
             sender,
             loop_handle: Some(loop_handle),
             child_status: None,
@@ -312,20 +351,22 @@ impl PtySession {
     ///
     /// The loop thread records its events through the engine's shared
     /// recorder (`PtyWrite` from the shared term, `ChildExit` from the
-    /// loop); this is the main-thread side of that wiring: `PtyWrite`
-    /// replies are accepted atomically through the shared
-    /// [`ReplyLedger`] (rejections counted there, never dropped),
-    /// `ChildExit` records the status, other events are discarded.
+    /// loop); this is the main-thread side of that wiring: every record
+    /// is resolved through the shared [`resolve_record`] (reply strings
+    /// are accepted atomically through the shared [`ReplyLedger`] —
+    /// rejections counted there, never dropped), `ChildExit` records
+    /// the status, and other events are discarded.
     fn process_events(&mut self) {
         for record in self.engine.drain_events() {
             match record {
-                EventRecord::PtyWrite(reply) => {
-                    self.ledger.accept(&mut self.writer, &reply);
-                }
                 EventRecord::ChildExit(status) if self.child_status.is_none() => {
                     self.child_status = Some(status);
                 }
-                _ => {}
+                record => {
+                    if let Some(reply) = resolve_record(&self.engine, self.size, record) {
+                        self.ledger.accept(&mut self.writer, &reply);
+                    }
+                }
             }
         }
     }

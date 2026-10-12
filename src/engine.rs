@@ -21,16 +21,16 @@
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::color::{COUNT, Colors};
 use alacritty_terminal::term::{
     ClipboardType, Config, Term, TermDamage, TermMode, point_to_viewport,
 };
 use alacritty_terminal::vte;
-use alacritty_terminal::vte::ansi::{Color, CursorShape};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, Rgb};
 
 /// Headless terminal engine with ordered event capture.
 pub struct Engine {
@@ -68,23 +68,74 @@ impl Dimensions for Size {
 ///
 /// `Event::ClipboardLoad`, `Event::ColorRequest` and
 /// `Event::TextAreaSizeRequest` carry engine-internal `Arc<dyn Fn>`
-/// formatters; the records keep only the request identity (lossy by design).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// formatters; the records keep those formatters so the session layer
+/// can resolve the requests into replies. Formatters are neither
+/// comparable nor printable, so [`PartialEq`]/[`Eq`] compare variant and
+/// scalar fields only (closures compare equal within a variant) and
+/// `Debug` prints the request identity.
+#[derive(Clone)]
 pub enum EventRecord {
     MouseCursorDirty,
     Title(String),
     ResetTitle,
     ClipboardStore(ClipboardType, String),
-    ClipboardLoad(ClipboardType),
-    ColorRequest(usize),
+    ClipboardLoad(ClipboardType, Arc<dyn Fn(&str) -> String + Sync + Send>),
+    ColorRequest(usize, Arc<dyn Fn(Rgb) -> String + Sync + Send>),
     PtyWrite(String),
-    TextAreaSizeRequest,
+    TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send>),
     CursorBlinkingChange,
     Wakeup,
     Bell,
     Exit,
     ChildExit(ExitStatus),
 }
+
+impl std::fmt::Debug for EventRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventRecord::MouseCursorDirty => write!(f, "MouseCursorDirty"),
+            EventRecord::Title(title) => write!(f, "Title({title:?})"),
+            EventRecord::ResetTitle => write!(f, "ResetTitle"),
+            EventRecord::ClipboardStore(clipboard, text) => {
+                write!(f, "ClipboardStore({clipboard:?}, {text:?})")
+            }
+            EventRecord::ClipboardLoad(clipboard, _) => write!(f, "ClipboardLoad({clipboard:?})"),
+            EventRecord::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
+            EventRecord::PtyWrite(text) => write!(f, "PtyWrite({text})"),
+            EventRecord::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
+            EventRecord::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
+            EventRecord::Wakeup => write!(f, "Wakeup"),
+            EventRecord::Bell => write!(f, "Bell"),
+            EventRecord::Exit => write!(f, "Exit"),
+            EventRecord::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+        }
+    }
+}
+
+impl PartialEq for EventRecord {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EventRecord::MouseCursorDirty, EventRecord::MouseCursorDirty) => true,
+            (EventRecord::Title(a), EventRecord::Title(b)) => a == b,
+            (EventRecord::ResetTitle, EventRecord::ResetTitle) => true,
+            (EventRecord::ClipboardStore(a, x), EventRecord::ClipboardStore(b, y)) => {
+                a == b && x == y
+            }
+            (EventRecord::ClipboardLoad(a, _), EventRecord::ClipboardLoad(b, _)) => a == b,
+            (EventRecord::ColorRequest(a, _), EventRecord::ColorRequest(b, _)) => a == b,
+            (EventRecord::PtyWrite(a), EventRecord::PtyWrite(b)) => a == b,
+            (EventRecord::TextAreaSizeRequest(_), EventRecord::TextAreaSizeRequest(_)) => true,
+            (EventRecord::CursorBlinkingChange, EventRecord::CursorBlinkingChange) => true,
+            (EventRecord::Wakeup, EventRecord::Wakeup) => true,
+            (EventRecord::Bell, EventRecord::Bell) => true,
+            (EventRecord::Exit, EventRecord::Exit) => true,
+            (EventRecord::ChildExit(a), EventRecord::ChildExit(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EventRecord {}
 
 /// Ordered event sink shared between the engine, its owner, and any PTY
 /// event loop driven against the engine's term.
@@ -106,10 +157,10 @@ fn to_record(event: Event) -> EventRecord {
         Event::Title(title) => EventRecord::Title(title),
         Event::ResetTitle => EventRecord::ResetTitle,
         Event::ClipboardStore(clipboard, text) => EventRecord::ClipboardStore(clipboard, text),
-        Event::ClipboardLoad(clipboard, _) => EventRecord::ClipboardLoad(clipboard),
-        Event::ColorRequest(index, _) => EventRecord::ColorRequest(index),
+        Event::ClipboardLoad(clipboard, format) => EventRecord::ClipboardLoad(clipboard, format),
+        Event::ColorRequest(index, format) => EventRecord::ColorRequest(index, format),
         Event::PtyWrite(bytes) => EventRecord::PtyWrite(bytes),
-        Event::TextAreaSizeRequest(_) => EventRecord::TextAreaSizeRequest,
+        Event::TextAreaSizeRequest(format) => EventRecord::TextAreaSizeRequest(format),
         Event::CursorBlinkingChange => EventRecord::CursorBlinkingChange,
         Event::Wakeup => EventRecord::Wakeup,
         Event::Bell => EventRecord::Bell,
@@ -251,6 +302,18 @@ impl Engine {
     /// Current terminal modes.
     pub fn modes(&self) -> TermMode {
         *self.term.lock().mode()
+    }
+
+    /// Raw color-table read under the shared term guard (pinned
+    /// `Term::colors()`): `Some` when the slot is set, `None` when it is
+    /// unset (no seeding here — unset-slot defaults are applied at
+    /// resolution time by the session layer). Indices beyond the table
+    /// are reported as unset.
+    pub fn color(&self, index: usize) -> Option<Rgb> {
+        if index >= COUNT {
+            return None;
+        }
+        self.term.lock().colors()[index]
     }
 
     /// Cursor position in viewport coordinates (0-based row, column).

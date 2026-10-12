@@ -10,7 +10,10 @@
 //! - a pre-validated cwd is honored;
 //! - a failed launch and a bad cwd are clean `PtyError`s (no panic, no hang);
 //! - loop end surfaces as `Terminated` carrying the session's own `SessionId`
-//!   and the expected exit code, and `close()` is idempotent.
+//!   and the expected exit code, and `close()` is idempotent;
+//! - N06a: size replies resolve against each session's own window geometry
+//!   and never cross sessions (stale in-flight replies stay in their own
+//!   session's stream).
 //!
 //! Every wait is deadline-bounded (10 s) and polls every 10 ms on observable
 //! markers only — no sleep guesses.
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nora::session::io::WriterConfig;
+use nora::session::io::{WriterConfig, WriterError};
 use nora::session::pty::{LaunchSpec, PtyError, PtySession, SessionEvent};
 
 /// One poll tick inside the deadline-bounded pumps.
@@ -71,6 +74,16 @@ fn pump(
             ));
         }
         thread::sleep(POLL);
+    }
+}
+
+/// Flush `limit` bytes, tolerating the `Err(WriterError::Closed)` a
+/// session reports once its loop is dead and an in-flight reply can no
+/// longer be delivered (N06a, fixture P1).
+fn flush_tolerant(session: &mut PtySession, limit: usize) {
+    match session.flush(limit) {
+        Ok(_) | Err(WriterError::Closed) => {}
+        Err(error) => panic!("flush: {error:?}"),
     }
 }
 
@@ -317,6 +330,163 @@ fn backpressure_with_stop_reading_child() {
     .expect("session must terminate after close within the deadline");
 
     assert_eq!(session.close(), 0, "second close must release nothing");
+}
+
+/// N06a (fixture P1): a size reply must resolve against each session's
+/// own window geometry and carry that session's own generation identity.
+/// A (`dying 1b5b313474` at 24×80) issues a CSI 14t query and dies with
+/// its `\x1b[4;384;640t` reply still in flight; B (`check B ...` at
+/// 20×100) issues the same query and waits on its stdin for its own
+/// `\x1b[4;320;800t` reply — it must see `CHECK:B`, never `CHECKFAIL`
+/// (A's stale reply bytes must not leak into B's stream), and each
+/// session's `Terminated` must carry its own `SessionId` with a clean
+/// exit status, sticky on every poll after loop end.
+#[test]
+fn size_replies_routed_to_own_session_stale_generation() {
+    let mut a = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["dying".to_string(), "1b5b313474".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("A spawns over a real PTY");
+    let mut b = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec![
+                "check".to_string(),
+                "B".to_string(),
+                "1b5b313474".to_string(),
+                // `\x1b[4;320;800t`: B's own 20×100 geometry at the
+                // nominal 8 px × 16 px cell size.
+                "1b5b343b3332303b38303074".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        20,
+        100,
+        cap(),
+    )
+    .expect("B spawns over a real PTY");
+
+    let a_id = a.id();
+    let b_id = b.id();
+    assert_ne!(a_id, b_id, "spawn ids must differ per session");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut a_events: Vec<SessionEvent> = Vec::new();
+    let mut b_events: Vec<SessionEvent> = Vec::new();
+    let mut a_ready = false;
+    let mut b_checked = false;
+    let mut last_a = String::new();
+    let mut last_b = String::new();
+
+    while Instant::now() < deadline {
+        // An in-flight reply hitting a dead loop reports `Closed`; both
+        // sessions may reach that state in this window.
+        flush_tolerant(&mut a, 256);
+        flush_tolerant(&mut b, 256);
+
+        a_events.append(&mut a.poll_events());
+        b_events.append(&mut b.poll_events());
+
+        last_a = grid_text(&mut a);
+        last_b = grid_text(&mut b);
+        if last_a.contains("READY") {
+            a_ready = true;
+        }
+        if last_b.contains("CHECK:B") {
+            b_checked = true;
+        }
+        assert!(
+            !last_b.contains("CHECKFAIL"),
+            "B's stream must not fail the check; B grid: {last_b:?}"
+        );
+        assert!(
+            !last_a.contains("CHECK"),
+            "A's grid must show only READY; A grid: {last_a:?}"
+        );
+
+        let a_terminated = a_events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Terminated {
+                    session,
+                    status: Some(status),
+                } if *session == a_id && status.code() == Some(0)
+            )
+        });
+        let b_terminated = b_events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Terminated {
+                    session,
+                    status: Some(status),
+                } if *session == b_id && status.code() == Some(0)
+            )
+        });
+        if a_ready && b_checked && a_terminated && b_terminated {
+            break;
+        }
+        thread::sleep(POLL);
+    }
+
+    assert!(a_ready, "A's grid must show READY; last A grid: {last_a:?}");
+    assert!(
+        b_checked,
+        "B must receive its own 20x100 size reply within the deadline; last B grid: {last_b:?}"
+    );
+    // No cross-tagging: every Terminated in each stream carries that
+    // session's own id.
+    assert!(a_events.iter().all(|event| {
+        matches!(
+            event,
+            SessionEvent::Terminated { session, .. } if *session == a_id
+        )
+    }));
+    assert!(b_events.iter().all(|event| {
+        matches!(
+            event,
+            SessionEvent::Terminated { session, .. } if *session == b_id
+        )
+    }));
+
+    // N05b contract: `Terminated` is a state report — sticky on every
+    // poll after loop end.
+    for _ in 0..3 {
+        let a_poll = a.poll_events();
+        assert!(a_poll.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Terminated {
+                    session,
+                    status: Some(status),
+                } if *session == a_id && status.code() == Some(0)
+            )
+        }));
+        let b_poll = b.poll_events();
+        assert!(b_poll.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::Terminated {
+                    session,
+                    status: Some(status),
+                } if *session == b_id && status.code() == Some(0)
+            )
+        }));
+        thread::sleep(POLL);
+    }
+
+    let _ = a.close();
+    assert_eq!(a.close(), 0, "second close must release nothing");
+    let _ = b.close();
+    assert_eq!(b.close(), 0, "second close must release nothing");
 }
 
 /// N05b: the spawn window size must reach the child's actual TIOCGWINSZ.

@@ -8,7 +8,7 @@
 
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use nora::engine::{CellText, Damage, Engine, EventRecord, Snapshot};
 
@@ -270,6 +270,31 @@ fn seeded_random_chunking_matches_single_feed() {
             "seeded chunking iteration {iteration}"
         );
     }
+}
+
+/// N06a (fixture H8): the raw color-table read must reflect exactly what
+/// the parser stored — no seeding, no defaults (those are applied at
+/// resolution time by the session layer).
+#[test]
+fn color_accessor_reflects_table() {
+    let mut engine = Engine::new(4, 8);
+    // The pinned table starts all-unset: no seeding anywhere.
+    assert_eq!(engine.color(256), None, "a fresh table must be all-unset");
+
+    // OSC 10 sets the foreground slot (index 256); `rgb:12/34/56` scales
+    // to Rgb { 0x12, 0x34, 0x56 }.
+    engine.feed(b"\x1b]10;rgb:12/34/56\x07");
+    assert_eq!(
+        engine.color(256),
+        Some(Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56
+        })
+    );
+
+    // A palette slot left unset stays unset.
+    assert_eq!(engine.color(0), None);
 }
 
 /// Deterministic PRNG so the chunking sequence is reproducible.
