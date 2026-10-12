@@ -21,10 +21,11 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, EventLoopSender, Msg, State};
 use alacritty_terminal::tty::{self, Options, Pty, Shell};
 
@@ -224,6 +225,37 @@ impl PtySession {
         })
     }
 
+    /// Resize this session's window: update the shared size and apply
+    /// the same dimensions to the engine grid (they must move together
+    /// — `resolve_record` in `src/session/mod.rs` resolves future size
+    /// replies against `size`, and the pinned `Term::resize` marks the
+    /// terminal fully damaged, so the next [`Engine::snapshot`]
+    /// reports `Damage::Full`), then enqueue a fresh
+    /// `TextAreaSizeRequest` through the shared recorder — the same
+    /// event path as the request at spawn (pty.rs:171): the next
+    /// `process_events` resolves it against this session's own
+    /// updated `WindowSize` (nominal cell geometry, as at spawn) and
+    /// credits the reply through the ledger as usual (no new reply
+    /// kind).
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.size = WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: NOMINAL_CELL_WIDTH,
+            cell_height: NOMINAL_CELL_HEIGHT,
+        };
+        self.engine().resize(rows as usize, cols as usize);
+        self.engine
+            .recorder()
+            .send_event(Event::TextAreaSizeRequest(Arc::new(
+                |window_size: WindowSize| {
+                    let height = window_size.num_lines * window_size.cell_height;
+                    let width = window_size.num_cols * window_size.cell_width;
+                    format!("\x1b[4;{height};{width}t")
+                },
+            )));
+    }
+
     /// This session's generation identity.
     pub fn id(&self) -> SessionId {
         self.id
@@ -390,3 +422,11 @@ impl PtySession {
         }
     }
 }
+
+// The session's writer side is `Arc`-based and `PtyReader` is a raw
+// master handle, so `PtySession` is `Send` — the type of state a window
+// loop must own across its thread.
+const _: () = {
+    const fn _assert<T: Send>() {}
+    _assert::<PtySession>()
+};

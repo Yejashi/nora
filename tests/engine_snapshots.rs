@@ -10,6 +10,7 @@ use alacritty_terminal::vte::ansi::{Color, Rgb};
 
 use nora::engine::{CellText, Damage, Engine, LineDamage, Snapshot};
 use nora::render::snapshot::SnapshotPool;
+use nora::render::term::is_noop_damage;
 
 /// Cell at (row, col) in a row-major snapshot.
 fn cell(snap: &Snapshot, row: usize, col: usize) -> &CellText {
@@ -257,4 +258,119 @@ fn pool_reuses_slots_and_never_exceeds_two() {
     assert_eq!(pool.current(), Some(&c_copy));
     assert_eq!(pool.spare(), Some(&b_copy));
     assert_eq!(prev, a_copy);
+}
+
+/// N08b1: `Engine::probe` reports pending damage WITHOUT resetting it
+/// (pinned `Term::damage` reports, never consumes; the report is
+/// consumed only by the following `snapshot()`'s `reset_damage()`):
+/// two probes back the same non-noop report, the snapshot reads it,
+/// and the post-reset probe shows only the re-damaged current cursor
+/// cell — the written cells are gone.
+#[test]
+fn probe_reports_damage_without_resetting() {
+    let mut engine = Engine::new(24, 80);
+
+    // Consume the pinned initial full damage (N07a) so the pending
+    // report is exactly what the feed below produces.
+    let first = engine.snapshot();
+    assert_eq!(first.damage, Damage::Full);
+
+    // A two-column write on line 0 (cursor ends at (0, 2)), then CUP to
+    // (1, 0). The write path accumulates no damage; `goto` damages the
+    // old and new cursor cells ((0, 2) and (1, 0)), and the pinned
+    // `Term::damage` additionally re-damages the previous cursor cell
+    // (0, 0) plus the current one — the written span is bracketed by
+    // line 0's 0..=2.
+    engine.feed(b"ab\x1b[2;1H");
+
+    let (damage, cursor) = engine.probe();
+    assert_eq!(
+        damage,
+        Damage::Partial(vec![
+            LineDamage {
+                line: 0,
+                left: 0,
+                right: 2
+            },
+            LineDamage {
+                line: 1,
+                left: 0,
+                right: 0
+            },
+        ]),
+        "the probe must report the pending write plus cursor cells"
+    );
+    assert_eq!(cursor, Some((1, 0)));
+
+    // Second probe: the SAME report — the probe does not reset.
+    assert_eq!(
+        engine.probe(),
+        (damage.clone(), cursor),
+        "a second probe must see the same pending report"
+    );
+
+    // The following snapshot reads the pending report (and resets it).
+    let snap = engine.snapshot();
+    assert_eq!(snap.damage, damage, "the snapshot reads the pending report");
+    assert_eq!(snap.cursor, Some((1, 0)));
+    assert_eq!((snap.rows, snap.cols), (24, 80));
+
+    // Post-reset probe: only the re-damaged current cursor cell
+    // remains — `last_cursor` already equals the cursor, so there is
+    // no transition damage, and the written cells are gone (pinned
+    // `reset`).
+    let (damage, cursor) = engine.probe();
+    assert_eq!(
+        damage,
+        Damage::Partial(vec![LineDamage {
+            line: 1,
+            left: 0,
+            right: 0
+        }]),
+        "the post-reset probe must report only the re-damaged cursor cell"
+    );
+    assert_eq!(cursor, Some((1, 0)));
+}
+
+/// N08b1: `Engine::probe` on an idle term reports the pinned no-op
+/// shape — a single cursor cell at the cursor position on the cursor
+/// row — and the following `snapshot()` consumes it (the probe
+/// itself does not reset).
+#[test]
+fn probe_on_idle_term_reports_noop_shape() {
+    let mut engine = Engine::new(24, 80);
+
+    // Consume the pinned initial full damage (N07a).
+    let first = engine.snapshot();
+    assert_eq!(first.damage, Damage::Full);
+
+    // Idle term: exactly one damaged line (the cursor row), a
+    // single-column span at the cursor.
+    let (damage, cursor) = engine.probe();
+    assert!(
+        is_noop_damage(&damage, cursor),
+        "idle probe must be the pinned no-op shape, got {damage:?} cursor {cursor:?}"
+    );
+    assert_eq!(
+        damage,
+        Damage::Partial(vec![LineDamage {
+            line: 0,
+            left: 0,
+            right: 0
+        }])
+    );
+    assert_eq!(cursor, Some((0, 0)));
+
+    // The following snapshot reads (and resets) the pending report.
+    let snap = engine.snapshot();
+    assert_eq!(
+        snap.damage,
+        Damage::Partial(vec![LineDamage {
+            line: 0,
+            left: 0,
+            right: 0
+        }]),
+        "the snapshot reads the pending no-op report"
+    );
+    assert_eq!(snap.cursor, Some((0, 0)));
 }

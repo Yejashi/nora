@@ -511,6 +511,37 @@ impl Engine {
         snapshot
     }
 
+    /// Inspect pending damage without consuming it: the same damage
+    /// conversion and cursor read as [`Engine::snapshot`], but no
+    /// `reset_damage` — the following `snapshot()` reads and resets
+    /// (engine.rs snapshot tail). The pinned `Term::damage` re-damages
+    /// the cursor cell on every call (alacritty_terminal-0.26.0
+    /// term/mod.rs:477-485), which is race-free here: the PTY loop
+    /// thread is the sole feeder, and this probe runs on the owner
+    /// thread under the same term guard as `snapshot()`.
+    pub fn probe(&self) -> (Damage, Option<(usize, usize)>) {
+        let mut term = self.term.lock();
+        let damage = term.damage();
+        let damage = match damage {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(lines) => Damage::Partial(
+                lines
+                    .map(|bounds| LineDamage {
+                        line: bounds.line,
+                        left: bounds.left,
+                        right: bounds.right,
+                    })
+                    .collect(),
+            ),
+        };
+
+        let content = term.renderable_content();
+        let cursor = point_to_viewport(content.display_offset, content.cursor.point)
+            .map(|p| (p.line, p.column.0));
+
+        (damage, cursor)
+    }
+
     /// All events captured so far, in arrival order.
     pub fn events(&self) -> Vec<EventRecord> {
         let state = self

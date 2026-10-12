@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nora::engine::Damage;
 use nora::session::io::{WriterConfig, WriterError};
 use nora::session::pty::{LaunchSpec, PtyError, PtySession, SessionEvent};
 
@@ -561,5 +562,79 @@ fn child_title_surfaces_as_session_title() {
     }
 
     session.join();
+    session.close();
+}
+
+/// N08b1: `PtySession::resize` must move the shared size and the
+/// engine grid together, and the fresh `TextAreaSizeRequest` it
+/// enqueues must credit this session's own ledger: the child's size
+/// reply reflects the new 10×40 geometry (deadline-bounded, P1
+/// cross-session test shape), and the engine's next snapshot reports
+/// `Damage::Full` (pinned `Term::resize` ⇒ Full, alacritty_terminal
+/// term/mod.rs:699-701).
+#[test]
+fn resize_updates_child_and_forces_full_damage() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec![
+                "check".to_string(),
+                "R".to_string(),
+                // Empty query: the child writes nothing and waits on
+                // stdin for the exact reply that `resize()` enqueues.
+                String::new(),
+                // `\x1b[4;160;320t`: 10×40 at the nominal 8 px × 16 px
+                // cell size.
+                "1b5b343b3136303b33323074".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("helper ready within the deadline");
+
+    session.resize(10, 40);
+
+    // The engine's next snapshot reports Full damage (pinned
+    // `Term::resize` ⇒ full damage, term/mod.rs:699-701) — asserted
+    // before the loop below, whose per-tick `grid_text` snapshots and
+    // resets damage.
+    let snap = session.engine().snapshot();
+    assert_eq!(
+        snap.damage,
+        Damage::Full,
+        "engine resize must force Full damage"
+    );
+    assert_eq!((snap.rows, snap.cols), (10, 40));
+
+    // The reply — resolved against the updated 10×40 size and credited
+    // through the ledger — must reach the child, which verifies the
+    // contiguous bytes and emits `CHECK:R` (deadline-bounded, P1 shape:
+    // flush each tick so queued replies actually leave the master).
+    let deadline = Instant::now() + DEADLINE;
+    let mut events: Vec<SessionEvent> = Vec::new();
+    let mut checked = false;
+    while Instant::now() < deadline {
+        flush_tolerant(&mut session, 256);
+        let mut fresh = session.poll_events();
+        events.append(&mut fresh);
+        if grid_text(&mut session).contains("CHECK:R") {
+            checked = true;
+            break;
+        }
+        thread::sleep(POLL);
+    }
+    assert!(
+        checked,
+        "child observed the resized 10x40 geometry within the deadline; saw {} event(s)",
+        events.len()
+    );
+
     session.close();
 }
