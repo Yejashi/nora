@@ -4,3 +4,4 @@
 //! borrowed renderable iterators or terminal locks survive into these types.
 
 pub mod snapshot;
+pub mod term;
