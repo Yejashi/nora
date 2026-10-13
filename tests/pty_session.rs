@@ -1100,7 +1100,9 @@ fn fd_count() -> usize {
 /// N12a: repeated spawn/close must not leak file descriptors. The
 /// property checked is no unbounded growth per spawn/close — the margin
 /// absorbs other test sessions running concurrently in this process
-/// (integration tests share one process), not an exact per-cycle count.
+/// (integration tests share one process, and this binary's ~17 PTY tests
+/// run in parallel, each holding its PTY fds; one parallel run observed
+/// a net +26 within the window), not an exact per-cycle count.
 #[test]
 fn repeated_spawn_close_no_fd_leak() {
     let baseline = fd_count();
@@ -1127,8 +1129,8 @@ fn repeated_spawn_close_no_fd_leak() {
 
     let final_count = fd_count();
     assert!(
-        final_count <= baseline + 8,
-        "fd count must not grow beyond baseline + 8; baseline: {baseline}, final: {final_count}"
+        final_count <= baseline + 48,
+        "fd count must not grow beyond baseline + 48; baseline: {baseline}, final: {final_count}"
     );
 }
 
