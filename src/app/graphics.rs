@@ -17,20 +17,24 @@
 use std::sync::Arc;
 
 use super::glyphs;
+use cosmic_text::UnderlineStyle;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Cursor, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use wgpu::{
-    Adapter, CommandEncoder, CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor,
-    DeviceLostReason, Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, Surface,
-    SurfaceTexture, TextureAspect, TextureFormat, TextureView, TextureViewDescriptor,
+    Adapter, BlendState, BufferDescriptor, BufferUsages, ColorTargetState, CommandEncoder,
+    CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor, DeviceLostReason,
+    FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    PipelineCompilationOptions, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
+    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, StoreOp, Surface, SurfaceTexture,
+    TextureAspect, TextureFormat, TextureView, TextureViewDescriptor, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexState,
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
 use nora::render::state::SurfaceStatus;
-use nora::render::style::CellStyle;
+use nora::render::style::{CellStyle, decoration_style};
 
 /// One cell to draw in a live frame (N13a): its grid position, the full
 /// cluster text (the cell character plus its combining marks), the resolved
@@ -43,37 +47,168 @@ pub struct DrawCell {
     pub col: u32,
     /// The full cluster: the cell character followed by its zerowidth marks.
     pub text: String,
-    /// Resolved visual style (fg/bg/bold/italic/faint/conceal).
+    /// Resolved visual style (fg/bg/bold/italic/faint/conceal/underline/
+    /// strikethrough).
     pub style: CellStyle,
     /// Advance width in cells (1 or 2).
     pub width: u16,
 }
 
-/// Shape one cell with an explicit weight and style (N13a), mirroring
-/// `glyphs::shape_cell` but honoring the resolved cell style. The
-/// family is the generic monospace family so cosmic-text resolves the same
-/// loaded monospace face the rest of the app uses.
+/// Shape one cell with an explicit weight, style and decorations (N13a,
+/// N13c), mirroring `glyphs::shape_cell` but honoring the resolved cell
+/// style. The family is the generic monospace family so cosmic-text
+/// resolves the same loaded monospace face the rest of the app uses.
+///
+/// The underline and strikethrough decorations are set on the shaping
+/// attributes so cosmic-text emits them in the laid-out line's
+/// `decorations` spans, which the render pass reads back and draws (N13c).
 fn shape_styled(
     fs: &mut FontSystem,
     text: &str,
     metrics: Metrics,
     bold: bool,
     italic: bool,
+    underline: UnderlineStyle,
+    strikethrough: bool,
 ) -> Buffer {
     let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
     let style = if italic { Style::Italic } else { Style::Normal };
+    let mut attrs = Attrs::new()
+        .family(Family::Monospace)
+        .weight(weight)
+        .style(style);
+    if underline != UnderlineStyle::None {
+        attrs.text_decoration.underline = underline;
+    }
+    if strikethrough {
+        attrs.text_decoration.strikethrough = true;
+    }
     let mut buffer = Buffer::new(fs, metrics);
-    buffer.set_text(
-        text,
-        &Attrs::new()
-            .family(Family::Monospace)
-            .weight(weight)
-            .style(style),
-        Shaping::Advanced,
-        None,
-    );
+    buffer.set_text(text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_cursor(fs, Cursor::default(), false);
     buffer
+}
+
+/// One vertex for the N13c decoration fill pass: position in normalized
+/// device coordinates, two padding floats (the shader reads only the first
+/// 8 bytes of the 32-byte stride), and the resolved decoration RGBA.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DecoVertex {
+    pos: [f32; 2],
+    _pad: [f32; 2],
+    color: [f32; 4],
+}
+
+/// Build the N13c decoration fill pipeline: a vertex-only pass that draws
+/// pre-clipped decoration rectangles (underline/strikethrough lines) in the
+/// surface format. Opaque RGBA8 fill, no blending, mirroring the glyphon
+/// text pass's output.
+fn decoration_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("nora decoration shader"),
+        source: ShaderSource::Wgsl(
+            r#"
+struct VSOut {
+    @builtin(position) pos: vec4f,
+    @location(0) color: vec4f,
+};
+
+@vertex
+fn vs_main(@location(0) pos: vec2f) -> VSOut {
+    var out: VSOut;
+    out.pos = vec4f(pos, 0.0, 1.0);
+    out.color = vec4f(1.0);
+    return out;
+}
+
+@fragment
+fn fs_main(@location(0) color: vec4f) -> @location(0) vec4f {
+    return color;
+}"#
+            .into(),
+        ),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("nora decoration pipeline"),
+        layout: None,
+        vertex: VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: PipelineCompilationOptions::default(),
+            buffers: &[Some(VertexBufferLayout {
+                array_stride: 32,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[VertexAttribute {
+                    shader_location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            })],
+        },
+        fragment: Some(FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: PipelineCompilationOptions::default(),
+            targets: &[Some(ColorTargetState {
+                format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::default(),
+            })],
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// One decoration line in pixel space, before NDC conversion (N13c).
+#[derive(Clone, Copy)]
+struct DecoLine {
+    /// Left edge (px).
+    x0: f32,
+    /// Right edge (px).
+    x1: f32,
+    /// Top of the cell's row band (px).
+    top: f32,
+    /// Bottom of the cell's row band (px).
+    bottom: f32,
+    /// Top of the line (px, from the baseline).
+    y: f32,
+    /// Line thickness (px).
+    thickness: f32,
+    /// Resolved RGBA.
+    color: [u8; 4],
+}
+
+/// Push one decoration line (clipped to the cell's row band) as two
+/// triangles of NDC [`DecoVertex`]es (N13c).
+fn push_deco_rect(out: &mut Vec<DecoVertex>, line: &DecoLine, frame_w: f32, frame_h: f32) {
+    let y0 = line.y.max(line.top);
+    let y1 = (line.y + line.thickness).min(line.bottom);
+    if y1 <= y0 {
+        return;
+    }
+    let c: [f32; 4] = [
+        line.color[0] as f32 / 255.0,
+        line.color[1] as f32 / 255.0,
+        line.color[2] as f32 / 255.0,
+        line.color[3] as f32 / 255.0,
+    ];
+    let ndc =
+        |px: f32, py: f32| -> [f32; 2] { [2.0 * px / frame_w - 1.0, 1.0 - 2.0 * py / frame_h] };
+    let v = |pos: [f32; 2]| DecoVertex {
+        pos,
+        _pad: [0.0; 2],
+        color: c,
+    };
+    let a = ndc(line.x0, y0);
+    let b = ndc(line.x1, y0);
+    let d = ndc(line.x1, y1);
+    let e = ndc(line.x0, y1);
+    out.extend([v(a), v(b), v(d), v(a), v(d), v(e)]);
 }
 
 /// The background a live frame is cleared to (N02b pattern).
@@ -175,6 +310,8 @@ pub struct Graphics {
     swash: SwashCache,
     viewport: Viewport,
     renderer: TextRenderer,
+    /// N13c decoration (underline/strikethrough) fill pipeline.
+    deco_pipeline: wgpu::RenderPipeline,
 }
 
 impl Graphics {
@@ -236,6 +373,7 @@ impl Graphics {
         let swash = SwashCache::new();
         let viewport = Viewport::new(&device, &cache);
         let renderer = TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let deco_pipeline = decoration_pipeline(&device, format);
 
         Ok(Self {
             adapter,
@@ -249,6 +387,7 @@ impl Graphics {
             swash,
             viewport,
             renderer,
+            deco_pipeline,
         })
     }
 
@@ -349,6 +488,11 @@ impl Graphics {
     /// cells are filtered out by the caller. An empty `cells` clears the
     /// frame to the background. A frame without a texture (an errored
     /// acquire) is left untouched.
+    ///
+    /// N13c: each cell's shaped buffer carries its underline and
+    /// strikethrough decorations in `LayoutRun.decorations`; those spans are
+    /// resolved by [`decoration_style`] and drawn as fill lines in the same
+    /// pass, after the text.
     pub fn draw_frame(
         &mut self,
         frame: &mut Frame,
@@ -373,6 +517,8 @@ impl Graphics {
                 metrics,
                 cell.style.bold,
                 cell.style.italic,
+                cell.style.underline,
+                cell.style.strikethrough,
             ));
         }
 
@@ -432,6 +578,85 @@ impl Graphics {
         self.renderer
             .render(&self.atlas, &self.viewport, &mut pass)
             .map_err(|err| format!("glyph render failed: {err}"))?;
+
+        // N13c: decoration lines (underline/strikethrough) from each cell's
+        // shaped buffer, drawn as fill rectangles in the same pass.
+        let mut deco: Vec<DecoVertex> = Vec::new();
+        if let Some(texture) = frame.texture.as_ref() {
+            let size = texture.texture.size();
+            let frame_w = size.width as f32;
+            let frame_h = size.height as f32;
+            for (cell, buffer) in cells.iter().zip(buffers.iter()) {
+                let Some(run) = buffer.layout_runs().next() else {
+                    continue;
+                };
+                for span in run.decorations {
+                    let ds = decoration_style(span, cell.style.fg);
+                    // The run's baseline relative to the area's top-left
+                    // (glyphon places glyphs at `area.top + line_y + y`);
+                    // decoration offsets are EM units from the baseline,
+                    // positive up.
+                    let baseline = cell.row as f32 * glyphs::CELL_H + run.line_y;
+                    let font_size = span.font_size;
+                    let span_w = cell.width.max(1) as i32;
+                    let x0 = cell.col as f32 * cw;
+                    let x1 = (cell.col as i32 + span_w) as f32 * cw;
+                    let top = cell.row as f32 * glyphs::CELL_H;
+                    let bottom = (cell.row + 1) as f32 * glyphs::CELL_H;
+                    let band = |y: f32, thickness: f32, color: [u8; 4]| DecoLine {
+                        x0,
+                        x1,
+                        top,
+                        bottom,
+                        y,
+                        thickness,
+                        color,
+                    };
+                    if let Some(color) = ds.underline {
+                        let thickness = (span.data.underline_metrics.thickness * font_size)
+                            .max(1.0)
+                            .ceil();
+                        let y = baseline - span.data.underline_metrics.offset * font_size;
+                        push_deco_rect(&mut deco, &band(y, thickness, color), frame_w, frame_h);
+                        if ds.underline_double {
+                            // A second line one thickness below the first.
+                            push_deco_rect(
+                                &mut deco,
+                                &band(y + thickness * 2.0, thickness, color),
+                                frame_w,
+                                frame_h,
+                            );
+                        }
+                    }
+                    if let Some(color) = ds.strikethrough {
+                        let thickness = (span.data.strikethrough_metrics.thickness * font_size)
+                            .max(1.0)
+                            .ceil();
+                        let y = baseline - span.data.strikethrough_metrics.offset * font_size;
+                        push_deco_rect(&mut deco, &band(y, thickness, color), frame_w, frame_h);
+                    }
+                }
+            }
+        }
+        if !deco.is_empty() {
+            let mut bytes = Vec::with_capacity(deco.len() * 32);
+            for v in &deco {
+                for f in v.pos.iter().chain(v._pad.iter()).chain(v.color.iter()) {
+                    bytes.extend_from_slice(&f.to_bits().to_ne_bytes());
+                }
+            }
+            let buffer = self.device.create_buffer(&BufferDescriptor {
+                label: Some("nora decoration vertices"),
+                size: bytes.len() as u64,
+                usage: BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &bytes);
+            pass.set_pipeline(&self.deco_pipeline);
+            pass.set_vertex_buffer(0, buffer.slice(0..));
+            pass.draw(0..deco.len() as u32, 0..1);
+        }
+
         // Dropping `pass` ends it (pinned wgpu 30 `RenderPass` has no
         // explicit finish; the N02 offscreen test follows the same pattern).
         Ok(())

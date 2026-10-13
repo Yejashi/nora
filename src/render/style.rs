@@ -1,14 +1,20 @@
-//! Per-cell style resolution (N13a).
+//! Per-cell style resolution (N13a) and decoration resolution (N13c).
 //!
 //! [`cell_style`] resolves a terminal cell's [`Flags`] (the alacritty
 //! `TermFlags` re-exported by [`crate::engine`]) and colors into a concrete
 //! [`CellStyle`]: resolved RGBA foreground/background plus the bold, italic,
-//! faint and conceal traits. It is pure — it reads only the cell's flags and
-//! the terminal color table, never the GPU.
+//! faint, conceal, underline and strikethrough traits. It is pure — it reads
+//! only the cell's flags and the terminal color table, never the GPU.
+//!
+//! [`decoration_style`] resolves one cosmic-text [`DecorationSpan`] (read
+//! back from a shaped line's `decorations` in the render pass) into a
+//! concrete [`DecorationStyle`]: the resolved underline and strikethrough
+//! colors plus the single/double underline trait.
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, Rgb};
+use cosmic_text::{DecorationSpan, UnderlineStyle};
 
 /// Resolved visual style for one cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +31,12 @@ pub struct CellStyle {
     pub faint: bool,
     /// Concealed: the cell is not drawn.
     pub conceal: bool,
+    /// Underline style (N13c): `UNDERCURL`, `DOTTED_UNDERLINE` and
+    /// `DASHED_UNDERLINE` have no cosmic-text counterpart and collapse to
+    /// [`UnderlineStyle::Single`].
+    pub underline: UnderlineStyle,
+    /// Strikethrough (N13c).
+    pub strikethrough: bool,
 }
 
 /// Resolve a cell's style from its [`Flags`] and colors.
@@ -38,12 +50,24 @@ pub struct CellStyle {
 /// before resolving. `reverse` (INVERSE) swaps foreground and background.
 /// `faint` (DIM) blends the resolved foreground 50% toward the resolved
 /// background, per channel. `italic` (ITALIC) and `conceal` (HIDDEN) set the
-/// matching traits.
+/// matching traits. `underline` (UNDERLINE / DOUBLE_UNDERLINE /
+/// UNDERCURL / DOTTED_UNDERLINE / DASHED_UNDERLINE) and `strikethrough`
+/// (STRIKEOUT) set the matching decoration traits (N13c).
 pub fn cell_style(flags: Flags, fg: Color, bg: Color, colors: &Colors) -> CellStyle {
     let bold = flags.contains(Flags::BOLD);
     let italic = flags.contains(Flags::ITALIC);
     let faint = flags.contains(Flags::DIM);
     let conceal = flags.contains(Flags::HIDDEN);
+    // UNDERCURL, DOTTED_UNDERLINE and DASHED_UNDERLINE have no cosmic-text
+    // counterpart and render as a single underline (N13c).
+    let underline = if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if flags.intersects(Flags::ALL_UNDERLINES) {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
+    };
+    let strikethrough = flags.contains(Flags::STRIKEOUT);
 
     // Bold: a named foreground brightens before it is resolved through the
     // table (e.g. `Named::Red` -> `Named::BrightRed` -> `colors[1]`).
@@ -78,6 +102,52 @@ pub fn cell_style(flags: Flags, fg: Color, bg: Color, colors: &Colors) -> CellSt
         italic,
         faint,
         conceal,
+        underline,
+        strikethrough,
+    }
+}
+
+/// The resolved decoration style for a cell (N13c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecorationStyle {
+    /// The underline color (RGBA), or `None` if no underline.
+    pub underline: Option<[u8; 4]>,
+    /// `true` if the underline is double.
+    pub underline_double: bool,
+    /// The strikethrough color (RGBA), or `None` if no strikethrough.
+    pub strikethrough: Option<[u8; 4]>,
+}
+
+/// Resolve one cosmic-text [`DecorationSpan`] into a concrete
+/// [`DecorationStyle`] (N13c).
+///
+/// The `fg` argument is the cell's resolved foreground RGBA, used as the
+/// ultimate color fallback.
+pub fn decoration_style(span: &DecorationSpan, fg: [u8; 4]) -> DecorationStyle {
+    let td = &span.data.text_decoration;
+    let span_color = span.color_opt.map(|c| c.as_rgba());
+
+    // Three-level color fallback, per decoration: the decoration's explicit
+    // color, then the span's color, then the cell foreground.
+    let resolve = |explicit: Option<cosmic_text::Color>| -> [u8; 4] {
+        explicit.map(|c| c.as_rgba()).or(span_color).unwrap_or(fg)
+    };
+
+    let underline = if td.underline == UnderlineStyle::None {
+        None
+    } else {
+        Some(resolve(td.underline_color_opt))
+    };
+    let strikethrough = if !td.strikethrough {
+        None
+    } else {
+        Some(resolve(td.strikethrough_color_opt))
+    };
+
+    DecorationStyle {
+        underline,
+        underline_double: td.underline == UnderlineStyle::Double,
+        strikethrough,
     }
 }
 
@@ -227,5 +297,35 @@ mod tests {
         );
         assert!(s.bold && s.italic && s.conceal);
         assert_eq!(s.fg, [5, 5, 5, 255]);
+    }
+
+    #[test]
+    fn underline_flags_resolve() {
+        let c = Color::Spec(Rgb { r: 1, g: 1, b: 1 });
+        let s = cell_style(Flags::UNDERLINE, c, BG, &colors());
+        assert_eq!(s.underline, UnderlineStyle::Single);
+        let s = cell_style(Flags::DOUBLE_UNDERLINE, c, BG, &colors());
+        assert_eq!(s.underline, UnderlineStyle::Double);
+        // UNDERCURL, DOTTED and DASHED have no cosmic-text counterpart and
+        // collapse to a single underline (N13c).
+        for f in [
+            Flags::UNDERCURL,
+            Flags::DOTTED_UNDERLINE,
+            Flags::DASHED_UNDERLINE,
+        ] {
+            let s = cell_style(f, c, BG, &colors());
+            assert_eq!(s.underline, UnderlineStyle::Single);
+        }
+        let s = cell_style(Flags::empty(), c, BG, &colors());
+        assert_eq!(s.underline, UnderlineStyle::None);
+    }
+
+    #[test]
+    fn strikeout_flag_resolves() {
+        let c = Color::Spec(Rgb { r: 1, g: 1, b: 1 });
+        let s = cell_style(Flags::STRIKEOUT, c, BG, &colors());
+        assert!(s.strikethrough);
+        let s = cell_style(Flags::empty(), c, BG, &colors());
+        assert!(!s.strikethrough);
     }
 }
