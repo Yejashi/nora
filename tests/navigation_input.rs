@@ -10,7 +10,8 @@
 //! - Alt prefixes `ESC` (the N09 Alt rule); Shift/Ctrl add no `1;N~`
 //!   modifier encoding (the plain sequence is sent); Backspace is `0x7f`
 //!   in both modes;
-//! - F-keys, `Key::Dead`, `Key::Unidentified` → `None` (F-keys are N10b).
+//! - `Key::Dead` and `Key::Unidentified` → `None` (the F-key rows landed
+//!   under N10b in `tests/keypad_input.rs`).
 //!
 //! PTY legs (real child, `nora_child check`, deadline-bounded, 100 ms
 //! settle before grid inspection per the pinned `pty_read` try-lock / EIO
@@ -302,22 +303,11 @@ fn backspace_is_0x7f_in_both_modes() {
     );
 }
 
-/// F-keys stay `None` (N10b); `Key::Dead` and `Key::Unidentified` send
-/// nothing (the N09 `None` rows are unchanged).
+/// F-keys now encode under N10b (`tests/keypad_input.rs`); `Key::Dead`
+/// and `Key::Unidentified` send nothing (the N09 `None` rows are
+/// unchanged).
 #[test]
-fn fkeys_dead_unidentified_send_nothing() {
-    for name in [NamedKey::F1, NamedKey::F2] {
-        assert_eq!(
-            enc_named(name, ModifiersState::empty(), NORMAL),
-            None,
-            "{name:?} has no N10a bytes"
-        );
-        assert_eq!(
-            enc_named(name, ModifiersState::empty(), APP),
-            None,
-            "{name:?} has no N10a bytes (app)"
-        );
-    }
+fn dead_unidentified_send_nothing() {
     let physical = nav_physical();
     assert_eq!(
         encode(

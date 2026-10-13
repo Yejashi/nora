@@ -307,6 +307,10 @@ struct WinApp {
     state: RenderState,
     /// Keyboard modifier state at the last `ModifiersChanged` (N09b).
     mods: ModifiersState,
+    /// Live terminal `TermMode` (N10b): the mode source passed to `encode`.
+    /// Initialized to `SHOW_CURSOR` to match N09b's hard-coded behavior; the
+    /// first pump tick corrects it to the engine's live mode within ~10 ms.
+    modes: TermMode,
     fonts: Option<glyphs::Fonts>,
     graphics: Option<Graphics>,
     window: Option<Arc<Window>>,
@@ -335,6 +339,7 @@ pub fn run_windowed(
         stop,
         state: RenderState::default(),
         mods: ModifiersState::default(),
+        modes: TermMode::SHOW_CURSOR,
         fonts: None,
         graphics: None,
         window: None,
@@ -559,6 +564,12 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     event_loop.exit();
                 }
             }
+            AppEvent::Modes(modes) => {
+                // N10b: the engine's live `TermMode` changed; update the
+                // mode source for `encode`. Mode changes do not dirty the
+                // screen, so no `request_redraw`.
+                self.modes = modes;
+            }
         }
     }
 
@@ -660,7 +671,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     &self.mods,
                     event.repeat,
                     &BindingTable::default(),
-                    TermMode::SHOW_CURSOR,
+                    self.modes,
                 ) {
                     match action {
                         InputAction::Send(bytes) => {

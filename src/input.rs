@@ -44,8 +44,9 @@ impl Default for BindingTable {
 /// change the encoding. `modes` is accepted for N10+ (mode-dependent
 /// input); N09 rows are mode-independent.
 ///
-/// Returns `None` for keys with no meaning in v0.1 (F-keys — N10b;
-/// `Dead`/`Unidentified`; modifier-only presses).
+/// Returns `None` for keys with no meaning in v0.1 (F13+ — deferred to a
+/// future slice; `Dead`; modifier-only presses). F1-F12, the
+/// cursor/navigation keys, and the numpad keys are encoded (N10a/N10b).
 pub fn encode(
     logical: &Key,
     physical: &PhysicalKey,
@@ -67,6 +68,14 @@ pub fn encode(
 
     match logical {
         Key::Character(text) => {
+            // N10b: numpad digit / decimal / comma / equal / operator.
+            // The physical `Numpad*` scancode is authoritative (winit folds
+            // the logical key to `Character`); it wins over the Ctrl / Alt
+            // / plain branches below (Shift/Ctrl add no encoding — the plain
+            // sequence is sent; Alt prefixes an `ESC`).
+            if let Some(key) = keypad_key(physical, mods, modes) {
+                return Some(key);
+            }
             if mods.control_key() {
                 // Ctrl+letter → 0x01–0x1a (case-insensitive), Ctrl+Space →
                 // 0x00. A single keypress carries one codepoint.
@@ -89,6 +98,22 @@ pub fn encode(
             }
         }
         Key::Named(name) => match name {
+            // N10b: numpad Enter / Home / End (physical `NumpadEnter`/
+            // `Numpad7`/`Numpad1` disambiguates from the main row; winit folds
+            // KP_Enter/KP_Home/KP_End to `Enter`/`Home`/`End`). App mode =
+            // `APP_CURSOR || APP_KEYPAD` (decision N10-2).
+            NamedKey::Enter if *physical == PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                keypad_key(physical, mods, modes)
+            }
+            // N10b: numpad Home / End (app positions 7/1) — app: SS3 letter,
+            // normal: `None` (no mode-invariant form). Their DIGIT role is the
+            // `Character` arm (`keypad_key`).
+            NamedKey::Home if *physical == PhysicalKey::Code(KeyCode::Numpad7) => {
+                numpad_seq(None, Some(b'H'), mods, modes)
+            }
+            NamedKey::End if *physical == PhysicalKey::Code(KeyCode::Numpad1) => {
+                numpad_seq(None, Some(b'F'), mods, modes)
+            }
             NamedKey::Enter => Some(InputAction::Send(vec![0x0d])),
             NamedKey::Tab => Some(InputAction::Send(vec![0x09])),
             // The raw slave keeps the kernel `erase` (0x7f); NOT
@@ -105,8 +130,7 @@ pub fn encode(
             }
             // N10a: cursor-key / core navigation (lead decisions
             // N10-1/N10-2). Arrows + Home/End are DECCKM-conditional;
-            // Insert/Delete/PgUp/PgDn are mode-invariant. F-keys stay
-            // `None` (N10b); modifier-only Named presses fall through.
+            // Insert/Delete/PgUp/PgDn are mode-invariant.
             NamedKey::ArrowUp
             | NamedKey::ArrowDown
             | NamedKey::ArrowLeft
@@ -117,12 +141,102 @@ pub fn encode(
             | NamedKey::Delete
             | NamedKey::PageUp
             | NamedKey::PageDown => navigation_key(name, mods, modes),
+            // N10b: F1-F12 (mode-invariant; F13+ remain `None` — PC keyboards
+            // need Ctrl+Fn). Shift/Ctrl add no `1;N~` encoding (N21); Alt
+            // prefixes an `ESC` per the N09 rule.
+            NamedKey::F1 => alt_prefix(vec![0x1b, b'O', b'P'], mods),
+            NamedKey::F2 => alt_prefix(vec![0x1b, b'O', b'Q'], mods),
+            NamedKey::F3 => alt_prefix(vec![0x1b, b'O', b'R'], mods),
+            NamedKey::F4 => alt_prefix(vec![0x1b, b'O', b'S'], mods),
+            NamedKey::F5 => alt_prefix(vec![0x1b, b'[', b'1', b'5', b'~'], mods),
+            NamedKey::F6 => alt_prefix(vec![0x1b, b'[', b'1', b'7', b'~'], mods),
+            NamedKey::F7 => alt_prefix(vec![0x1b, b'[', b'1', b'8', b'~'], mods),
+            NamedKey::F8 => alt_prefix(vec![0x1b, b'[', b'1', b'9', b'~'], mods),
+            NamedKey::F9 => alt_prefix(vec![0x1b, b'[', b'2', b'0', b'~'], mods),
+            NamedKey::F10 => alt_prefix(vec![0x1b, b'[', b'2', b'1', b'~'], mods),
+            NamedKey::F11 => alt_prefix(vec![0x1b, b'[', b'2', b'3', b'~'], mods),
+            NamedKey::F12 => alt_prefix(vec![0x1b, b'[', b'2', b'4', b'~'], mods),
             _ => None,
         },
-        // Dead keys are never bytes in v0.1 (IME duplication rule);
-        // Unidentified has no layout text to encode.
-        Key::Dead(_) | Key::Unidentified(_) => None,
+        // Dead keys are never bytes in v0.1 (IME duplication rule).
+        Key::Dead(_) => None,
+        // N10b: a numpad operator may arrive `Unidentified` (winit folds it
+        // to `Unidentified` when xkbcommon has no character for the keysym);
+        // the physical `Numpad*` scancode is still authoritative.
+        Key::Unidentified(_) => keypad_key(physical, mods, modes),
     }
+}
+
+/// N10b: prefix an `ESC` for Alt (per the N09/N10a Alt rule); Shift/Ctrl
+/// add no `1;N~` modifier encoding in v0.1 (the plain sequence is sent).
+/// Used by the mode-invariant F-key rows.
+fn alt_prefix(bytes: Vec<u8>, mods: &ModifiersState) -> Option<InputAction> {
+    let mut bytes = bytes;
+    if mods.alt_key() {
+        bytes.insert(0, 0x1b);
+    }
+    Some(InputAction::Send(bytes))
+}
+
+/// N10b numpad resolver: `app` = `APP_CURSOR || APP_KEYPAD` (decision
+/// N10-2). App mode sends the SS3 letter (`ESC O <letter>`); normal mode
+/// sends the plain byte (`None` for the numpad Home/End, which have no
+/// mode-invariant form). Shift/Ctrl add no `1;N~` encoding (the plain
+/// sequence is sent); Alt prefixes an `ESC` per the N09/N10a rule.
+fn numpad_seq(
+    plain: Option<u8>,
+    ss3: Option<u8>,
+    mods: &ModifiersState,
+    modes: TermMode,
+) -> Option<InputAction> {
+    let app = modes.contains(TermMode::APP_CURSOR) || modes.contains(TermMode::APP_KEYPAD);
+    let mut bytes = if app {
+        ss3.map(|letter| vec![0x1b, b'O', letter])?
+    } else {
+        plain.map(|byte| vec![byte])?
+    };
+    if mods.alt_key() {
+        bytes.insert(0, 0x1b);
+    }
+    Some(InputAction::Send(bytes))
+}
+
+/// N10b numpad keys, resolved by the authoritative physical `Numpad*`
+/// scancode (winit folds the logical key to `Character`, or to
+/// `Enter`/`Home`/`End` for KP_Enter/KP_Home/KP_End). Returns the
+/// (normal byte, app SS3 letter) for each; `None` for non-numpad physicals
+/// (so main-row keys fall through to the `Character` / `Named` handling).
+/// SS3 letters pinned from the xterm ctlseqs numeric + editing keypads:
+/// 0-9 = `p`-`y` (2625-2649), Home/End = `H`/`F` (2492-2527), `.` = `n`,
+/// Enter = `M`, `+`/`-`/`*`/`/` = `k`/`m`/`j`/`l`, `,` = `l`, `=` = `X`
+/// (2625-2649).
+fn keypad_key(
+    physical: &PhysicalKey,
+    mods: &ModifiersState,
+    modes: TermMode,
+) -> Option<InputAction> {
+    let (plain, ss3): (Option<u8>, Option<u8>) = match physical {
+        PhysicalKey::Code(KeyCode::Numpad0) => (Some(b'0'), Some(b'p')),
+        PhysicalKey::Code(KeyCode::Numpad1) => (Some(b'1'), Some(b'q')),
+        PhysicalKey::Code(KeyCode::Numpad2) => (Some(b'2'), Some(b'r')),
+        PhysicalKey::Code(KeyCode::Numpad3) => (Some(b'3'), Some(b's')),
+        PhysicalKey::Code(KeyCode::Numpad4) => (Some(b'4'), Some(b't')),
+        PhysicalKey::Code(KeyCode::Numpad5) => (Some(b'5'), Some(b'u')),
+        PhysicalKey::Code(KeyCode::Numpad6) => (Some(b'6'), Some(b'v')),
+        PhysicalKey::Code(KeyCode::Numpad7) => (Some(b'7'), Some(b'w')),
+        PhysicalKey::Code(KeyCode::Numpad8) => (Some(b'8'), Some(b'x')),
+        PhysicalKey::Code(KeyCode::Numpad9) => (Some(b'9'), Some(b'y')),
+        PhysicalKey::Code(KeyCode::NumpadDecimal) => (Some(b'.'), Some(b'n')),
+        PhysicalKey::Code(KeyCode::NumpadEnter) => (Some(0x0d), Some(b'M')),
+        PhysicalKey::Code(KeyCode::NumpadAdd) => (Some(b'+'), Some(b'k')),
+        PhysicalKey::Code(KeyCode::NumpadSubtract) => (Some(b'-'), Some(b'm')),
+        PhysicalKey::Code(KeyCode::NumpadMultiply) => (Some(b'*'), Some(b'j')),
+        PhysicalKey::Code(KeyCode::NumpadDivide) => (Some(b'/'), Some(b'l')),
+        PhysicalKey::Code(KeyCode::NumpadComma) => (Some(b','), Some(b'l')),
+        PhysicalKey::Code(KeyCode::NumpadEqual) => (Some(b'='), Some(b'X')),
+        _ => return None,
+    };
+    numpad_seq(plain, ss3, mods, modes)
 }
 
 /// N10a: cursor-key / core navigation rows (lead decisions N10-1/N10-2).

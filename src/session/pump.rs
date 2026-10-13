@@ -16,6 +16,7 @@ use std::time::Duration;
 use super::pty::{PtySession, SessionEvent};
 use crate::engine::Snapshot;
 use crate::render::term::is_noop_damage;
+use alacritty_terminal::term::TermMode;
 
 /// The outcome of one [`pump_tick`].
 #[derive(Clone, Debug)]
@@ -75,6 +76,9 @@ pub enum AppEvent {
     DirtyPulse,
     /// The session child exited (exit code, or None if the loop died without one).
     ChildExit(Option<i32>),
+    /// The engine's live `TermMode` changed (N10b); the window updates its
+    /// `encode` mode source.
+    Modes(TermMode),
 }
 
 /// Window→pump message.
@@ -90,12 +94,15 @@ pub enum PumpMsg {
 /// Each tick: (1) [`pump_tick`]; (2) on the FIRST tick with
 /// `terminated == true`: send [`AppEvent::ChildExit`], `session.close()`,
 /// break; (3) if a snapshot was fetched: store it in the slot and send
-/// [`AppEvent::DirtyPulse`]; (4) drain [`PumpMsg`] commands — resize the
+/// [`AppEvent::DirtyPulse`]; (4) if the engine's live `TermMode` differs
+/// from the last published one (the first tick always publishes,
+/// correcting the window's initial `SHOW_CURSOR`): send
+/// [`AppEvent::Modes`]; (5) drain [`PumpMsg`] commands — resize the
 /// session, or extend the pending input with encoded keystroke bytes;
-/// (5) feed the pending input in order (bounded by the writer's app cap;
+/// (6) feed the pending input in order (bounded by the writer's app cap;
 /// `Ok(0)` = budget full, remainder waits for the next tick;
 /// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
-/// cap per tick; (6) if `stop` is set: break; else sleep 10 ms.
+/// cap per tick; (7) if `stop` is set: break; else sleep 10 ms.
 pub fn pump_thread(
     mut session: PtySession,
     slot: Arc<Mutex<Option<Snapshot>>>,
@@ -104,6 +111,10 @@ pub fn pump_thread(
     stop: Arc<AtomicBool>,
 ) {
     let mut pending_input: Vec<u8> = Vec::new();
+    // N10b: the last published engine `TermMode`. `None` until the first tick,
+    // so the first tick always publishes (correcting the window's initial
+    // `SHOW_CURSOR` to the engine's live mode).
+    let mut last_modes: Option<TermMode> = None;
     loop {
         let outcome = pump_tick(&mut session);
 
@@ -127,6 +138,15 @@ pub fn pump_thread(
                 eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
             }
             let _ = events.send_event(AppEvent::DirtyPulse);
+        }
+
+        // N10b: publish the engine's live `TermMode` on change. `TermMode`
+        // is `Copy`, so the engine guard is dropped before the channel
+        // send — never held across it.
+        let modes = session.engine().modes();
+        if last_modes != Some(modes) {
+            last_modes = Some(modes);
+            let _ = events.send_event(AppEvent::Modes(modes));
         }
 
         while let Ok(msg) = commands.try_recv() {

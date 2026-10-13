@@ -40,6 +40,27 @@ Use this order: IME/composition handling → enabled local shortcuts → normali
 
 Legacy fixture examples to verify in the selected mode: Enter sends CR; Ctrl+C sends byte 0x03 and the child's terminal settings determine interrupt handling; application arrows differ from ordinary arrows. Define Backspace consistently with terminfo, not a guessed universal byte. Non-US layouts, AltGr, dead keys and keypad need tests.
 
+### Input coverage: navigation, F-keys and keypad (N10a/N10b)
+
+Tested by `tests/navigation_input.rs` and `tests/keypad_input.rs` (pure table rows, both `TermMode` values constructed directly, plus PTY legs against `nora_child check`; headless, deadline-bounded).
+
+| Area | v0.1 behavior | Modes | Status / proof |
+| --- | --- | --- | --- |
+| Arrows + Home/End | `ESC [ A`/`B`/`C`/`D`/`H`/`F` normal, `ESC O <letter>` app | DECCKM-conditional on `APP_CURSOR` | pass — table rows + normal/app PTY legs; pinned DECCKM `\e[?1h`/`\e[?1l` (alacritty_terminal 0.26.0 term/mod.rs:2001-2005) |
+| Insert/Delete/PgUp/PgDn | `ESC [ 2~`/`3~`/`5~`/`6~` | mode-invariant | pass — table rows + PTY leg |
+| F1–F4 | `ESC O P`/`Q`/`R`/`S` | mode-invariant | pass — table rows both modes + PTY leg; SS3 forms per xterm ctlseqs [S18] |
+| F5–F12 | `ESC [ 15~`/`17~`/`18~`/`19~`/`20~`/`21~`/`23~`/`24~` | mode-invariant | pass — table rows both modes |
+| F13+ | no bytes (`None`) | — | **deferred** — PC keyboards need Ctrl+Fn to reach F13+; no v0.1 encoding |
+| Numpad digits 0–9 | plain `0`–`9` normal; SS3 `p`–`y` app | app = `APP_CURSOR || APP_KEYPAD` | pass — table rows + app PTY leg |
+| Numpad `.` / Enter | `.` / `0x0d` normal; SS3 `n` / `M` app | app = `APP_CURSOR || APP_KEYPAD` | pass — table rows |
+| Numpad operators `+`/`-`/`*`/`/`, `,`, `=` | plain byte normal; SS3 `k`/`m`/`j`/`l`/`l`/`X` app | app = `APP_CURSOR || APP_KEYPAD` | pass — table rows |
+| Numpad Home/End (physicals `Numpad7`/`Numpad1`) | `None` normal; SS3 `H`/`F` app | app-only | pass — table rows both modes |
+| Backspace | `0x7f` (kernel `erase`) | mode-invariant | pass — table rows |
+| Numpad under `Key::Unidentified` | resolved by physical `Numpad*` scancode | as above | pass — table rows; winit 0.30.13 folds numpad logicals to `Character`/`Enter`/`Home`/`End` (registry `winit-0.30.13/src/keyboard.rs`) |
+| F-key modifier encoding | Shift/Ctrl send the plain row (no `1;N~`); Alt prefixes `ESC` | — | pass — table rows; **deferred**: DECFNK `1;N~` modifier encoding is N21-era (kitty/modern protocol work) |
+
+Mode-drive citations: DECCKM (`APP_CURSOR`) is `CSI ? 1 h/l` (pinned alacritty_terminal 0.26.0 term/mod.rs:2001-2005, vte-0.15.0 private-mode 1 = `CursorKeys`, vte-0.15.0/src/ansi.rs:900); keypad application mode (`APP_KEYPAD`) is the DECKPAM escape pair `ESC =`/`ESC >` (pinned vte-0.15.0 escape-final dispatch, vte-0.15.0/src/ansi.rs:1816-1817; recorded by the pinned alacritty term at term/mod.rs:2180-2188). Note: `CSI ? 6 h` is **not** the keypad on this stack — the pinned `PrivateMode::new` maps 6 to `Origin` (vte-0.15.0/src/ansi.rs:902). SS3 letter assignments pinned from the xterm ctlseqs numeric and editing keypads [S18].
+
 Modern kitty keyboard behavior is negotiated by the application, with a legacy default. Implement only the flags actually supported end to end; verify stack/query/pop handling, modifiers, repeat/release and associated text. The engine exposes flags, but frontend encoding remains separate [S11, S23]. The Alacritty frontend keyboard implementation is a useful Apache-licensed reference [S30, S35]; record the exact revision/notice if adapting code.
 
 ## Paste
