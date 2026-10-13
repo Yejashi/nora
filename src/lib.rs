@@ -6,5 +6,6 @@
 //! `tests/engine_adapter.rs`.
 
 pub mod engine;
+pub mod input;
 pub mod render;
 pub mod session;

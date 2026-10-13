@@ -22,9 +22,12 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::term::TermMode;
 use nora::engine::Damage;
+use nora::input::{BindingTable, InputAction, encode};
 use nora::session::io::{WriterConfig, WriterError};
 use nora::session::pty::{LaunchSpec, PtyError, PtySession, SessionEvent};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey};
 
 /// One poll tick inside the deadline-bounded pumps.
 const POLL: Duration = Duration::from_millis(10);
@@ -635,6 +638,187 @@ fn resize_updates_child_and_forces_full_damage() {
         "child observed the resized 10x40 geometry within the deadline; saw {} event(s)",
         events.len()
     );
+
+    session.close();
+}
+
+/// Lower-case hex for the helper's `check` argv (the helper decodes
+/// two-digit pairs; the payload is strictly hex, so nothing is dropped).
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// N09a: the input encoder's pinned rows become the typed bytes that
+/// reach the real child in order. `a`, `b` and the multi-byte `é`
+/// (UTF-8 must arrive intact through the PTY) plus Enter (`0x0d`) are
+/// encoded with `nora::input::encode` (default `BindingTable`,
+/// `TermMode::SHOW_CURSOR`, fresh press); the helper's `check` mode
+/// matches the exact contiguous byte sequence on stdin and only then
+/// prints `CHECK:N09TYPED` (deadline-bounded, P1 shape). The raw slave
+/// does no ICRNL/ECHO translation, so the sequence carries no line
+/// terminator of its own — `check` needs none.
+#[test]
+fn typed_bytes_reach_the_child_in_order() {
+    // The N09a pinned rows: plain characters (ASCII and multi-byte
+    // UTF-8) and Enter, each a fresh press with no modifiers.
+    let bindings = BindingTable::default();
+    let rows = [
+        (Key::Character("a".into()), PhysicalKey::Code(KeyCode::KeyA)),
+        (
+            Key::Character("b".into()),
+            PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+        ),
+        (
+            Key::Character("é".into()),
+            PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+        ),
+        (
+            Key::Named(NamedKey::Enter),
+            PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+        ),
+    ];
+    let mut input: Vec<u8> = Vec::new();
+    for (logical, physical) in rows {
+        let action = encode(
+            &logical,
+            &physical,
+            &ModifiersState::default(),
+            false,
+            &bindings,
+            TermMode::SHOW_CURSOR,
+        )
+        .expect("pinned N09a row must encode");
+        let InputAction::Send(bytes) = action else {
+            panic!("pinned N09a row must encode to InputAction::Send");
+        };
+        input.extend(bytes);
+    }
+    assert_eq!(input, vec![0x61, 0x62, 0xc3, 0xa9, 0x0d]);
+
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec![
+                "check".to_string(),
+                "N09TYPED".to_string(),
+                String::new(),
+                hex(&input),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("child printed READY within the deadline");
+
+    assert_eq!(session.feed(&input), Ok(input.len()));
+    session
+        .flush(256)
+        .expect("flush must forward the typed bytes");
+
+    // Settle before inspecting: the pinned loop's `pty_read` parses master
+    // bytes only under `try_lock_unfair` (alacritty_terminal-0.26.0
+    // `event_loop.rs`), and a missed try-lock followed by the exited
+    // child's EIO read drops the buffered bytes with the loop's state.
+    // This check child matches and exits within microseconds of the
+    // flush, so the flush tick's own `snapshot` (main-thread term lock)
+    // deterministically contends in that window (Round 26 diagnostic:
+    // verdict parsed without a main pump, dropped with one). Sleeping
+    // here lets match → verdict → exit → parse → terminate complete
+    // with the main thread holding no term lock; 100 ms is three orders
+    // of magnitude over the observed microsecond-scale window.
+    thread::sleep(Duration::from_millis(100));
+
+    pump(&mut session, |text, events| {
+        text.contains("CHECK:N09TYPED") && exited_with(events, 0)
+    })
+    .expect("child matched the exact typed bytes and exited cleanly within the deadline");
+
+    session.close();
+}
+
+/// N09a: a 2048-byte payload fed through the bounded writer in 256-byte
+/// chunks must reach the real child with no loss and no reordering under
+/// backpressure. The helper's `check` mode matches the exact contiguous
+/// sequence on stdin and only then prints `CHECK:N09B64`; a dropped or
+/// reordered byte fails the match and ends in `CHECKFAIL` on close
+/// (deadline-bounded, P1 shape).
+#[test]
+fn slow_child_input_no_loss_in_order() {
+    // 128 × 16 bytes = 2048: deterministic, and exactly eight 256-byte
+    // feed windows.
+    let unit = "nora-0123456789\n";
+    let mut payload: Vec<u8> = Vec::new();
+    for _ in 0..128 {
+        payload.extend_from_slice(unit.as_bytes());
+    }
+    assert_eq!(payload.len(), 2048);
+    let expect_hex = hex(&payload);
+
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec![
+                "check".to_string(),
+                "N09B64".to_string(),
+                String::new(),
+                expect_hex,
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("child printed READY within the deadline");
+
+    // Feed in 256-byte windows. The app budget (192 bytes at the cap)
+    // is smaller than a window, so backpressure surfaces as `Ok(0)` or
+    // a partial count; the outstanding remainder is retried each tick
+    // until the deadline — never dropped.
+    let mut offset = 0;
+    let deadline = Instant::now() + DEADLINE;
+    while offset < payload.len() {
+        if Instant::now() > deadline {
+            panic!(
+                "deadline exceeded feeding the payload; accepted {offset} of {} bytes",
+                payload.len()
+            );
+        }
+        let end = (offset + 256).min(payload.len());
+        match session.feed(&payload[offset..end]) {
+            Ok(accepted) => offset += accepted,
+            // The session ending is a test failure the final pump
+            // reports with the grid; stop retrying and fail there.
+            Err(WriterError::Closed) => break,
+            Err(error) => panic!("feed: {error:?}"),
+        }
+        flush_tolerant(&mut session, 256);
+        let _ = session.poll_events();
+        thread::sleep(POLL);
+    }
+    assert_eq!(
+        offset,
+        payload.len(),
+        "every payload byte must be accepted by the writer"
+    );
+    flush_tolerant(&mut session, 256);
+
+    pump(&mut session, |text, _events| text.contains("CHECK:N09B64"))
+        .expect("child observed all 2048 bytes in order within the deadline");
 
     session.close();
 }
