@@ -9,6 +9,9 @@
 //! anything but the pinned engine calls.
 
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use super::pty::{PtySession, SessionEvent};
 use crate::engine::Snapshot;
@@ -57,5 +60,78 @@ pub fn pump_tick(session: &mut PtySession) -> PumpOutcome {
         terminated,
         status,
         snapshot,
+    }
+}
+
+/// `NORA_DEBUG` gates the window-loop debug lines (N08b2).
+fn debug_enabled() -> bool {
+    std::env::var_os("NORA_DEBUG").is_some()
+}
+
+/// Window-loop events from the pump thread (the ONLY pump→window protocol).
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    /// The pump fetched a snapshot (stored in the shared slot); non-noop damage.
+    DirtyPulse,
+    /// The session child exited (exit code, or None if the loop died without one).
+    ChildExit(Option<i32>),
+}
+
+/// Window→pump message.
+pub enum PumpMsg {
+    /// Resize the PTY session to (rows, cols) and re-pump.
+    Resize(usize, usize),
+}
+
+/// Bounded pump thread: owns the session; ticks until terminated or stopped.
+///
+/// Each tick: (1) [`pump_tick`]; (2) on the FIRST tick with
+/// `terminated == true`: send [`AppEvent::ChildExit`], `session.close()`,
+/// break; (3) if a snapshot was fetched: store it in the slot and send
+/// [`AppEvent::DirtyPulse`]; (4) drain [`PumpMsg::Resize`] and resize the
+/// session; (5) if `stop` is set: break; else sleep 10 ms.
+pub fn pump_thread(
+    mut session: PtySession,
+    slot: Arc<Mutex<Option<Snapshot>>>,
+    events: winit::event_loop::EventLoopProxy<AppEvent>,
+    commands: mpsc::Receiver<PumpMsg>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        let outcome = pump_tick(&mut session);
+
+        if outcome.terminated {
+            // N06b: surface the last title set by the child, on stderr,
+            // before the loop folds `ChildExited`.
+            if let Some(title) = session.title() {
+                eprintln!("title: {title}");
+            }
+            let _ = events.send_event(AppEvent::ChildExit(
+                outcome.status.and_then(|status| status.code()),
+            ));
+            session.close();
+            break;
+        }
+
+        if let Some(snapshot) = outcome.snapshot {
+            let (rows, cols) = (snapshot.rows, snapshot.cols);
+            *slot.lock().unwrap() = Some(snapshot);
+            if debug_enabled() {
+                eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
+            }
+            let _ = events.send_event(AppEvent::DirtyPulse);
+        }
+
+        while let Ok(PumpMsg::Resize(rows, cols)) = commands.try_recv() {
+            if debug_enabled() {
+                eprintln!("debug: pump: resize message {rows}x{cols}");
+            }
+            session.resize(rows as u16, cols as u16);
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }

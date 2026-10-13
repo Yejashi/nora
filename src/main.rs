@@ -3,10 +3,12 @@
 //! CLI (N00): the binary identifies itself and its version.
 //! Smoke (N01): `--smoke` runs one automated window smoke cycle and exits
 //! with a status code reflecting success (never the launch path).
-//! Launch (N05b): `nora -- COMMAND ARG...` runs the command headless on a
-//! PTY session and exits with the command's exit status (1 for signal
-//! death or a loop death without one); with no command the default shell
-//! (`$SHELL`, else `/bin/sh`) is launched and a clean close exits 0.
+//! Launch (N05b/N08b2b-2): `nora -- COMMAND ARG...` (and bare `nora`) opens
+//! the windowed session and exits with the command's exit status (1 for
+//! signal death or a loop death without one); with no command the default
+//! shell (`$SHELL`, else `/bin/sh`) is launched and a clean close exits 0.
+//! With no display server available the launch falls back to the headless
+//! session pump (CI-safe).
 
 mod app;
 
@@ -106,7 +108,10 @@ fn main() -> ExitCode {
             env: vec![],
         }
     };
-    run_session(spec, explicit)
+    // Bare `nora` and `nora -- COMMAND ARG...` both open the windowed
+    // session (N08b2b-2); `run_windowed` falls back to the headless
+    // session pump when no display server is available (CI-safe).
+    run_windowed(spec, explicit)
 }
 
 /// Headless launch (N05b). 24×80 is the documented headless placeholder
@@ -142,6 +147,69 @@ fn run_session(spec: LaunchSpec, explicit: bool) -> ExitCode {
         0
     };
     ExitCode::from(code as u8)
+}
+
+/// Windowed interactive launch (N08b2b-2). The pump thread owns the
+/// session; the event loop owns the window and the render state. A
+/// headless environment (no display server) falls back to the N05b
+/// headless session pump, so `nora -- CMD` stays CI-safe. Exits with
+/// the child's exit status when explicit (1 on a loop death without
+/// one), 0 on a clean default-shell close, or 1 on a startup failure.
+fn run_windowed(spec: LaunchSpec, explicit: bool) -> ExitCode {
+    let event_loop =
+        match winit::event_loop::EventLoop::<nora::session::pump::AppEvent>::with_user_event()
+            .build()
+        {
+            Ok(event_loop) => event_loop,
+            Err(err) => {
+                eprintln!("{NAME} {VERSION}: no display server ({err}); headless session");
+                return run_session(spec, explicit);
+            }
+        };
+
+    // The session starts at the window's initial grid: the font
+    // metrics are pure (no display needed), so the child sees the
+    // window's WINSIZE from the first byte and the initial
+    // `WindowEvent::Resized` asks the pump for the same grid (a no-op
+    // engine resize: no damage, no pulse, no extra frame).
+    let fonts = app::glyphs::Fonts::load();
+    let (cols, rows) = app::glyphs::grid_size(
+        app::INITIAL_SIZE.0 as u32,
+        app::INITIAL_SIZE.1 as u32,
+        fonts.cell_w,
+        fonts.cell_h(),
+    );
+    let session = match PtySession::spawn(spec, rows as usize, cols as usize, DEFAULT_CAP) {
+        Ok(session) => session,
+        Err(err) => {
+            let message = match &err {
+                PtyError::BadCwd(path) => format!(
+                    "working directory '{}' does not exist or is not a directory",
+                    path.display()
+                ),
+                PtyError::Spawn(source) => format!("session could not be started: {source}"),
+            };
+            eprintln!("{NAME} {VERSION}: {message}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let slot: std::sync::Arc<std::sync::Mutex<Option<nora::engine::Snapshot>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (pump_commands, pump_commands_rx) =
+        std::sync::mpsc::channel::<nora::session::pump::PumpMsg>();
+    let proxy = event_loop.create_proxy();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The pump thread gets its own Arcs; the window loop keeps these.
+    let pump_slot = slot.clone();
+    let pump_stop = stop.clone();
+    let pump = std::thread::spawn(move || {
+        nora::session::pump::pump_thread(session, pump_slot, proxy, pump_commands_rx, pump_stop)
+    });
+    let code = app::run_windowed(event_loop, slot, pump_commands, stop.clone(), explicit);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = pump.join();
+    code
 }
 
 #[cfg(test)]
