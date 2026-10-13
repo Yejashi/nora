@@ -11,6 +11,9 @@
 //!   winsize on stdin (arguments nominal, ignored), exit 0;
 //! - `dying <q-hex>`: print `READY`, wait 100 ms, write the hex-decoded
 //!   query bytes to stdout, exit 0;
+//! - `descendant <hold_ms>`: print `READY`, spawn `/bin/sleep <hold_ms
+//!   as seconds>` with inherited stdin (it holds the slave PTY fd),
+//!   wait for it, print `DESCENDANT-DONE`, exit 0;
 //! - `title <t>`: print `READY`, wait 100 ms, write `\x1b]0;<t>\x07` to
 //!   stdout, exit 0;
 //! - `check <marker> <q-hex> <expect-hex>`: print `READY`, write the
@@ -76,6 +79,9 @@ fn main() {
             let query = hex_decode(args.get(2).map(String::as_str).unwrap_or(""));
             let expect = hex_decode(args.get(3).map(String::as_str).unwrap_or(""));
             check(&mut out, marker, &query, &expect);
+        }
+        Some("descendant") => {
+            descendant(&mut out, args.get(1).map(String::as_str).unwrap_or("0"));
         }
         Some(_) => echo(&mut out),
     }
@@ -186,6 +192,25 @@ fn contains_sequence(buffer: &[u8], needle: &[u8]) -> bool {
         return true;
     }
     buffer.windows(needle.len()).any(|window| window == needle)
+}
+
+/// `READY`, then spawn `/bin/sleep <hold_ms as seconds>` with inherited
+/// stdin (it holds the slave PTY fd for the whole hold), wait for it,
+/// print `DESCENDANT-DONE`, and exit 0 (N12a).
+fn descendant(out: &mut impl Write, hold_ms: &str) {
+    ready(out);
+    let ms = hold_ms.parse::<u64>().unwrap_or(0);
+    // Convert milliseconds to a seconds string, e.g. 300 -> "0.300".
+    let seconds = format!("{}.{:03}", ms / 1000, ms % 1000);
+    // Inherited stdin: the grandchild keeps the slave PTY fd open for
+    // the whole hold, exercising the bounded final drain (N12a).
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg(seconds);
+    command.stdin(std::process::Stdio::inherit());
+    let _ = command.status();
+    let _ = writeln!(out, "DESCENDANT-DONE");
+    let _ = out.flush();
+    std::process::exit(0);
 }
 
 /// `READY`, then echo each stdin line as `E:<line>`; exit 0 on EOF.

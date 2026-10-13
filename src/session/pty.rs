@@ -15,21 +15,29 @@
 //! clipboard-load query events) and the resulting replies are accepted
 //! atomically through the shared [`ReplyLedger`], against this
 //! session's own window geometry.
+//!
+//! N12a: the bounded child-exit lifecycle — the pinned `Lifecycle`
+//! state chain (`Starting → Running → Exiting → Exited → Closed`),
+//! [`PtySession::wait_drain`] (the bounded wait for the session loop
+//! thread) and [`DRAIN_TIMEOUT`] (5 s). Finiteness is nora-side: the
+//! pinned `drain_on_exit` read has no in-crate timeout
+//! (alacritty_terminal 0.26.0 `event_loop.rs`).
 
 use std::borrow::Cow;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, EventLoopSender, Msg, State};
-use alacritty_terminal::tty::{self, Options, Pty, Shell};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, EventLoopSender, Msg};
+use alacritty_terminal::tty::{self, Options, Shell};
 
-use crate::engine::{Engine, EventRecord, Recorder};
+use crate::engine::{Engine, EventRecord};
 
 use super::io::{BoundedWriter, WriterConfig, WriterError};
 use super::{NOMINAL_CELL_HEIGHT, NOMINAL_CELL_WIDTH, ReplyLedger, resolve_record};
@@ -90,6 +98,36 @@ impl SessionId {
     }
 }
 
+/// The session's bounded child-exit lifecycle (N12a, 03:107):
+/// `Starting → Running → Exiting → Exited → Closed`.
+///
+/// Writers (pinned): the main thread sets `Running` at spawn (after
+/// the loop handle is assigned — the loop thread never sets `Running`)
+/// and folds `Exiting` on the first child-exit fold; the session loop
+/// thread folds `Exiting` on its return path (every exit path of the
+/// pinned PTY reader funnels through it — covers a loop death without
+/// a child-exit event) and signals its finish; `close()` (main thread
+/// only) folds `Exited` after the bounded wait and `Closed` after
+/// joining the loop thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Spawn, before the loop handle is assigned (transient).
+    Starting,
+    /// The session is live (loop handle assigned).
+    Running,
+    /// A child exit was folded, or the loop thread is exiting.
+    Exiting,
+    /// `close()`'s bounded wait for the loop thread returned.
+    Exited,
+    /// The loop thread is joined; `close()` completed.
+    Closed,
+}
+
+/// Bound for every drain wait of the session loop thread (N12a): the
+/// pinned `drain_on_exit` read has no in-crate timeout, so finiteness
+/// is nora-side (03:107).
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `status` is `Some` on a clean child exit (`Event::ChildExit`), `None`
 /// when the loop died from an I/O or registration error. Not
 /// `PartialEq`-able (`ExitStatus`) — assert with `matches!` +
@@ -121,11 +159,26 @@ pub struct PtySession {
     /// size replies resolve against it, so they never cross sessions.
     size: WindowSize,
     sender: EventLoopSender,
-    loop_handle: Option<JoinHandle<(EventLoop<Pty, Recorder>, State)>>,
+    /// The session loop thread (N12a): a wrapper around the pinned PTY
+    /// reader that folds [`Lifecycle::Exiting`] on the wrapper's return
+    /// (every exit path of the pinned loop funnels through it) and
+    /// signals `done` before returning. Present while the thread is
+    /// unjoined; `terminated()` uses the handle while present.
+    loop_handle: Option<JoinHandle<()>>,
+    /// Current lifecycle state (N12a), shared main ↔ loop thread.
+    lifecycle: Arc<Mutex<Lifecycle>>,
+    /// The loop thread finished (N12a): set by the loop thread on
+    /// every exit path, then it notifies `done_notify`; `wait_drain`
+    /// waits on it (bounded).
+    done: Arc<Mutex<bool>>,
+    done_notify: Arc<Condvar>,
     /// Exit status recorded from the loop's `ChildExit` event, if any.
     child_status: Option<ExitStatus>,
     /// Whether `Msg::Shutdown` has been sent.
     shutdown_sent: bool,
+    /// A terminated loop with no child-exit event was reported once
+    /// (N12a): `observe_loop_end` keeps the stderr line singular.
+    loop_end_reported: bool,
     /// Last title set by the terminal (latest wins), `None` when the
     /// title was reset or never set. Folded on the main thread from
     /// drained [`EventRecord::Title`]/[`EventRecord::ResetTitle`]
@@ -209,7 +262,34 @@ impl PtySession {
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
             .map_err(PtyError::Spawn)?;
         let sender = loop_.channel();
-        let loop_handle = loop_.spawn();
+
+        // N12a: the session loop thread wraps the pinned PTY reader.
+        // Every exit path of the pinned loop (child exit, I/O error,
+        // registration error, shutdown) funnels through the wrapper's
+        // return: fold `Exiting` there (covers a loop death without a
+        // child-exit event), then signal `done` before returning. The
+        // main thread sets `Running` after the loop handle is
+        // assigned — the loop thread never sets `Running`.
+        let lifecycle = Arc::new(Mutex::new(Lifecycle::Starting));
+        let done = Arc::new(Mutex::new(false));
+        let done_notify = Arc::new(Condvar::new());
+        let lifecycle_loop = lifecycle.clone();
+        let done_loop = done.clone();
+        let done_notify_loop = done_notify.clone();
+        let loop_handle = std::thread::Builder::new()
+            .name(format!("nora session {}", id.0))
+            .spawn(move || {
+                let pinned = loop_.spawn();
+                let _ = pinned.join();
+                *lifecycle_loop
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Exiting;
+                *done_loop.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                done_notify_loop.notify_all();
+            })
+            .map_err(PtyError::Spawn)?;
+
+        *lifecycle.lock().unwrap_or_else(PoisonError::into_inner) = Lifecycle::Running;
 
         Ok(Self {
             id,
@@ -219,8 +299,12 @@ impl PtySession {
             size,
             sender,
             loop_handle: Some(loop_handle),
+            lifecycle,
+            done,
+            done_notify,
             child_status: None,
             shutdown_sent: false,
+            loop_end_reported: false,
             title: None,
         })
     }
@@ -277,6 +361,32 @@ impl PtySession {
     /// thread; see the struct docs).
     pub fn title(&self) -> Option<String> {
         self.title.clone()
+    }
+
+    /// The session's current lifecycle state (N12a, 03:107).
+    pub fn lifecycle(&self) -> Lifecycle {
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Bounded wait for the session loop thread to finish (N12a).
+    ///
+    /// Returns `true` if the loop finished within `timeout`.
+    /// Finiteness is nora-side: the pinned `drain_on_exit` read has no
+    /// in-crate timeout, so every join/close path goes through this
+    /// bound (03:107).
+    pub fn wait_drain(&self, timeout: Duration) -> bool {
+        let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*done {
+            let (guard, _timeout_result) = self
+                .done_notify
+                .wait_timeout(done, timeout)
+                .unwrap_or_else(PoisonError::into_inner);
+            done = guard;
+        }
+        *done
     }
 
     /// App bytes into the writer's app budget (partial acceptance,
@@ -349,6 +459,7 @@ impl PtySession {
         self.process_events();
         let mut events = Vec::new();
         if self.terminated() {
+            self.observe_loop_end();
             events.push(SessionEvent::Terminated {
                 session: self.id,
                 status: self.child_status,
@@ -365,23 +476,56 @@ impl PtySession {
         }
     }
 
-    /// Block until the loop thread ends; the child's exit status if a clean
-    /// child exit was observed. The status is state, not a one-shot: it is
+    /// Block until the loop thread has ended — bounded by
+    /// [`DRAIN_TIMEOUT`] (N12a: the pinned `drain_on_exit` read has no
+    /// in-crate timeout) — the child's exit status if a clean child
+    /// exit was observed. The status is state, not a one-shot: it is
     /// also carried by every `Terminated` after loop end.
     pub fn join(&mut self) -> Option<ExitStatus> {
-        if let Some(handle) = self.loop_handle.take() {
+        let finished = self.wait_drain(DRAIN_TIMEOUT);
+        if !finished {
+            Self::warn_drain_timeout();
+        }
+        if let Some(handle) = self.loop_handle.take()
+            && finished
+        {
             let _ = handle.join();
         }
         self.process_events();
+        self.observe_loop_end();
         self.child_status
     }
 
-    /// Release writer bytes and send `Msg::Shutdown`. Idempotent.
+    /// Release writer bytes and send `Msg::Shutdown`, then wait for the
+    /// loop thread to finish (bounded by [`DRAIN_TIMEOUT`], N12a), fold
+    /// `Exited`, and join the loop thread (folding `Closed`).
+    /// Idempotent: a second call returns 0 without touching the writer.
     pub fn close(&mut self) -> usize {
+        if self.lifecycle() == Lifecycle::Closed {
+            return 0;
+        }
         self.process_events();
+        self.observe_loop_end();
         let released = self.writer.cancel();
         self.ledger.release();
         self.send_shutdown();
+        let finished = self.wait_drain(DRAIN_TIMEOUT);
+        if !finished {
+            Self::warn_drain_timeout();
+        }
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Exited;
+        if let Some(handle) = self.loop_handle.take()
+            && finished
+        {
+            let _ = handle.join();
+        }
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Closed;
         released
     }
 
@@ -424,6 +568,13 @@ impl PtySession {
             match record {
                 EventRecord::ChildExit(status) if self.child_status.is_none() => {
                     self.child_status = Some(status);
+                    // N12a: the first child-exit fold also folds
+                    // `Exiting` (idempotent value — the loop thread
+                    // folds the same value on its return path).
+                    *self
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Exiting;
                 }
                 record => {
                     if let Some(reply) = resolve_record(&self.engine, self.size, record) {
@@ -432,6 +583,29 @@ impl PtySession {
                 }
             }
         }
+    }
+
+    /// Report a loop end without a child-exit event exactly once
+    /// (N12a): the pinned loop sends `ChildExit` before returning on
+    /// every clean exit, so a terminated loop with no folded status is
+    /// a launch/worker failure — visible, never silent (03:107).
+    /// Called from the main-thread observation points
+    /// ([`Self::poll_events`] and [`Self::join`]); on a live windowed
+    /// session the pump thread is that driver.
+    fn observe_loop_end(&mut self) {
+        if self.terminated() && !self.loop_end_reported {
+            self.loop_end_reported = true;
+            if self.child_status.is_none() {
+                eprintln!("nora: error: session loop exited without a child-exit event");
+            }
+        }
+    }
+
+    /// One stderr line when the bounded drain does not finish in time
+    /// (N12a): the loop thread is then detached (process-lifetime
+    /// bounded) and the join proceeds.
+    fn warn_drain_timeout() {
+        eprintln!("nora: session drain timed out; detaching loop thread");
     }
 }
 

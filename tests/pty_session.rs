@@ -25,8 +25,11 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::term::TermMode;
 use nora::engine::Damage;
 use nora::input::{BindingTable, InputAction, encode};
+use nora::render::term::is_noop_damage;
 use nora::session::io::{WriterConfig, WriterError};
-use nora::session::pty::{LaunchSpec, PtyError, PtySession, SessionEvent};
+use nora::session::pty::{
+    DRAIN_TIMEOUT, LaunchSpec, Lifecycle, PtyError, PtySession, SessionEvent,
+};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey};
 
 /// One poll tick inside the deadline-bounded pumps.
@@ -887,4 +890,273 @@ fn zero_resize_retains_last_valid_geometry() {
     );
 
     session.close();
+}
+
+/// N12a: the session lifecycle is a deterministic state machine over the
+/// observable surfaces: `spawn` → `Running`; the terminated fold (clean
+/// child exit) → `Exiting`; `close()` → `Closed` (idempotent); and the
+/// reap-once leg — repeated `poll_events()`/`join()` keep reporting the
+/// same `Some(0)` status, never `None` and never another code
+/// (deadline-bounded; 100 ms settle before inspecting per the pinned
+/// `pty_read` gap).
+#[test]
+fn lifecycle_transitions_deterministic() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["status".to_string(), "0".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Running,
+        "spawn must be Running"
+    );
+
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("terminated fold with status Some(0) within the deadline");
+
+    // Settle before inspecting: the pinned loop's `pty_read` parses master
+    // bytes only under a try-lock; a missed try-lock followed by the exited
+    // child's EIO read drops buffered bytes with the loop's state.
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Exiting,
+        "the terminated fold must be visible as Exiting"
+    );
+
+    session.close();
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Closed,
+        "close must land on Closed"
+    );
+
+    // Idempotent: a second close is a no-op that stays `Closed`.
+    session.close();
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Closed,
+        "a second close must stay Closed (idempotent)"
+    );
+
+    // Reap-once leg: the status is a state report — repeated polls and
+    // joins keep reporting the same `Some(0)`, never `None` or another code.
+    let id = session.id();
+    for _ in 0..3 {
+        let events = session.poll_events();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    SessionEvent::Terminated {
+                        session: sid,
+                        status: Some(status),
+                    } if *sid == id && status.code() == Some(0)
+                )
+            }),
+            "Terminated must stay a state report with status Some(0) after close"
+        );
+        let joined = session.join();
+        assert_eq!(
+            joined.as_ref().and_then(|status| status.code()),
+            Some(0),
+            "repeated join() must keep reporting the same status"
+        );
+        thread::sleep(POLL);
+    }
+}
+
+/// N12a: final emitted bytes must be visible before normal close. The
+/// helper's `argv` mode prints its token line (`A:1 N12FINAL`) and exits
+/// 0; after the terminated fold + 100 ms settle, the token must be in the
+/// grid — proven by a fresh guard-protected snapshot when there is new
+/// damage, else by the grid text the pump last fetched — and `close()`
+/// must return well within the drain bound without hanging.
+#[test]
+fn final_bytes_before_close() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["argv".to_string(), "N12FINAL".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    // The pump's satisfying tick is the last grid text fetched; it must
+    // have seen both the token and the exit.
+    let mut last = String::new();
+    pump(&mut session, |text, events| {
+        last = text.to_string();
+        text.contains("N12FINAL") && exited_with(events, 0)
+    })
+    .expect("final token visible and child exited 0 within the deadline");
+
+    // Settle before inspecting (pinned `pty_read` try-lock gap).
+    thread::sleep(Duration::from_millis(100));
+
+    // Term-guard idiom: `probe` (non-resetting) gates the next `snapshot`
+    // (consumes + resets the damage), the same pair the live pump ticks.
+    let (damage, cursor) = session.engine().probe();
+    let text = if is_noop_damage(&damage, cursor) {
+        // No new damage since the pump's last tick: the grid text it
+        // fetched on its satisfying tick already shows the token.
+        last
+    } else {
+        let snap = session.engine().snapshot();
+        snap.cells.iter().map(|cell| cell.ch).collect()
+    };
+    assert!(
+        text.contains("N12FINAL"),
+        "the grid must show the final token; grid: {text:?}"
+    );
+
+    let started = Instant::now();
+    session.close();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < DRAIN_TIMEOUT,
+        "close must return within the drain bound (no hang); elapsed: {elapsed:?}"
+    );
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Closed,
+        "close must land on Closed"
+    );
+}
+
+/// N12a: a descendant that inherits the slave fd and holds it must not
+/// hang the session. `close()` right after the child exits waits for the
+/// pinned `drain_on_exit` read, which stays blocked until the grandchild
+/// releases the slave at ~0.3 s — the wait must return well under the
+/// drain bound, land on `Closed`, and the grandchild's marker line must
+/// reach the grid.
+#[test]
+fn descendant_bounded_drain() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["descendant".to_string(), "300".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("helper ready within the deadline");
+
+    // Close immediately: the loop is still inside the pinned
+    // `drain_on_exit` read until the grandchild releases the slave at
+    // ~0.3 s, so this exercises the bounded wait inside `close()`.
+    let started = Instant::now();
+    session.close();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "close must return well under DRAIN_TIMEOUT ({:?}); elapsed: {elapsed:?}",
+        DRAIN_TIMEOUT
+    );
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Closed,
+        "close must land on Closed"
+    );
+
+    // Settle before inspecting (pinned `pty_read` try-lock gap).
+    thread::sleep(Duration::from_millis(100));
+
+    let text = grid_text(&mut session);
+    assert!(
+        text.contains("DESCENDANT-DONE"),
+        "the grandchild's marker must reach the grid; grid: {text:?}"
+    );
+}
+
+/// Open file-descriptor count for this process (Linux `/proc` view).
+fn fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd readable")
+        .count()
+}
+
+/// N12a: repeated spawn/close must not leak file descriptors. The
+/// property checked is no unbounded growth per spawn/close — the margin
+/// absorbs other test sessions running concurrently in this process
+/// (integration tests share one process), not an exact per-cycle count.
+#[test]
+fn repeated_spawn_close_no_fd_leak() {
+    let baseline = fd_count();
+
+    for _ in 0..3 {
+        let mut session = PtySession::spawn(
+            LaunchSpec {
+                program: helper(),
+                args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+            },
+            24,
+            80,
+            cap(),
+        )
+        .expect("helper spawns over a real PTY");
+
+        pump(&mut session, |text, _events| text.contains("READY"))
+            .expect("helper ready within the deadline");
+
+        session.close();
+    }
+
+    let final_count = fd_count();
+    assert!(
+        final_count <= baseline + 8,
+        "fd count must not grow beyond baseline + 8; baseline: {baseline}, final: {final_count}"
+    );
+}
+
+/// N12a: `close()` before the session is dropped must be clean — no
+/// panic, no hang; this is the headless approximation of the live
+/// stop-arm leg (the pump's close-before-break path).
+#[test]
+fn close_before_drop_clean() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    session.close();
+    assert_eq!(
+        session.lifecycle(),
+        Lifecycle::Closed,
+        "close must land on Closed"
+    );
+
+    // Explicit drop after close: must not panic or block on a closed session.
+    drop(session);
 }

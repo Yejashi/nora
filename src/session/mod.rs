@@ -30,7 +30,9 @@ pub mod io;
 pub mod pty;
 pub mod pump;
 
-pub use pty::{LaunchSpec, PtyError, PtySession, SessionEvent, SessionId};
+pub use pty::{
+    DRAIN_TIMEOUT, LaunchSpec, Lifecycle, PtyError, PtySession, SessionEvent, SessionId,
+};
 
 /// Nominal headless cell width in pixels (no UI window exists yet, so
 /// pixel-size replies report columns times this value).

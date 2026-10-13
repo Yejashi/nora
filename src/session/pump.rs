@@ -11,9 +11,9 @@
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::pty::{PtySession, SessionEvent};
+use super::pty::{DRAIN_TIMEOUT, PtySession, SessionEvent};
 use crate::engine::Snapshot;
 use crate::render::term::is_noop_damage;
 use alacritty_terminal::term::TermMode;
@@ -92,8 +92,12 @@ pub enum PumpMsg {
 /// Bounded pump thread: owns the session; ticks until terminated or stopped.
 ///
 /// Each tick: (1) [`pump_tick`]; (2) on the FIRST tick with
-/// `terminated == true`: send [`AppEvent::ChildExit`], `session.close()`,
-/// break; (3) if a snapshot was fetched: store it in the slot and send
+/// `terminated == true`: enter N12a drain mode — tick
+/// `wait_drain(Duration::from_millis(10))` + probe + snapshot (non-noop
+/// only, the windowed final frame) until the session loop thread
+/// finished or [`DRAIN_TIMEOUT`] elapsed — then send
+/// [`AppEvent::ChildExit`], `session.close()`, break; (3) if a snapshot
+/// was fetched: store it in the slot and send
 /// [`AppEvent::DirtyPulse`]; (4) if the engine's live `TermMode` differs
 /// from the last published one (the first tick always publishes,
 /// correcting the window's initial `SHOW_CURSOR`): send
@@ -102,7 +106,8 @@ pub enum PumpMsg {
 /// (6) feed the pending input in order (bounded by the writer's app cap;
 /// `Ok(0)` = budget full, remainder waits for the next tick;
 /// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
-/// cap per tick; (7) if `stop` is set: break; else sleep 10 ms.
+/// cap per tick; (7) if `stop` is set: `session.close()` and break; else
+/// sleep 10 ms.
 pub fn pump_thread(
     mut session: PtySession,
     slot: Arc<Mutex<Option<Snapshot>>>,
@@ -124,6 +129,46 @@ pub fn pump_thread(
             if let Some(title) = session.title() {
                 eprintln!("title: {title}");
             }
+
+            // N12a drain mode: the session loop thread is still
+            // finishing (the pinned `drain_on_exit` read). Keep ticking
+            // probe + snapshot only — no input, no resize — until the
+            // loop thread finished (`wait_drain` per tick) or
+            // `DRAIN_TIMEOUT` elapsed. A snapshot is fetched only when
+            // the damage is not the pinned no-op shape (the final
+            // frame), stored in the slot and pulsed; the engine guard
+            // is dropped before any channel work.
+            let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+            let mut finished = false;
+            while !finished {
+                // One bounded wait per tick. When `wait_drain` returns
+                // true the loop thread is done, but the probe still
+                // runs once more: the final frame is fetched after the
+                // loop thread's last parse.
+                finished = session.wait_drain(Duration::from_millis(10));
+                let stored = {
+                    let (damage, cursor) = session.engine().probe();
+                    if !is_noop_damage(&damage, cursor) {
+                        let snapshot = session.engine().snapshot();
+                        let (rows, cols) = (snapshot.rows, snapshot.cols);
+                        *slot.lock().unwrap() = Some(snapshot);
+                        if debug_enabled() {
+                            eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if stored {
+                    let _ = events.send_event(AppEvent::DirtyPulse);
+                }
+                if !finished && Instant::now() >= drain_deadline {
+                    eprintln!("nora: final drain timed out; proceeding to close");
+                    break;
+                }
+            }
+
             let _ = events.send_event(AppEvent::ChildExit(
                 outcome.status.and_then(|status| status.code()),
             ));
@@ -186,6 +231,11 @@ pub fn pump_thread(
         let _ = session.flush(1024 * 1024);
 
         if stop.load(Ordering::Relaxed) {
+            // N12a: close before break — the pinned loop panics in
+            // `PeekableReceiver::recv` when its sender is dropped
+            // without `Msg::Shutdown` (alacritty_terminal 0.26.0
+            // event_loop.rs:483-488); `close()` sends it.
+            session.close();
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
