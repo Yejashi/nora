@@ -17,7 +17,8 @@
 //!   character → the character's own bytes;
 //! - Alt+character → `0x1b` prefix + the character's bytes;
 //! - `Key::Dead` / `Key::Unidentified` / `Named` rows with no N09 meaning
-//!   (modifier keys, arrows, F-keys, Home) → `None`;
+//!   (modifier keys, F-keys) → `None` (the navigation rows — arrows,
+//!   Home/End, edit keys — now encode under N10a, `tests/navigation_input.rs`);
 //! - physical Ctrl+Q: the binding fires before layout decoding (`Quit`);
 //!   with `ctrl_q_quit: false`, a `Character("q")` falls through to the
 //!   Ctrl-letter row (`Send([0x11])`) and an `Unidentified` logical key has
@@ -257,18 +258,11 @@ fn dead_and_unidentified_keys_send_nothing() {
 }
 
 #[test]
-fn modifier_only_and_navigation_named_keys_send_nothing() {
-    // `Named` rows with no N09 meaning (modifier key, arrows, F-key, Home)
-    // stay `None` until N10.
-    for name in [
-        NamedKey::Shift,
-        NamedKey::ArrowUp,
-        NamedKey::ArrowDown,
-        NamedKey::ArrowLeft,
-        NamedKey::ArrowRight,
-        NamedKey::Home,
-        NamedKey::F1,
-    ] {
+fn modifier_only_and_fk_named_keys_send_nothing() {
+    // `Named` rows with no N09/N10a meaning (modifier key, F-key) stay
+    // `None`; the navigation rows (arrows, Home/End, edit keys) now encode
+    // under N10a (`tests/navigation_input.rs`).
+    for name in [NamedKey::Shift, NamedKey::F1] {
         assert_eq!(
             enc_named(name, ModifiersState::empty()),
             None,

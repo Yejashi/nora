@@ -44,8 +44,8 @@ impl Default for BindingTable {
 /// change the encoding. `modes` is accepted for N10+ (mode-dependent
 /// input); N09 rows are mode-independent.
 ///
-/// Returns `None` for keys with no N09 meaning (F-keys, arrows,
-/// Home/End/PgUp/PgDn, Insert, Delete — N10; `Dead`/`Unidentified`).
+/// Returns `None` for keys with no meaning in v0.1 (F-keys — N10b;
+/// `Dead`/`Unidentified`; modifier-only presses).
 pub fn encode(
     logical: &Key,
     physical: &PhysicalKey,
@@ -54,9 +54,10 @@ pub fn encode(
     bindings: &BindingTable,
     modes: TermMode,
 ) -> Option<InputAction> {
-    // `repeat` and `modes` may become encoding-relevant in N10+; N09 rows
-    // are mode-independent and key repeat does not change the bytes.
-    let _ = (repeat, modes);
+    // `repeat` may become encoding-relevant in N10+; key repeat does not
+    // change the bytes in v0.1. `modes` drives the N10a navigation rows
+    // (DECCKM cursor keys); N09 rows remain mode-independent.
+    let _ = repeat;
 
     // Local bindings key on the physical key, ahead of layout decoding,
     // so they fire regardless of the layout text (or lack of one).
@@ -102,13 +103,71 @@ pub fn encode(
                     Some(InputAction::Send(vec![0x20]))
                 }
             }
-            // F-keys, arrows, Home/End/PgUp/PgDn, Insert, Delete,
-            // modifier-only Named presses: no N09 bytes (N10).
+            // N10a: cursor-key / core navigation (lead decisions
+            // N10-1/N10-2). Arrows + Home/End are DECCKM-conditional;
+            // Insert/Delete/PgUp/PgDn are mode-invariant. F-keys stay
+            // `None` (N10b); modifier-only Named presses fall through.
+            NamedKey::ArrowUp
+            | NamedKey::ArrowDown
+            | NamedKey::ArrowLeft
+            | NamedKey::ArrowRight
+            | NamedKey::Home
+            | NamedKey::End
+            | NamedKey::Insert
+            | NamedKey::Delete
+            | NamedKey::PageUp
+            | NamedKey::PageDown => navigation_key(name, mods, modes),
             _ => None,
         },
         // Dead keys are never bytes in v0.1 (IME duplication rule);
         // Unidentified has no layout text to encode.
         Key::Dead(_) | Key::Unidentified(_) => None,
+    }
+}
+
+/// N10a: cursor-key / core navigation rows (lead decisions N10-1/N10-2).
+///
+/// Arrows and Home/End are DECCKM-conditional on [`TermMode::APP_CURSOR`]:
+/// normal mode sends `ESC [ <letter>`, application mode sends
+/// `ESC O <letter>`. Insert/Delete/PageUp/PageDown are mode-invariant
+/// `ESC [ <n>~` (their DECCKM scope excludes them). Shift/Ctrl add no
+/// `1;N~` modifier encoding in v0.1 (the plain sequence is sent); Alt
+/// prefixes an `ESC`, exactly per the N09 Alt rule for characters.
+fn navigation_key(name: &NamedKey, mods: &ModifiersState, modes: TermMode) -> Option<InputAction> {
+    let bytes = match name {
+        // DECCKM-conditional arrows + Home/End.
+        NamedKey::ArrowUp => cursor_key(b'A', modes),
+        NamedKey::ArrowDown => cursor_key(b'B', modes),
+        NamedKey::ArrowLeft => cursor_key(b'D', modes),
+        NamedKey::ArrowRight => cursor_key(b'C', modes),
+        NamedKey::Home => cursor_key(b'H', modes),
+        NamedKey::End => cursor_key(b'F', modes),
+        // Mode-invariant edit keys.
+        NamedKey::Insert => vec![0x1b, b'[', b'2', b'~'],
+        NamedKey::Delete => vec![0x1b, b'[', b'3', b'~'],
+        NamedKey::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        NamedKey::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        _ => return None,
+    };
+    // Alt prefixes an ESC (xterm meta convention), mirroring the N09
+    // character rule; the base sequence itself is unchanged by Shift/Ctrl.
+    if mods.alt_key() {
+        let mut out = Vec::with_capacity(1 + bytes.len());
+        out.push(0x1b);
+        out.extend_from_slice(&bytes);
+        Some(InputAction::Send(out))
+    } else {
+        Some(InputAction::Send(bytes))
+    }
+}
+
+/// One DECCKM-conditional arrow/Home/End key: `ESC [ <c>` in normal mode,
+/// `ESC O <c>` in application mode (`APP_CURSOR`).
+fn cursor_key(c: u8, modes: TermMode) -> Vec<u8> {
+    if modes.contains(TermMode::APP_CURSOR) {
+        vec![0x1b, b'O', c]
+    } else {
+        vec![0x1b, b'[', c]
     }
 }
 
