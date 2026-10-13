@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use super::glyphs;
 use glyphon::{
-    Buffer, Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
-    Viewport,
+    Attrs, Buffer, Cache, Color, Cursor, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use wgpu::{
     Adapter, CommandEncoder, CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor,
@@ -30,6 +30,51 @@ use wgpu::{
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
 use nora::render::state::SurfaceStatus;
+use nora::render::style::CellStyle;
+
+/// One cell to draw in a live frame (N13a): its grid position, the full
+/// cluster text (the cell character plus its combining marks), the resolved
+/// [`CellStyle`], and the advance width in cells (2 for a wide char, 1
+/// otherwise; spacers are filtered out before reaching the render pass).
+pub struct DrawCell {
+    /// Viewport row (0 = top).
+    pub row: u32,
+    /// Viewport column (0 = left).
+    pub col: u32,
+    /// The full cluster: the cell character followed by its zerowidth marks.
+    pub text: String,
+    /// Resolved visual style (fg/bg/bold/italic/faint/conceal).
+    pub style: CellStyle,
+    /// Advance width in cells (1 or 2).
+    pub width: u16,
+}
+
+/// Shape one cell with an explicit weight and style (N13a), mirroring
+/// `glyphs::shape_cell` but honoring the resolved cell style. The
+/// family is the generic monospace family so cosmic-text resolves the same
+/// loaded monospace face the rest of the app uses.
+fn shape_styled(
+    fs: &mut FontSystem,
+    text: &str,
+    metrics: Metrics,
+    bold: bool,
+    italic: bool,
+) -> Buffer {
+    let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
+    let style = if italic { Style::Italic } else { Style::Normal };
+    let mut buffer = Buffer::new(fs, metrics);
+    buffer.set_text(
+        text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .weight(weight)
+            .style(style),
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_cursor(fs, Cursor::default(), false);
+    buffer
+}
 
 /// The background a live frame is cleared to (N02b pattern).
 const BG: wgpu::Color = wgpu::Color {
@@ -294,44 +339,65 @@ impl Graphics {
     }
 
     /// Render one frame of terminal content into an acquired [`Frame`]
-    /// (N08b2b).
+    /// (N08b2b), restructured for per-cell style (N13a).
     ///
-    /// `cells` are the visible cells as `(row, col, text)`: each is shaped
-    /// with `glyphs::Fonts::shape_cell` and placed with a cell-allocated
-    /// `TextBounds`, exactly as `tests/text_render.rs` does. An empty `cells`
-    /// clears the frame to the background. A frame without a texture (an
-    /// errored acquire) is left untouched.
+    /// Each [`DrawCell`] is shaped with its resolved weight/style and placed
+    /// with a cell-allocated [`TextBounds`] whose right edge spans the cell's
+    /// advance width (a wide char spans 2 cells). Spacer cells (advance
+    /// width 0) are filtered out by the caller before reaching here. The
+    /// cell's resolved foreground becomes the area's [`Color`]; concealed
+    /// cells are filtered out by the caller. An empty `cells` clears the
+    /// frame to the background. A frame without a texture (an errored
+    /// acquire) is left untouched.
     pub fn draw_frame(
         &mut self,
         frame: &mut Frame,
         fonts: &mut glyphs::Fonts,
-        cells: &[(u32, u32, &str)],
+        cells: &[DrawCell],
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
             return Ok(());
         };
 
-        let mut buffers: Vec<Buffer> = Vec::with_capacity(cells.len());
-        for (_row, _col, text) in cells {
-            buffers.push(fonts.shape_cell(text));
-        }
         let cell_w = fonts.cell_w;
         let cw = cell_w as f32;
+        let metrics = Metrics::new(glyphs::FONT_SIZE, glyphs::CELL_H);
 
-        let mut areas: Vec<TextArea> = Vec::with_capacity(buffers.len());
-        for (buffer, (row, col, _)) in buffers.iter().zip(cells.iter()) {
+        // Shape every cell first: glyphon's `TextArea` borrows its `Buffer`,
+        // so all buffers must be pushed before any area borrows the vector.
+        let mut buffers: Vec<Buffer> = Vec::with_capacity(cells.len());
+        for cell in cells {
+            buffers.push(shape_styled(
+                &mut fonts.fs,
+                &cell.text,
+                metrics,
+                cell.style.bold,
+                cell.style.italic,
+            ));
+        }
+
+        let mut areas: Vec<TextArea> = Vec::with_capacity(cells.len());
+        for (cell, buffer) in cells.iter().zip(buffers.iter()) {
+            // Advance by the cell's width: a wide char spans 2 cells,
+            // everything else 1 (spacers never reach here).
+            let span = cell.width.max(1) as i32;
             areas.push(TextArea {
                 buffer,
-                left: *col as f32 * cw,
-                top: *row as f32 * glyphs::CELL_H,
+                left: cell.col as f32 * cw,
+                top: cell.row as f32 * glyphs::CELL_H,
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: *col as i32 * cell_w as i32,
-                    top: *row as i32 * glyphs::CELL_H as i32,
-                    right: (*col + 1) as i32 * cell_w as i32,
-                    bottom: (*row + 1) as i32 * glyphs::CELL_H as i32,
+                    left: cell.col as i32 * cell_w as i32,
+                    top: cell.row as i32 * glyphs::CELL_H as i32,
+                    right: (cell.col as i32 + span) * cell_w as i32,
+                    bottom: (cell.row + 1) as i32 * glyphs::CELL_H as i32,
                 },
-                default_color: Color::rgb(0xFF, 0xFF, 0xFF),
+                default_color: Color::rgba(
+                    cell.style.fg[0],
+                    cell.style.fg[1],
+                    cell.style.fg[2],
+                    cell.style.fg[3],
+                ),
                 custom_glyphs: &[],
             });
         }

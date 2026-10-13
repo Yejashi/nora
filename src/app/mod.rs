@@ -25,12 +25,13 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use self::graphics::Graphics;
+use self::graphics::{DrawCell, Graphics};
 use alacritty_terminal::term::TermMode;
 use nora::engine::Snapshot;
 use nora::input::{BindingTable, InputAction, encode};
 use nora::render::policy::{clamp_grid, snapshot_is_stale};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
+use nora::render::style::cell_style;
 use nora::session::pump::{AppEvent, PumpMsg};
 
 /// Fixed smoke-test resize target, in logical pixels.
@@ -452,22 +453,45 @@ impl WinApp {
                     return;
                 }
                 let fonts = self.fonts.as_mut().expect("fonts are loaded at startup");
-                // Row-major visible cells; spaces carry no content.
-                let mut cell_texts: Vec<(u32, u32, String)> = Vec::new();
+                // Row-major visible cells (N13a): each cell's full cluster is
+                // shaped with its resolved style; spacers and concealed cells
+                // are skipped, wide chars advance by 2.
+                let mut draw_cells: Vec<DrawCell> = Vec::new();
                 for row in 0..snap.rows {
                     for col in 0..snap.cols {
-                        let ch = snap.cells[row * snap.cols + col].ch;
-                        if ch != ' ' {
-                            cell_texts.push((row as u32, col as u32, ch.to_string()));
+                        let cell = &snap.cells[row * snap.cols + col];
+                        // Spacer cells (wide-char continuation) are not drawn.
+                        if cell.width() == 0 {
+                            continue;
                         }
+                        // Spaces carry no content.
+                        if cell.ch == ' ' {
+                            continue;
+                        }
+                        let style = cell_style(cell.flags, cell.fg, cell.bg, &snap.colors);
+                        // Concealed cells are not drawn.
+                        if style.conceal {
+                            continue;
+                        }
+                        // Full cluster: the cell character plus its combining
+                        // marks, shaped together so the marks compose onto
+                        // the base character.
+                        let mut text = String::new();
+                        text.push(cell.ch);
+                        for &mark in &cell.zerowidth {
+                            text.push(mark);
+                        }
+                        draw_cells.push(DrawCell {
+                            row: row as u32,
+                            col: col as u32,
+                            text,
+                            style,
+                            width: cell.width(),
+                        });
                     }
                 }
-                let cells: Vec<(u32, u32, &str)> = cell_texts
-                    .iter()
-                    .map(|(row, col, text)| (*row, *col, text.as_str()))
-                    .collect();
                 let line1 = first_non_space_line(&snap, 40);
-                if let Err(message) = graphics.draw_frame(&mut frame, fonts, &cells) {
+                if let Err(message) = graphics.draw_frame(&mut frame, fonts, &draw_cells) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
                 graphics.present(frame);

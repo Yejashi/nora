@@ -8,6 +8,9 @@ license = "MIT"
 
 [dependencies]
 alacritty_terminal = "0.26.0"
+# Direct dependency (same pinned version glyphon pulls in): enables
+# `Font::unicode_codepoints()` for per-char font fallback (N13a).
+cosmic-text = { version = "0.19", features = ["monospace_fallback"] }
 glyphon = "0.12.0"
 libc = "0.2"
 pollster = "0.4"

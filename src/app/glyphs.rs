@@ -74,7 +74,6 @@ fn shape_cell(fs: &mut FontSystem, text: &str, family: Family, metrics: Metrics)
 /// Loaded fonts and the mono cell metrics they imply.
 pub struct Fonts {
     pub fs: FontSystem,
-    metrics: Metrics,
     /// Mono advance (cell width), in logical pixels; a whole pixel by
     /// construction (derived from the mono face, as in the N02 test).
     pub cell_w: u32,
@@ -110,7 +109,6 @@ impl Fonts {
 
         Self {
             fs,
-            metrics,
             cell_w,
             mono_path,
         }
@@ -119,14 +117,6 @@ impl Fonts {
     /// Cell height in logical pixels (fixed by the N02 metrics).
     pub const fn cell_h(&self) -> u32 {
         CELL_H as u32
-    }
-
-    /// Shape one visible cell into a fresh cosmic `Buffer` under the mono
-    /// family (ASCII v0.1 scope). The returned buffer is the per-cell content
-    /// that `Graphics::draw` places with cell-allocated `bounds`.
-    pub fn shape_cell(&mut self, text: &str) -> Buffer {
-        let mono = Family::Name(MONO_FAMILY);
-        shape_cell(&mut self.fs, text, mono, self.metrics)
     }
 }
 
