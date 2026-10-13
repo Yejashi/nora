@@ -204,7 +204,7 @@ impl ApplicationHandler for App {
             } else {
                 let mut frame = graphics.acquire();
                 println!("smoke: acquire status {:?}", frame.status);
-                if let Err(message) = graphics.draw_frame(&mut frame, &mut fonts, &[]) {
+                if let Err(message) = graphics.draw_frame(&mut frame, &mut fonts, &[], 1.0) {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
                 graphics.present(frame);
@@ -491,7 +491,12 @@ impl WinApp {
                     }
                 }
                 let line1 = first_non_space_line(&snap, 40);
-                if let Err(message) = graphics.draw_frame(&mut frame, fonts, &draw_cells) {
+                if let Err(message) = graphics.draw_frame(
+                    &mut frame,
+                    fonts,
+                    &draw_cells,
+                    window.scale_factor() as f32,
+                ) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
                 graphics.present(frame);

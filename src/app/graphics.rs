@@ -493,11 +493,15 @@ impl Graphics {
     /// strikethrough decorations in `LayoutRun.decorations`; those spans are
     /// resolved by [`decoration_style`] and drawn as fill lines in the same
     /// pass, after the text.
+    ///
+    /// `scale` is the window's scale factor (native DPI, N13d), applied as
+    /// each area's `TextArea.scale`; logical cell metrics are unchanged.
     pub fn draw_frame(
         &mut self,
         frame: &mut Frame,
         fonts: &mut glyphs::Fonts,
         cells: &[DrawCell],
+        scale: f32,
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
             return Ok(());
@@ -531,7 +535,7 @@ impl Graphics {
                 buffer,
                 left: cell.col as f32 * cw,
                 top: cell.row as f32 * glyphs::CELL_H,
-                scale: 1.0,
+                scale,
                 bounds: TextBounds {
                     left: cell.col as i32 * cell_w as i32,
                     top: cell.row as i32 * glyphs::CELL_H as i32,

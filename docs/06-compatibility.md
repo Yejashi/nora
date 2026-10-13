@@ -88,3 +88,13 @@ IME preedit is UI-only, not PTY content. Commit text once, move the candidate re
 Start the development slice with `TERM=xterm-256color` only after testing its relevant advertised behavior. Document it as an initial compatibility choice, not a proof of complete xterm emulation. `COLORTERM=truecolor` can advertise validated truecolor. Never set `TERM=xterm-kitty` for branding.
 
 Before v0.1, decide whether to ship a dedicated `nora` terminfo entry or keep the verified fallback. A dedicated entry includes only validated capabilities, compiles with `tic`, and works with `infocmp` and curses applications [S27]. For SSH, document how to install it on remote hosts or explicitly use a fallback; do not set an unknown remote TERM by default. Use runtime protocol negotiation for modern features rather than claiming they follow from the TERM string.
+
+## Emoji and complex scripts (N13)
+
+Emoji are rendered via the N13a font-fallback path: `first_supporting` (`src/render/fallback.rs`) selects the first stack font that supports the code point, and cosmic-text's internal fallback resolves the remaining faces. The pinned stack is NotoSansMono → NotoSansCJK → NotoSerifEthiopic (`src/app/glyphs.rs`); NotoSansCJK covers some emoji, but no dedicated emoji font (e.g., Noto Color Emoji) is loaded.
+
+Documented limitations (no width policy invented):
+
+- **Monochrome only** — no color-emoji format/blending path; emoji render as the fallback face's monochrome glyphs.
+- **No complex grapheme clustering** — each cell is one grapheme; ZWJ sequences and other multi-cell emoji are shaped per cell, so joined sequences may render as separate components.
+- **Left-to-right only** — no RTL shaping; RTL scripts render in logical order without direction-aware shaping.
