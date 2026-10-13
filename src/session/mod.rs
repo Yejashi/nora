@@ -28,6 +28,7 @@ use io::{BoundedWriter, WriterConfig, WriterError};
 
 pub mod io;
 pub mod pty;
+pub mod pump;
 
 pub use pty::{LaunchSpec, PtyError, PtySession, SessionEvent, SessionId};
 
