@@ -29,6 +29,7 @@ use self::graphics::Graphics;
 use alacritty_terminal::term::TermMode;
 use nora::engine::Snapshot;
 use nora::input::{BindingTable, InputAction, encode};
+use nora::render::policy::{clamp_grid, snapshot_is_stale};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::session::pump::{AppEvent, PumpMsg};
 
@@ -120,6 +121,20 @@ fn platform_hint() -> String {
     } else {
         "unknown (neither WAYLAND_DISPLAY nor DISPLAY is set)".to_owned()
     }
+}
+
+/// The grid that fits the window's current *logical* size (N11a): the
+/// mono cell metrics in [`glyphs`] are logical pixels, so the derivation
+/// converts the physical inner size to logical first — correct at every
+/// scale factor, not just 1.0.
+pub(crate) fn window_grid(window: &Window, fonts: &glyphs::Fonts) -> (u16, u16) {
+    let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
+    glyphs::grid_size(
+        logical.width as u32,
+        logical.height as u32,
+        fonts.cell_w,
+        fonts.cell_h(),
+    )
 }
 
 impl ApplicationHandler for App {
@@ -320,6 +335,11 @@ struct WinApp {
     /// `Some(code)` = the child's exit status, `None` = the pump loop
     /// died without one.
     child_exit: Option<Option<i32>>,
+    /// The last grid sent to the pump as `PumpMsg::Resize` (N11a);
+    /// `(0, 0)` = never sent. The `Resized`/`ScaleFactorChanged` arms
+    /// send only when the derived (clamped) grid differs, so repeated
+    /// no-op derivations emit nothing.
+    last_grid: (u16, u16),
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -328,6 +348,7 @@ struct WinApp {
 /// thread when the window closes.
 pub fn run_windowed(
     event_loop: EventLoop<AppEvent>,
+    window: Arc<Window>,
     slot: Arc<Mutex<Option<Snapshot>>>,
     pump_commands: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
@@ -342,10 +363,11 @@ pub fn run_windowed(
         modes: TermMode::SHOW_CURSOR,
         fonts: None,
         graphics: None,
-        window: None,
+        window: Some(window),
         failed: false,
         frames: 0,
         child_exit: None,
+        last_grid: (0, 0),
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -406,6 +428,23 @@ impl WinApp {
                     }
                     return;
                 };
+                // N11a stale-geometry rejection: the geometry pair is the
+                // staleness tag — never present old geometry to the new
+                // surface. Fonts are shared-borrowed here, then mutably
+                // borrowed below for drawing; never both at once.
+                let (grid_cols, grid_rows) = {
+                    let fonts = self.fonts.as_ref().expect("fonts are loaded at startup");
+                    window_grid(window, fonts)
+                };
+                if snapshot_is_stale(snap.rows as u16, snap.cols as u16, grid_rows, grid_cols) {
+                    if debug_enabled() {
+                        eprintln!(
+                            "debug: stale snapshot {}x{} != grid {}x{}",
+                            snap.rows, snap.cols, grid_rows, grid_cols
+                        );
+                    }
+                    return;
+                }
                 let fonts = self.fonts.as_mut().expect("fonts are loaded at startup");
                 // Row-major visible cells; spaces carry no content.
                 let mut cell_texts: Vec<(u32, u32, String)> = Vec::new();
@@ -465,22 +504,17 @@ impl WinApp {
 
 impl ApplicationHandler<AppEvent> for WinApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.graphics.is_some() {
             return;
         }
 
-        let attributes = WindowAttributes::default()
-            .with_title("nora")
-            .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(err) => {
-                eprintln!("nora: failed to create the window: {err}");
-                self.failed = true;
-                event_loop.exit();
-                return;
-            }
-        };
+        // N11a: the window is created in `main` before the session spawn,
+        // so the child sees the window's grid from the first byte; this
+        // handler only binds the graphics and loads the fonts.
+        let window = self
+            .window
+            .clone()
+            .expect("the window is created before the loop runs");
 
         // N09b: no IME in v0.1; `Ime` events are ignored in `window_event`.
         window.set_ime_allowed(false);
@@ -520,7 +554,6 @@ impl ApplicationHandler<AppEvent> for WinApp {
         );
         println!("fonts: cell {}x{}", fonts.cell_w, fonts.cell_h());
 
-        self.window = Some(window);
         self.graphics = Some(graphics);
         self.fonts = Some(fonts);
     }
@@ -602,12 +635,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     validation = Some(message);
                 }
 
-                // (b) The grid that fits the new size from the pinned
-                // mono metrics (pure: no GPU, no display).
+                // (b) The grid that fits the new *logical* size from the
+                // pinned mono metrics (N11a: logical derivation; pure: no
+                // GPU, no display).
                 let (cols, rows) = match self.fonts.as_ref() {
-                    Some(fonts) => {
-                        glyphs::grid_size(size.width, size.height, fonts.cell_w, fonts.cell_h())
-                    }
+                    Some(fonts) => window_grid(window, fonts),
                     None => (0, 0),
                 };
 
@@ -628,17 +660,68 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     return;
                 }
 
-                // (d) Ask the pump thread to resize the PTY session; the
-                // next pulse carries the post-resize `Full` snapshot,
-                // which the render path presents.
-                let _ = self
-                    .pump_commands
-                    .send(PumpMsg::Resize(rows as usize, cols as usize));
+                // (d) Ask the pump thread to resize the PTY session, only
+                // when the clamped grid differs from the last one sent
+                // (N11a: zero retention + change-only sends); the next
+                // pulse carries the post-resize `Full` snapshot, which
+                // the render path presents.
+                let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
+                if (rows, cols) != self.last_grid {
+                    self.last_grid = (rows, cols);
+                    let _ = self
+                        .pump_commands
+                        .send(PumpMsg::Resize(rows as usize, cols as usize));
+                }
 
                 // (e) Coalesce the redraw.
                 window.request_redraw(); // redraw SITE 2
                 if debug_enabled() {
                     eprintln!("debug: resize {rows}x{cols}");
+                }
+            }
+            // N11a: the window's scale factor changed (monitor move, DPI
+            // change). The physical size is unchanged — no `set_size`, no
+            // reconfigure; only the logical grid is re-derived, so the
+            // same surface now shows a different cell count.
+            WindowEvent::ScaleFactorChanged {
+                scale_factor: _,
+                inner_size_writer: _,
+            } => {
+                // (a) The scale-change carries a usable window size,
+                // exactly like a `Resized` event.
+                if self.state.zero_size || self.state.surface_retry >= 3 {
+                    return;
+                }
+                let (cols, rows) = match self.fonts.as_ref() {
+                    Some(fonts) => window_grid(window, fonts),
+                    None => (0, 0),
+                };
+                // (c) Fold the scale change through the machine with the
+                // same guard order as the `Resized` arm: `Resize` forces
+                // `Damage::Full` and reconfigures; the following render
+                // attempt presents the post-resize snapshot.
+                let (state, action) = on_event(self.state.clone(), RenderEvent::Resize);
+                self.state = state;
+                if action == Action::ExitFail {
+                    self.failed = true;
+                    event_loop.exit();
+                    return;
+                }
+
+                // (d) Send the clamped resize only on change (N11a); the
+                // redraw arrives via SITE 1 (DirtyPulse) when the pump
+                // takes the post-resize `Full` snapshot — no
+                // `request_redraw` in this arm, keeping the pinned
+                // exactly-three call sites intact.
+                let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
+                if (rows, cols) != self.last_grid {
+                    self.last_grid = (rows, cols);
+                    let _ = self
+                        .pump_commands
+                        .send(PumpMsg::Resize(rows as usize, cols as usize));
+                }
+                if debug_enabled() {
+                    eprintln!("debug: scale factor changed, grid {rows}x{cols}");
                 }
             }
             WindowEvent::CloseRequested => {

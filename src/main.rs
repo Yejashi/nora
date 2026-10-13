@@ -167,18 +167,38 @@ fn run_windowed(spec: LaunchSpec, explicit: bool) -> ExitCode {
             }
         };
 
-    // The session starts at the window's initial grid: the font
-    // metrics are pure (no display needed), so the child sees the
-    // window's WINSIZE from the first byte and the initial
-    // `WindowEvent::Resized` asks the pump for the same grid (a no-op
-    // engine resize: no damage, no pulse, no extra frame).
-    let fonts = app::glyphs::Fonts::load();
-    let (cols, rows) = app::glyphs::grid_size(
-        app::INITIAL_SIZE.0 as u32,
-        app::INITIAL_SIZE.1 as u32,
-        fonts.cell_w,
-        fonts.cell_h(),
+    // N11a: the window exists before the session spawn, so the child
+    // sees the window's *logical* grid from the first byte (the font
+    // metrics are pure — no display needed — and the initial
+    // `WindowEvent::Resized` asks the pump for the same grid: a no-op
+    // engine resize with no damage, no pulse, no extra frame).
+    //
+    // Pinned winit 0.30.13 moved window creation to
+    // `ActiveEventLoop::create_window` (handler context); N11a's spawn
+    // ordering needs the window before `run_app`, so the deprecated
+    // `EventLoop::create_window` wrapper is used here — it builds the
+    // identical `platform_impl::Window`.
+    #[allow(deprecated)]
+    let window = std::sync::Arc::new(
+        event_loop
+            .create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("nora")
+                    .with_inner_size(winit::dpi::LogicalSize::new(
+                        app::INITIAL_SIZE.0,
+                        app::INITIAL_SIZE.1,
+                    )),
+            )
+            .expect("creating the nora window"),
     );
+    let fonts = app::glyphs::Fonts::load();
+    let (cols, rows) = app::window_grid(&window, &fonts);
+    let (rows, cols) = if rows == 0 || cols == 0 {
+        eprintln!("debug: degenerate window grid at spawn; falling back to 24x80");
+        (24, 80)
+    } else {
+        (rows, cols)
+    };
     let session = match PtySession::spawn(spec, rows as usize, cols as usize, DEFAULT_CAP) {
         Ok(session) => session,
         Err(err) => {
@@ -206,7 +226,14 @@ fn run_windowed(spec: LaunchSpec, explicit: bool) -> ExitCode {
     let pump = std::thread::spawn(move || {
         nora::session::pump::pump_thread(session, pump_slot, proxy, pump_commands_rx, pump_stop)
     });
-    let code = app::run_windowed(event_loop, slot, pump_commands, stop.clone(), explicit);
+    let code = app::run_windowed(
+        event_loop,
+        window,
+        slot,
+        pump_commands,
+        stop.clone(),
+        explicit,
+    );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pump.join();
     code

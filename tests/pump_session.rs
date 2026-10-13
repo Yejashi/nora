@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nora::engine::{Damage, Snapshot};
-use nora::render::policy::render_policy;
+use nora::render::policy::{clamp_grid, render_policy, snapshot_is_stale};
 use nora::session::io::WriterConfig;
 use nora::session::pty::{LaunchSpec, PtySession};
 use nora::session::pump::{PumpOutcome, pump_tick};
@@ -330,5 +330,50 @@ fn render_policy_pure_cases() {
     assert!(
         policy.pump && !policy.redraw,
         "live tick without a fetch only pumps"
+    );
+}
+
+/// N11b (1): the pure staleness tag — a fetched snapshot is stale iff
+/// its geometry differs from the current window grid; the geometry
+/// pair is the staleness tag in this single-window architecture.
+#[test]
+fn snapshot_is_stale_pure_cases() {
+    assert!(
+        !snapshot_is_stale(24, 80, 24, 80),
+        "equal geometry is fresh"
+    );
+    assert!(snapshot_is_stale(25, 80, 24, 80), "rows differ: stale");
+    assert!(snapshot_is_stale(24, 81, 24, 80), "cols differ: stale");
+    assert!(snapshot_is_stale(25, 81, 24, 80), "both axes differ: stale");
+    assert!(
+        snapshot_is_stale(0, 0, 25, 66),
+        "a zero-geometry snapshot is stale against a live grid"
+    );
+}
+
+/// N11b (2): per axis, zero clamps to the previous grid and non-zero
+/// takes the new — a tiny/minimized window must never request zero
+/// columns (the PTY retains the last valid geometry).
+#[test]
+fn clamp_grid_pure_cases() {
+    assert_eq!(
+        clamp_grid(0, 0, 24, 80),
+        (24, 80),
+        "both axes zero: the previous pair is returned unchanged"
+    );
+    assert_eq!(
+        clamp_grid(0, 40, 24, 80),
+        (24, 40),
+        "zero rows clamp to the previous rows"
+    );
+    assert_eq!(
+        clamp_grid(12, 0, 24, 80),
+        (12, 80),
+        "zero cols clamp to the previous cols"
+    );
+    assert_eq!(
+        clamp_grid(12, 40, 24, 80),
+        (12, 40),
+        "non-zero axes take the new geometry"
     );
 }

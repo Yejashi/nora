@@ -822,3 +822,69 @@ fn slow_child_input_no_loss_in_order() {
 
     session.close();
 }
+
+/// N11b: a zero resize never reaches the engine — `resize(0, 0)`
+/// retains the last valid geometry per axis (no engine resize, no
+/// event), so the grid stays at the spawn dimensions on every later
+/// snapshot. The first snapshot on a fresh session reports the pinned
+/// fresh `Term` damage (alacritty_terminal-0.26.0
+/// `TermDamageState::new` is `full: true`; the flag is only cleared by
+/// `reset_damage` inside `Engine::snapshot`), so it is Full at the
+/// spawn dimensions.
+#[test]
+fn zero_resize_retains_last_valid_geometry() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    // The first snapshot this session ever takes: the fresh full flag
+    // is still set, and a racing `READY` write only expands line
+    // spans (it cannot clear the flag), so this fetch is Full at the
+    // spawn dimensions.
+    let snap = session.engine().snapshot();
+    assert_eq!(
+        (snap.rows, snap.cols),
+        (24, 80),
+        "spawn dimensions on the first fetched snapshot"
+    );
+    assert_eq!(
+        snap.damage,
+        Damage::Full,
+        "fresh term damage is non-noop (Full)"
+    );
+
+    // The no-args helper blocks on stdin after READY — ready to echo.
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("helper printed READY within the deadline");
+
+    session.resize(0, 0);
+
+    // A non-noop tick after the zero resize: the helper echoes the fed
+    // line, and the next fetched snapshot must still be at the spawn
+    // dimensions — the zero was retained, not applied.
+    assert_eq!(session.feed(b"x\n"), Ok(2));
+    session
+        .flush(256)
+        .expect("flush must forward the fed bytes");
+
+    pump(&mut session, |text, _events| text.contains("E:x"))
+        .expect("helper echoed the fed line within the deadline");
+
+    let snap = session.engine().snapshot();
+    assert_eq!(
+        (snap.rows, snap.cols),
+        (24, 80),
+        "the zero resize retained the last valid geometry"
+    );
+
+    session.close();
+}

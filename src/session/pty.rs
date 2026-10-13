@@ -237,7 +237,19 @@ impl PtySession {
     /// updated `WindowSize` (nominal cell geometry, as at spawn) and
     /// credits the reply through the ledger as usual (no new reply
     /// kind).
+    ///
+    /// N11a zero retention (lib-level invariant): a zero on either axis
+    /// is retained per axis against the last valid value before
+    /// anything is applied — if the retained pair equals the current
+    /// geometry, the resize is a no-op (no engine resize, no
+    /// `TextAreaSizeRequest`, no event emitted); the engine must never
+    /// see a zero.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = if rows == 0 { self.size.num_lines } else { rows };
+        let cols = if cols == 0 { self.size.num_cols } else { cols };
+        if (rows, cols) == (self.size.num_lines, self.size.num_cols) {
+            return;
+        }
         self.size = WindowSize {
             num_lines: rows,
             num_cols: cols,
