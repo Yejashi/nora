@@ -92,6 +92,23 @@ fn explicit_command_exit_status_propagates() {
 }
 
 #[test]
+fn hold_headless_exit_status_propagates() {
+    let helper = helper_bin();
+    let mut cmd = Command::new(nora_bin());
+    cmd.args(["--hold", "--", helper.as_str(), "status", "7"])
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY");
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(7),
+        "headless --hold is ignored; status must still propagate; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[test]
 fn no_command_after_dash_dash_is_an_error() {
     let mut cmd = Command::new(nora_bin());
     cmd.arg("--");

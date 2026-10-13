@@ -335,6 +335,9 @@ struct WinApp {
     /// `Some(code)` = the child's exit status, `None` = the pump loop
     /// died without one.
     child_exit: Option<Option<i32>>,
+    /// `--hold` (N12b): when set, the `ChildExit` fold skips
+    /// `event_loop.exit()`; the window keeps its final frame.
+    hold: bool,
     /// The last grid sent to the pump as `PumpMsg::Resize` (N11a);
     /// `(0, 0)` = never sent. The `Resized`/`ScaleFactorChanged` arms
     /// send only when the derived (clamped) grid differs, so repeated
@@ -345,7 +348,8 @@ struct WinApp {
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
 /// [`AppEvent`]s from the pump thread; `slot` carries the latest snapshot;
 /// `pump_commands` carries window→pump messages; `stop` signals the pump
-/// thread when the window closes.
+/// thread when the window closes. `hold` (`--hold`, N12b) defers the
+/// `ChildExit` close: the window keeps its final frame until unhold.
 pub fn run_windowed(
     event_loop: EventLoop<AppEvent>,
     window: Arc<Window>,
@@ -353,6 +357,7 @@ pub fn run_windowed(
     pump_commands: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
     explicit: bool,
+    hold: bool,
 ) -> std::process::ExitCode {
     let mut app = WinApp {
         slot,
@@ -367,6 +372,7 @@ pub fn run_windowed(
         failed: false,
         frames: 0,
         child_exit: None,
+        hold,
         last_grid: (0, 0),
     };
     match event_loop.run_app(&mut app) {
@@ -594,7 +600,18 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 let (state, action) = on_event(self.state.clone(), RenderEvent::ChildExited);
                 self.state = state;
                 if action == Action::Close {
-                    event_loop.exit();
+                    // N12b `--hold`: skip the exit; the window keeps its
+                    // final frame (pulse-gated rendering — the pump has
+                    // exited, so nothing re-renders). Unhold goes through
+                    // the existing CloseRequested/Destroyed/Quit arms;
+                    // the exit code is already captured in `self.child_exit`.
+                    if self.hold {
+                        if debug_enabled() {
+                            eprintln!("debug: hold active; window stays open");
+                        }
+                    } else {
+                        event_loop.exit();
+                    }
                 }
             }
             AppEvent::Modes(modes) => {

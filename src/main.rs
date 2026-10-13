@@ -30,6 +30,8 @@ Options:\n\
   -V, --version                Print nora's name and version\n\
       --smoke                  Run one automated window smoke cycle and exit\n\
       --working-directory PATH Start the command in PATH\n\
+      --hold                  Keep the window open after the child\n\
+                             exits (windowed; headless ignores it)\n\
       --                       Remainder is the command argv (no shell\n\
                                interpolation)\n\n\
 With no command, the default shell ($SHELL, else /bin/sh) is launched.";
@@ -37,6 +39,7 @@ With no command, the default shell ($SHELL, else /bin/sh) is launched.";
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut smoke = false;
+    let mut hold = false;
     let mut working_directory: Option<PathBuf> = None;
     let mut command: Vec<String> = Vec::new();
     let mut after_separator = false;
@@ -59,6 +62,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--smoke" => smoke = true,
+            "--hold" => hold = true,
             "--working-directory" => {
                 let Some(path) = iter.next() else {
                     eprintln!("{NAME} {VERSION}: --working-directory requires a path");
@@ -111,7 +115,7 @@ fn main() -> ExitCode {
     // Bare `nora` and `nora -- COMMAND ARG...` both open the windowed
     // session (N08b2b-2); `run_windowed` falls back to the headless
     // session pump when no display server is available (CI-safe).
-    run_windowed(spec, explicit)
+    run_windowed(spec, explicit, hold)
 }
 
 /// Headless launch (N05b). 24×80 is the documented headless placeholder
@@ -155,7 +159,7 @@ fn run_session(spec: LaunchSpec, explicit: bool) -> ExitCode {
 /// headless session pump, so `nora -- CMD` stays CI-safe. Exits with
 /// the child's exit status when explicit (1 on a loop death without
 /// one), 0 on a clean default-shell close, or 1 on a startup failure.
-fn run_windowed(spec: LaunchSpec, explicit: bool) -> ExitCode {
+fn run_windowed(spec: LaunchSpec, explicit: bool, hold: bool) -> ExitCode {
     let event_loop =
         match winit::event_loop::EventLoop::<nora::session::pump::AppEvent>::with_user_event()
             .build()
@@ -233,6 +237,7 @@ fn run_windowed(spec: LaunchSpec, explicit: bool) -> ExitCode {
         pump_commands,
         stop.clone(),
         explicit,
+        hold,
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pump.join();
