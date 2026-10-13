@@ -81,6 +81,8 @@ pub enum AppEvent {
 pub enum PumpMsg {
     /// Resize the PTY session to (rows, cols) and re-pump.
     Resize(usize, usize),
+    /// Encoded keystroke bytes; window→PTY, ordered after earlier messages.
+    Input(Vec<u8>),
 }
 
 /// Bounded pump thread: owns the session; ticks until terminated or stopped.
@@ -88,8 +90,12 @@ pub enum PumpMsg {
 /// Each tick: (1) [`pump_tick`]; (2) on the FIRST tick with
 /// `terminated == true`: send [`AppEvent::ChildExit`], `session.close()`,
 /// break; (3) if a snapshot was fetched: store it in the slot and send
-/// [`AppEvent::DirtyPulse`]; (4) drain [`PumpMsg::Resize`] and resize the
-/// session; (5) if `stop` is set: break; else sleep 10 ms.
+/// [`AppEvent::DirtyPulse`]; (4) drain [`PumpMsg`] commands — resize the
+/// session, or extend the pending input with encoded keystroke bytes;
+/// (5) feed the pending input in order (bounded by the writer's app cap;
+/// `Ok(0)` = budget full, remainder waits for the next tick;
+/// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
+/// cap per tick; (6) if `stop` is set: break; else sleep 10 ms.
 pub fn pump_thread(
     mut session: PtySession,
     slot: Arc<Mutex<Option<Snapshot>>>,
@@ -97,6 +103,7 @@ pub fn pump_thread(
     commands: mpsc::Receiver<PumpMsg>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut pending_input: Vec<u8> = Vec::new();
     loop {
         let outcome = pump_tick(&mut session);
 
@@ -122,12 +129,41 @@ pub fn pump_thread(
             let _ = events.send_event(AppEvent::DirtyPulse);
         }
 
-        while let Ok(PumpMsg::Resize(rows, cols)) = commands.try_recv() {
-            if debug_enabled() {
-                eprintln!("debug: pump: resize message {rows}x{cols}");
+        while let Ok(msg) = commands.try_recv() {
+            match msg {
+                PumpMsg::Resize(rows, cols) => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: resize message {rows}x{cols}");
+                    }
+                    session.resize(rows as u16, cols as u16);
+                }
+                PumpMsg::Input(bytes) => pending_input.extend(bytes),
             }
-            session.resize(rows as u16, cols as u16);
         }
+
+        // N09b: drain pending input in order. Bounded by the writer's app
+        // cap: `feed` accepts at most the cap per call, so `Ok(0)` means the
+        // budget is full and the remainder waits for the next tick;
+        // `Err(Closed)` means the session loop died — drop the remainder.
+        while !pending_input.is_empty() {
+            match session.feed(&pending_input) {
+                Ok(0) => break,
+                Ok(accepted) => {
+                    pending_input.drain(..accepted);
+                    if debug_enabled() {
+                        eprintln!("debug: pump: fed {accepted} input byte(s)");
+                    }
+                }
+                Err(_) => {
+                    pending_input.clear();
+                    break;
+                }
+            }
+        }
+        // Per-tick flush: forwards accepted bytes (including ledger replies,
+        // which have no other flusher in windowed mode) — the full app cap
+        // per tick; empty flushes are cheap.
+        let _ = session.flush(1024 * 1024);
 
         if stop.load(Ordering::Relaxed) {
             break;

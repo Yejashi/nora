@@ -19,13 +19,16 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{StartCause, WindowEvent},
+    event::{ElementState, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::ModifiersState,
     window::{Window, WindowAttributes, WindowId},
 };
 
 use self::graphics::Graphics;
+use alacritty_terminal::term::TermMode;
 use nora::engine::Snapshot;
+use nora::input::{BindingTable, InputAction, encode};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::session::pump::{AppEvent, PumpMsg};
 
@@ -302,6 +305,8 @@ struct WinApp {
     pump_commands: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
     state: RenderState,
+    /// Keyboard modifier state at the last `ModifiersChanged` (N09b).
+    mods: ModifiersState,
     fonts: Option<glyphs::Fonts>,
     graphics: Option<Graphics>,
     window: Option<Arc<Window>>,
@@ -329,6 +334,7 @@ pub fn run_windowed(
         pump_commands,
         stop,
         state: RenderState::default(),
+        mods: ModifiersState::default(),
         fonts: None,
         graphics: None,
         window: None,
@@ -470,6 +476,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 return;
             }
         };
+
+        // N09b: no IME in v0.1; `Ime` events are ignored in `window_event`.
+        window.set_ime_allowed(false);
 
         let mut graphics =
             match pollster::block_on(Graphics::new(event_loop, &window, |device, surface| {
@@ -635,6 +644,40 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 self.stop.store(true, Ordering::Relaxed);
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // N09b: act only on real presses; held-key focus-gain
+                // presses are synthetic duplicates.
+                if event.state != ElementState::Pressed || is_synthetic {
+                    return;
+                }
+                if let Some(action) = encode(
+                    &event.logical_key,
+                    &event.physical_key,
+                    &self.mods,
+                    event.repeat,
+                    &BindingTable::default(),
+                    TermMode::SHOW_CURSOR,
+                ) {
+                    match action {
+                        InputAction::Send(bytes) => {
+                            let _ = self.pump_commands.send(PumpMsg::Input(bytes));
+                        }
+                        InputAction::Quit => {
+                            // Local quit (Ctrl+Q): the session drops on
+                            // unwind, the master closes and the child
+                            // gets SIGHUP.
+                            event_loop.exit();
+                        }
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
+            WindowEvent::Ime(_) => {}     // N09b: no IME in v0.1.
+            WindowEvent::Focused(_) => {} // N09b: synthetic filtering covers duplicates.
             _ => {}
         }
     }
