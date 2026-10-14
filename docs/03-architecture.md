@@ -10,6 +10,7 @@ Start with one application crate and internal modules. Add a small `nora-dev` Ru
 | --- | --- | --- |
 | `app` | winit lifecycle, event routing, window UI and instance shutdown | VT state mutation logic |
 | `workspace` | Tabs, pane tree, focus and integer pixel layout | PTY fd operations |
+| `layout` | Split pane tree, active-pane focus, deterministic integer rectangles | PTY fd operations, session state |
 | `session` | PTY lifecycle, session worker, ordered writes, engine synchronization | GPU resources |
 | `engine` | Alacritty adapter, state access, mode mapping, snapshot extraction | Desktop clipboard/URL operations |
 | `input` | Key/mouse/focus encoding, paste normalization, local binding resolution | Shell command execution |
@@ -78,6 +79,16 @@ The window wires the workspace into the event loop. `WinApp` owns a `Workspace` 
 - **Closing a tab reaps its sessions.** `Ctrl+W` sends `PumpMsg::CloseTab { tab }`; the pump closes that tab's session (bounded drain, reap-once, idempotent — the same lifecycle as a single session) and drops its slot. The window drops the tab's mirrored state and falls back to the last remaining tab.
 - **Stale events are ignored.** Every pump `AppEvent` is tagged with its tab (`AppEvent::DirtyPulse { tab, .. }`, `ChildExit { tab, status }`, `TabGone { tab }`, …). The window's `on_tab_event` routes each event to its tab and drops any event whose tab no longer exists (`Workspace::has_tab`), so a background flood cannot build a snapshot queue for a tab that is no longer active. Per-tab presentation state is a `CoalescingSlot` — a background tab's snapshot flood coalesces to a single pending snapshot and never builds a queue.
 - **The pump owns one session per tab.** `pump_thread` holds a `HashMap<TabId, TabPump>` (one `PtySession` + one `CoalescingSlot` per tab) and one engine event loop that drains all tabs' engines each tick. `PumpMsg::NewTab` spawns a session for a new tab; `PumpMsg::CloseTab` reaps one. The window's first tab is `TabId(0)`, matching the workspace's first `add_tab()`.
+
+## Layout tree (N24a)
+
+`src/layout.rs` owns the split-pane arrangement of a tab's panes. It is a pure, headless data structure: no I/O, PTY or window dependency, so it is testable without a display. The layout is a **binary split tree** (`LayoutNode`): leaves are panes (`PaneId`), internal nodes are splits with a direction (`Horizontal` = side by side, `Vertical` = stacked) and a ratio (the fraction of space given to the first child, 0.0 to 1.0).
+
+- **Each pane has independent output/history/cwd/session lifecycle.** Each leaf is the routing target for one independent session owned by the `session` module (its own `Engine`, scrollback, working directory and PTY lifecycle). The layout only *arranges* panes; it holds no engine, PTY or session state, so one pane's data cannot leak into another's.
+- **Physical integer rectangles with deterministic remainder allocation.** `Layout::compute_rectangles(width, height)` tiles the given cell area exactly: at every split the first child gets `floor(size * ratio)` and the second child gets the remainder. Rectangles are nonoverlapping and deterministic for a given tree and size.
+- **Minimum grids (no zero grids).** When a split has at least two cells to divide, each child gets at least one cell (the first child's share is clamped to `[1, total - 1]`); a zero cell is produced only when fewer than two cells are available to divide, which is unavoidable.
+- **Focus follows documented shortcuts.** The layout tracks one active pane. Splitting focuses the new pane; `focus_pane` moves focus to any live pane and reports stale targets; when the active pane is closed, focus falls back to the first remaining pane (the leftmost live leaf). The window maps the documented split/focus/close shortcuts to these operations (N24b).
+- **Closing a pane collapses the tree consistently.** `close_pane` removes the pane and replaces the closed leaf by its sibling subtree at every enclosing split, so a dead leaf never survives below the root. Closing the last pane leaves an empty layout (`pane_count() == 0`, no rectangles); splitting an empty layout re-roots at the new pane.
 
 ## Damage and snapshot retention
 

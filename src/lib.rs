@@ -10,6 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod ime;
 pub mod input;
+pub mod layout;
 pub mod render;
 pub mod search;
 pub mod session;
