@@ -9,6 +9,9 @@
 //! shell (`$SHELL`, else `/bin/sh`) is launched and a clean close exits 0.
 //! With no display server available the launch falls back to the headless
 //! session pump (CI-safe).
+//! Config (N18b): `--config PATH` selects an explicit config file and
+//! `--check-config` validates the loaded config and exits (no display or
+//! GPU needed). Precedence: CLI flags > config file > built-in defaults.
 
 mod app;
 
@@ -29,6 +32,9 @@ Options:\n\
   -h, --help                   Print this help message\n\
   -V, --version                Print nora's name and version\n\
       --smoke                  Run one automated window smoke cycle and exit\n\
+      --config PATH            Use an explicit config file\n\
+      --check-config           Validate the config and exit (no display\n\
+                               or GPU needed)\n\
       --working-directory PATH Start the command in PATH\n\
       --hold                  Keep the window open after the child\n\
                              exits (windowed; headless ignores it)\n\
@@ -40,6 +46,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut smoke = false;
     let mut hold = false;
+    let mut config: Option<String> = None;
+    let mut check_config = false;
     let mut working_directory: Option<PathBuf> = None;
     let mut command: Vec<String> = Vec::new();
     let mut after_separator = false;
@@ -63,6 +71,14 @@ fn main() -> ExitCode {
             }
             "--smoke" => smoke = true,
             "--hold" => hold = true,
+            "--config" => {
+                let Some(path) = iter.next() else {
+                    eprintln!("{NAME} {VERSION}: --config requires a path");
+                    return ExitCode::from(2);
+                };
+                config = Some(path);
+            }
+            "--check-config" => check_config = true,
             "--working-directory" => {
                 let Some(path) = iter.next() else {
                     eprintln!("{NAME} {VERSION}: --working-directory requires a path");
@@ -87,6 +103,36 @@ fn main() -> ExitCode {
     if after_separator && command.is_empty() {
         eprintln!("{NAME} {VERSION}: no command after --");
         return ExitCode::from(2);
+    }
+
+    // N18b: the config is loaded before the app starts, so it is available
+    // for the smoke, windowed and headless paths alike.
+    let loaded_config = match nora::config::load_config(config.as_deref()) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{NAME} {VERSION}: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // `--check-config` is headless: validate and exit, no display or GPU.
+    if check_config {
+        let errors = loaded_config.config.validate();
+        if errors.is_empty() {
+            println!(
+                "config OK: {}",
+                loaded_config
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "defaults".to_string())
+            );
+            return ExitCode::SUCCESS;
+        }
+        for error in &errors {
+            eprintln!("{error}");
+        }
+        return ExitCode::FAILURE;
     }
 
     if smoke {
@@ -115,12 +161,21 @@ fn main() -> ExitCode {
     // Bare `nora` and `nora -- COMMAND ARG...` both open the windowed
     // session (N08b2b-2); `run_windowed` falls back to the headless
     // session pump when no display server is available (CI-safe).
-    run_windowed(spec, explicit, hold)
+    // N18b precedence: the CLI `--working-directory` (already in
+    // `spec.cwd`) overrides any config value; the config overrides the
+    // built-in defaults.
+    run_windowed(spec, explicit, hold, &loaded_config.config)
 }
 
 /// Headless launch (N05b). 24×80 is the documented headless placeholder
-/// until the UI cards.
-fn run_session(spec: LaunchSpec, explicit: bool) -> ExitCode {
+/// until the UI cards. `config` (N18b) is the loaded configuration; the
+/// values are accepted and logged now, and consumed where the headless
+/// path supports them.
+fn run_session(spec: LaunchSpec, explicit: bool, config: &nora::config::NoraConfig) -> ExitCode {
+    eprintln!(
+        "debug: config loaded: history={}, font.size={}",
+        config.terminal.history, config.font.size
+    );
     let mut session = match PtySession::spawn(spec, 24, 80, DEFAULT_CAP) {
         Ok(session) => session,
         Err(err) => {
@@ -159,7 +214,14 @@ fn run_session(spec: LaunchSpec, explicit: bool) -> ExitCode {
 /// headless session pump, so `nora -- CMD` stays CI-safe. Exits with
 /// the child's exit status when explicit (1 on a loop death without
 /// one), 0 on a clean default-shell close, or 1 on a startup failure.
-fn run_windowed(spec: LaunchSpec, explicit: bool, hold: bool) -> ExitCode {
+/// `config` (N18b) is the loaded configuration, passed to the windowed
+/// app and the headless fallback alike.
+fn run_windowed(
+    spec: LaunchSpec,
+    explicit: bool,
+    hold: bool,
+    config: &nora::config::NoraConfig,
+) -> ExitCode {
     let event_loop =
         match winit::event_loop::EventLoop::<nora::session::pump::AppEvent>::with_user_event()
             .build()
@@ -167,7 +229,7 @@ fn run_windowed(spec: LaunchSpec, explicit: bool, hold: bool) -> ExitCode {
             Ok(event_loop) => event_loop,
             Err(err) => {
                 eprintln!("{NAME} {VERSION}: no display server ({err}); headless session");
-                return run_session(spec, explicit);
+                return run_session(spec, explicit, config);
             }
         };
 
@@ -238,6 +300,7 @@ fn run_windowed(spec: LaunchSpec, explicit: bool, hold: bool) -> ExitCode {
         stop.clone(),
         explicit,
         hold,
+        config,
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pump.join();

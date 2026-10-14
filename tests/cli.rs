@@ -170,6 +170,30 @@ fn help_and_version_exit_zero() {
     );
 }
 
+/// Write a config file named `name` under a unique temp dir and return
+/// its path.
+fn write_config(name: &str, contents: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nora-config-test-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock must not precede the epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("unique temp dir must be creatable");
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("config file must be writable");
+    path
+}
+
+/// Deterministic config discovery: with no `HOME` and no
+/// `XDG_CONFIG_HOME`, `load_config(None)` has no XDG candidates and falls
+/// back to the built-in defaults.
+fn no_config_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("HOME").env_remove("XDG_CONFIG_HOME")
+}
+
 #[test]
 fn working_directory_flag() {
     let dir = std::env::temp_dir().join(format!(
@@ -214,5 +238,107 @@ fn working_directory_flag() {
     assert!(
         !out.stderr.trim().is_empty(),
         "stderr must report the bad cwd"
+    );
+}
+
+// --- N18b: CLI config integration ---------------------------------------
+
+/// `nora --check-config --config <valid>` exits 0 and reports the path.
+#[test]
+fn check_config_valid() {
+    let path = write_config("valid.toml", "[terminal]\nhistory = 2000\n");
+    let mut cmd = Command::new(nora_bin());
+    no_config_env(&mut cmd)
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&path);
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "--check-config with a valid config must exit 0; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("config OK"),
+        "stdout must report the config as OK; stdout={:?}",
+        out.stdout
+    );
+}
+
+/// `nora --check-config --config <invalid>` exits 1 and reports the
+/// validation error(s).
+#[test]
+fn check_config_invalid() {
+    let path = write_config("invalid.toml", "[terminal]\nhistory = 999999999\n");
+    let mut cmd = Command::new(nora_bin());
+    no_config_env(&mut cmd)
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&path);
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(1),
+        "--check-config with an invalid config must exit 1; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("terminal.history"),
+        "stderr must name the failing setting; stderr={:?}",
+        out.stderr
+    );
+}
+
+/// `nora --check-config` with no discoverable config file exits 0 on the
+/// built-in defaults (no display or GPU needed).
+#[test]
+fn check_config_defaults() {
+    let mut cmd = Command::new(nora_bin());
+    no_config_env(&mut cmd).arg("--check-config");
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "--check-config with no config file must exit 0 on the built-in defaults; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("config OK: defaults"),
+        "stdout must report that the built-in defaults were used; stdout={:?}",
+        out.stdout
+    );
+}
+
+/// `nora --config <valid> -- COMMAND` loads the config and still runs the
+/// session headless, propagating the child's exit status.
+#[test]
+fn config_flag() {
+    let path = write_config("valid.toml", "[theme]\nbackground = \"#101010\"\n");
+    let helper = helper_bin();
+    let mut cmd = Command::new(nora_bin());
+    cmd.arg("--config")
+        .arg(&path)
+        .arg("--")
+        .arg(&helper)
+        .arg("status")
+        .arg("7")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY");
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(7),
+        "the child's exit status must still propagate with --config; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("debug: config loaded"),
+        "the loaded config must reach the session; stderr={:?}",
+        out.stderr
     );
 }

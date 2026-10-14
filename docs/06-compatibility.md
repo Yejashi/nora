@@ -155,9 +155,9 @@ Documented limitations (no width policy invented):
 - **No complex grapheme clustering** — each cell is one grapheme; ZWJ sequences and other multi-cell emoji are shaped per cell, so joined sequences may render as separate components.
 - **Left-to-right only** — no RTL shaping; RTL scripts render in logical order without direction-aware shaping.
 
-## Configuration (N18a)
+## Configuration (N18a/N18b)
 
-Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless fixtures in `tests/config.rs`. CLI precedence over the loaded config is N18b and is not part of this slice.
+Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless fixtures in `tests/config.rs`.
 
 **Discovery order** (first existing file wins; otherwise built-in defaults with no source path):
 
@@ -181,3 +181,17 @@ Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless
 | `keys.bindings` | table (string → string) | `{}` | — |
 
 **Validation.** Unknown fields are rejected at parse time (`deny_unknown_fields` on every section). Numeric ranges and `#RRGGBB` colors are checked after parsing and reported as `ConfigError::Validation` with one line per problem; I/O and TOML syntax failures are `ConfigError::Io` / `ConfigError::Parse`. Only settings that are actually implemented are accepted — the schema is intentionally minimal and grows with the features that consume it.
+
+### CLI integration (N18b)
+
+`src/main.rs` loads the config after flag parsing and before any display/GPU work, and passes the loaded `NoraConfig` to both the windowed (`app::run_windowed`) and headless (`run_session`) launch paths.
+
+| Flag | Behavior |
+| --- | --- |
+| `--config <path>` | Use an explicit config file; a missing, unreadable or invalid file exits 1 |
+| `--check-config` | Validate the loaded config and exit — headless, no display or GPU: `config OK: <path or defaults>` on stdout with exit 0, one validation error per line on stderr with exit 1 |
+| `--working-directory <path>` | Working directory for the child process (CLI value; the config schema has no `working_directory` field yet) |
+
+**Precedence:** CLI flags > config file > built-in defaults. `--working-directory` is the first CLI override (it lands in the launch spec's `cwd`, which outranks any future config value). Config values are accepted at launch and logged (`debug: config loaded: …`); scrollback history, font size and theme colors are consumed as the app grows support for them.
+
+Headless CLI fixtures in `tests/cli.rs`: `check_config_valid`, `check_config_invalid`, `check_config_defaults`, `config_flag`.

@@ -372,6 +372,9 @@ struct WinApp {
 /// `pump_commands` carries window→pump messages; `stop` signals the pump
 /// thread when the window closes. `hold` (`--hold`, N12b) defers the
 /// `ChildExit` close: the window keeps its final frame until unhold.
+/// `config` (N18b) is the loaded configuration; its values are accepted
+/// and logged now, and consumed where the windowed path supports them.
+#[allow(clippy::too_many_arguments)] // fixed wiring: loop + window + pump + state
 pub fn run_windowed(
     event_loop: EventLoop<AppEvent>,
     window: Arc<Window>,
@@ -380,7 +383,12 @@ pub fn run_windowed(
     stop: Arc<AtomicBool>,
     explicit: bool,
     hold: bool,
+    config: &nora::config::NoraConfig,
 ) -> std::process::ExitCode {
+    eprintln!(
+        "debug: config loaded: history={}, font.size={}",
+        config.terminal.history, config.font.size
+    );
     let mut app = WinApp {
         slot,
         pump_commands,
