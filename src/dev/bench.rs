@@ -62,7 +62,7 @@ impl EngineBench {
             total_time: started.elapsed(),
             state_checksum: state_checksum(&snapshot),
             non_blank_cells,
-            metadata: metadata(),
+            metadata: BenchMetadata::current(),
         }
     }
 }
@@ -101,7 +101,8 @@ pub struct BenchResult {
     pub metadata: BenchMetadata,
 }
 
-/// Build and machine metadata attached to every [`BenchResult`] (N26a).
+/// Build and machine metadata attached to every benchmark result
+/// (N26a; shared by the N26b PTY, renderer and input instruments).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BenchMetadata {
     /// nora package name (compile-time).
@@ -118,22 +119,24 @@ pub struct BenchMetadata {
     pub logical_cpus: usize,
 }
 
-/// Build/machine metadata for the current process.
-fn metadata() -> BenchMetadata {
-    let logical_cpus = std::thread::available_parallelism()
-        .map(|cpus| cpus.get())
-        .unwrap_or(0);
-    BenchMetadata {
-        package: env!("CARGO_PKG_NAME"),
-        version: env!("CARGO_PKG_VERSION"),
-        profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
-        os: std::env::consts::OS,
-        arch: std::env::consts::ARCH,
-        logical_cpus,
+impl BenchMetadata {
+    /// Build/machine metadata for the current process.
+    pub fn current() -> Self {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|cpus| cpus.get())
+            .unwrap_or(0);
+        BenchMetadata {
+            package: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            logical_cpus,
+        }
     }
 }
 
@@ -159,8 +162,9 @@ fn color_key(color: &Color) -> u32 {
 
 /// FNV-1a 64 over the final screen state: every cell's character, flags,
 /// colors and zerowidth stack, plus the viewport size and cursor
-/// position (N26a state correctness).
-fn state_checksum(snapshot: &Snapshot) -> u64 {
+/// position (N26a state correctness; shared by the N26b renderer
+/// instrument).
+pub fn state_checksum(snapshot: &Snapshot) -> u64 {
     let mut hash = FNV_OFFSET;
     let mut utf8 = [0u8; 4];
     for cell in &snapshot.cells {

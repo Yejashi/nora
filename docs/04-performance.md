@@ -36,7 +36,7 @@ Implemented in `src/dev/` (development instruments; no production code path depe
 - **Engine benchmark** (`src/dev/bench.rs`, `EngineBench` / `run_bench`): feeds a corpus to a fresh headless `Engine` in 4 KiB chunks and times **feed** (engine processing) and **snapshot** (state extraction) separately, plus total wall time, final-screen FNV-1a 64 state checksum, non-blank cell count, and build/machine metadata (package, version, profile, OS, arch, logical CPUs).
 - **Interpretation**: feed time is engine processing only; snapshot time is state extraction, not presentation. Neither is a user-latency number. The state checksum pins correctness: a fast trial with a wrong final screen is a failure, not a fast sample.
 
-Workload mapping: `ascii_lines` ≈ P01 (scrolling/parse), `control_sequence_flood` ≈ P02 (escape-heavy state work), `unicode_lines`/`unique_glyphs` ≈ P03/P05 (cell handling, warm-cache vs unique-glyph cost). P04 (alternate-screen TUI redraws) is covered by the alt-screen sequences inside the control flood; P06–P10 and the live-PTY (layer B) and renderer (layer C) instruments remain later N26 slices.
+Workload mapping: `ascii_lines` ≈ P01 (scrolling/parse), `control_sequence_flood` ≈ P02 (escape-heavy state work), `unicode_lines`/`unique_glyphs` ≈ P03/P05 (cell handling, warm-cache vs unique-glyph cost). P04 (alternate-screen TUI redraws) is covered by the alt-screen sequences inside the control flood; P06–P10 remain later N26 slices. The live-PTY (layer B) and renderer/input (layer C) instruments land in N26b.
 
 ### B. Live PTY, processing completion
 
@@ -46,11 +46,27 @@ DSR completion establishes that the stream was processed sufficiently to generat
 
 Use MiB/s = workload bytes / 2^20 / elapsed seconds. Pre-generate workloads or separately measure generation cost. Record output sizes, row count and final-state checksum so throughput is not gained by omitting work.
 
+### B.1 Real PTY completion handshake (N26b)
+
+Implemented in `src/dev/pty_bench.rs` and validated by `tests/pty_benchmark.rs`:
+
+- **Handshake** (`PtyBench` / `run_pty_bench`): spawns the tagged-I/O helper child (`src/bin/nora_child.rs`) over a real PTY (`PtySession`, N05a) in `stop <n>` mode. The child reads its stdin until at least `n` bytes and a newline have been received, and only then prints the `STOPPED` completion marker — so the marker can appear only after the child has processed every byte nora sent. The benchmark pumps the session until the marker is visible in the engine grid (deadline-bounded at 10 s; a missed deadline is reported in `PtyBenchResult::completed`, not a hang).
+- **Measured fields** (`PtyBenchResult`): `spawn_time` (session start), `feed_time` (enqueue + flush to the child), `completion_time` (time until the marker is visible), `total_time`, plus corpus bytes, viewport size, `completed`, the marker, and the N26a `BenchMetadata`.
+- **Interpretation**: completion time is a real PTY round trip (child receipt + engine grid), not a timer on the writer's own accounting. It establishes processing completion, not screen presentation (layer B caveat above). Timings are informational on shared CI; the `completed` flag and corpus byte count are the correctness gates.
+
 ### C. Rendering and user experience
 
 Measure full-frame CPU preparation and GPU timestamps if supported, atlas misses/evictions, upload bytes, draw calls, surface acquisition waits, input service and echo-to-submit. An instrumented test hook can associate a unique echoed marker with a snapshot revision and a submitted frame.
 
 Software timestamps end at submission unless platform presentation feedback is captured. Even compositor feedback is not a physical key-to-photon measurement. Use a camera/photodiode setup when making physical latency claims; identify display refresh, compositor and input hardware. Do not infer low physical latency from fast parser throughput.
+
+### C.1 Headless renderer and input instruments (N26b)
+
+Implemented in `src/dev/render_bench.rs` and `src/dev/input_bench.rs`, validated by `tests/render_benchmark.rs` and `tests/input_benchmark.rs`:
+
+- **Renderer** (`RenderBench` / `run_render_bench`): headless, no GPU. Feeds a full-screen deterministic corpus (N26a `Corpus`) to a fresh `Engine`, then times **prepare** (snapshot → draw items and background fills via the same pure mapping the GPU path uses, `crate::render::term`) and **submit** (flatten the prepared frame into a flat byte buffer — the CPU-side stand-in for the GPU vertex upload). `RenderBenchResult` records rows/cols, corpus bytes, draw-item and fill counts, `prepare_time`, `submit_time`, `total_time`, `submitted_bytes`, the N26a state checksum of the final screen, and `BenchMetadata`.
+- **Input** (`InputBench` / `run_input_bench` / `InputEvent`): times the pure keyboard encoder (`crate::input::encode`) over a list of key events — no terminal state, no PTY, no display. `InputBenchResult` records event count, encoded count, sent-byte total, `encode_time`, `total_time`, and `BenchMetadata`.
+- **Interpretation**: prepare/submit are CPU-side render-pipeline costs only — no surface acquisition, GPU timestamps or presentation are measured, and nothing here is a key-to-photon number. The state checksum (renderer) and the pinned N09a sent-byte total (input) are the correctness gates; timings are informational on shared CI.
 
 ## Workloads
 
