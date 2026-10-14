@@ -158,6 +158,7 @@ fn snap(
         colors: Colors::default(),
         damage,
         epoch: 1,
+        display_offset: 0,
     }
 }
 

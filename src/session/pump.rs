@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use super::pty::{DRAIN_TIMEOUT, PtySession, SessionEvent};
 use crate::engine::Snapshot;
 use crate::render::term::is_noop_damage;
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 
 /// The outcome of one [`pump_tick`].
@@ -87,6 +88,8 @@ pub enum PumpMsg {
     Resize(usize, usize),
     /// Encoded keystroke bytes; window→PTY, ordered after earlier messages.
     Input(Vec<u8>),
+    /// Scroll the engine's viewport (N14a); applied on the next tick.
+    Scroll(Scroll),
 }
 
 /// Bounded pump thread: owns the session; ticks until terminated or stopped.
@@ -102,7 +105,8 @@ pub enum PumpMsg {
 /// from the last published one (the first tick always publishes,
 /// correcting the window's initial `SHOW_CURSOR`): send
 /// [`AppEvent::Modes`]; (5) drain [`PumpMsg`] commands — resize the
-/// session, or extend the pending input with encoded keystroke bytes;
+/// session, scroll the viewport, or extend the pending input with encoded
+/// keystroke bytes;
 /// (6) feed the pending input in order (bounded by the writer's app cap;
 /// `Ok(0)` = budget full, remainder waits for the next tick;
 /// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
@@ -203,6 +207,12 @@ pub fn pump_thread(
                     session.resize(rows as u16, cols as u16);
                 }
                 PumpMsg::Input(bytes) => pending_input.extend(bytes),
+                PumpMsg::Scroll(scroll) => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: scroll {scroll:?}");
+                    }
+                    session.engine().scroll(scroll);
+                }
             }
         }
 

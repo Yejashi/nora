@@ -19,13 +19,14 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, StartCause, WindowEvent},
+    event::{ElementState, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
     window::{Window, WindowAttributes, WindowId},
 };
 
 use self::graphics::{DrawCell, Graphics};
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::engine::Snapshot;
 use nora::input::{BindingTable, InputAction, encode};
@@ -816,6 +817,21 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                // N14a: the wheel scrolls the scrollback. winit reports
+                // positive y as "content moves down" (scroll up) for both
+                // delta kinds, so positive lines = into history; the pump
+                // applies the delta to the engine on its next tick.
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * 3,
+                    MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
+                };
+                if lines != 0 {
+                    let _ = self
+                        .pump_commands
+                        .send(PumpMsg::Scroll(Scroll::Delta(lines)));
+                }
+            }
             WindowEvent::Ime(_) => {}     // N09b: no IME in v0.1.
             WindowEvent::Focused(_) => {} // N09b: synthetic filtering covers duplicates.
             _ => {}

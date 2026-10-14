@@ -8,8 +8,10 @@
 //! [`EventRecord`]) cross the boundary.
 //!
 //! Contract:
-//! - `Engine` runs with **zero scrollback** (`total_lines == rows`), so grid
-//!   lines equal viewport rows and `display_offset` is always 0.
+//! - [`Engine::new`] runs with **zero scrollback** (`total_lines == rows`),
+//!   so grid lines equal viewport rows and `display_offset` is always 0;
+//!   [`Engine::with_history`] admits `scrollback` lines of history, and
+//!   `display_offset` tracks the viewport's position within it.
 //! - [`Engine::snapshot`] consumes one damage report: the first snapshot of a
 //!   fresh engine is [`Damage::Full`] (the engine starts fully damaged); each
 //!   later snapshot reports only what changed since the previous snapshot.
@@ -22,7 +24,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::{COUNT, Colors};
@@ -300,6 +302,8 @@ pub struct Snapshot {
     pub colors: Colors,
     /// Damage for this snapshot (consumed on read, see module docs).
     pub damage: Damage,
+    /// Viewport offset into the scrollback history (0 = bottom).
+    pub display_offset: usize,
 }
 
 /// Content identity only: [`Snapshot::epoch`] is deliberately not compared,
@@ -329,6 +333,7 @@ impl std::fmt::Debug for Snapshot {
             .field("cursor_shape", &self.cursor_shape)
             .field("modes", &self.modes)
             .field("damage", &self.damage)
+            .field("display_offset", &self.display_offset)
             .finish()
     }
 }
@@ -356,12 +361,19 @@ impl Engine {
     /// Create a headless engine with a `rows` × `cols` viewport and no
     /// scrollback.
     pub fn new(rows: usize, cols: usize) -> Self {
-        // Zero history: grid lines equal viewport rows, so display_offset is
-        // always 0 and cursor/viewport math is the identity.
+        Self::with_history(rows, cols, 0)
+    }
+
+    /// Create a headless engine with a `rows` × `cols` viewport and
+    /// `scrollback` lines of history above the viewport.
+    pub fn with_history(rows: usize, cols: usize, scrollback: usize) -> Self {
+        // `scrollback` lines of history: with zero history, grid lines
+        // equal viewport rows, so display_offset is always 0 and
+        // cursor/viewport math is the identity.
         // OSC 52 store/load are denied: the pinned term emits no events and
         // no replies for clipboard queries while `Osc52::Disabled`.
         let config = Config {
-            scrolling_history: 0,
+            scrolling_history: scrollback,
             osc52: Osc52::Disabled,
             ..Default::default()
         };
@@ -439,10 +451,35 @@ impl Engine {
     }
 
     /// Cursor position in viewport coordinates (0-based row, column).
+    /// Returns `None` when the cursor is outside the visible viewport
+    /// (scrolled above or below the current display window).
     pub fn cursor(&self) -> Option<(usize, usize)> {
-        let point = self.term.lock().grid().cursor.point;
-        // Zero scrollback: display_offset is always 0.
-        point_to_viewport(0, point).map(|p| (p.line, p.column.0))
+        let term = self.term.lock();
+        let point = term.grid().cursor.point;
+        let display_offset = term.grid().display_offset();
+        point_to_viewport(display_offset, point)
+            .filter(|p| p.line < self.rows)
+            .map(|p| (p.line, p.column.0))
+    }
+
+    /// Scroll the viewport by `scroll` (N14a): `Delta` moves the display
+    /// offset by lines (positive = into history), clamped to the history
+    /// bounds; `PageUp`/`PageDown`/`Top`/`Bottom` jump within it.
+    pub fn scroll(&self, scroll: Scroll) {
+        let mut term = self.term.lock();
+        term.scroll_display(scroll);
+    }
+
+    /// The viewport's offset into the scrollback history (0 = bottom).
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
+    }
+
+    /// Number of scrollback lines currently stored above the viewport.
+    pub fn history_size(&self) -> usize {
+        let term = self.term.lock();
+        let grid = term.grid();
+        grid.total_lines().saturating_sub(grid.screen_lines())
     }
 
     /// Take one owned snapshot of the screen, consuming one damage report.
@@ -464,14 +501,17 @@ impl Engine {
 
         let content = term.renderable_content();
         // Cell extras are copied to owned, engine-free data under the term
-        // guard, via the pinned `Cell` accessors.
+        // guard, via the pinned `Cell` accessors. Grid points are mapped
+        // through `point_to_viewport` so history lines (negative grid
+        // lines) land in viewport rows; out-of-viewport cells are skipped.
+        let display_offset = content.display_offset;
         let cells: Vec<CellText> = content
             .display_iter
-            .map(|cell| {
-                let row = cell.point.line.0 as usize;
-                CellText {
-                    row,
-                    col: cell.point.column.0,
+            .filter_map(|cell| {
+                let point = point_to_viewport(display_offset, cell.point)?;
+                Some(CellText {
+                    row: point.line,
+                    col: point.column.0,
                     ch: cell.cell.c,
                     fg: cell.cell.fg,
                     bg: cell.cell.bg,
@@ -486,7 +526,7 @@ impl Engine {
                         .cell
                         .hyperlink()
                         .map(|h| (h.id().to_string(), h.uri().to_string())),
-                }
+                })
             })
             .collect();
 
@@ -506,6 +546,7 @@ impl Engine {
             modes: content.mode,
             colors: *content.colors,
             damage,
+            display_offset,
         };
         term.reset_damage();
         snapshot
