@@ -143,3 +143,95 @@ fn ime_preedit_empty() {
     ime.start_composition();
     assert_eq!(ime.preedit(), "");
 }
+
+// ---------------------------------------------------------------------------
+// N22b UI fixtures: the window event handler folds the platform `Ime`
+// events into `ImeState` in this order — `Enabled` → `start_composition`,
+// `Preedit` → `update_preedit`, `Commit` → `commit`, `Disabled` →
+// `cancel`. These fixtures drive the machine exactly as the window does
+// and assert the card's acceptance lines: preedit is UI-only, commit is
+// produced exactly once, and cancel clears all state.
+// ---------------------------------------------------------------------------
+
+/// N22b (1): the `Ime::Enabled` event starts a composition via the UI —
+/// the machine activates with an empty preedit.
+#[test]
+fn ime_ui_start() {
+    let mut ime = ImeState::new();
+    assert!(!ime.is_active());
+
+    // `Ime::Enabled` → `start_composition`.
+    ime.start_composition();
+    assert!(ime.is_active());
+    assert_eq!(ime.preedit(), "");
+    assert_eq!(ime.committed(), "");
+}
+
+/// N22b (2): `Ime::Preedit` events update the preedit via the UI; the
+/// preedit is UI-only state, readable while composing and never sent.
+#[test]
+fn ime_ui_preedit() {
+    let mut ime = ImeState::new();
+    ime.start_composition(); // `Ime::Enabled`
+
+    // `Ime::Preedit("nihao")` → `update_preedit`.
+    ime.update_preedit("nihao");
+    assert_eq!(ime.preedit(), "nihao");
+    assert!(ime.is_active());
+    assert_eq!(ime.committed(), "");
+
+    // A later `Ime::Preedit` replaces the text.
+    ime.update_preedit("nihao2");
+    assert_eq!(ime.preedit(), "nihao2");
+}
+
+/// N22b (3): the `Ime::Commit` event commits via the UI — the composed
+/// preedit is produced exactly once, sent to the PTY (here: returned),
+/// and the machine deactivates.
+#[test]
+fn ime_ui_commit() {
+    let mut ime = ImeState::new();
+    ime.start_composition(); // `Ime::Enabled`
+    ime.update_preedit("こんにちは"); // `Ime::Preedit`
+
+    // `Ime::Commit` → `commit`.
+    let committed = ime.commit();
+    assert_eq!(committed.as_deref(), Some("こんにちは"));
+    assert!(!ime.is_active());
+    assert_eq!(ime.preedit(), "");
+    assert_eq!(ime.committed(), "こんにちは");
+
+    // A second `Ime::Commit` with no active composition sends nothing.
+    assert_eq!(ime.commit(), None);
+}
+
+/// N22b (4): the `Ime::Disabled` event cancels via the UI — the active
+/// flag, preedit and committed text are all cleared without sending.
+#[test]
+fn ime_ui_cancel() {
+    let mut ime = ImeState::new();
+    ime.start_composition(); // `Ime::Enabled`
+    ime.update_preedit("abc"); // `Ime::Preedit`
+
+    // `Ime::Disabled` → `cancel`.
+    ime.cancel();
+    assert!(!ime.is_active());
+    assert_eq!(ime.preedit(), "");
+    assert_eq!(ime.committed(), "");
+    assert_eq!(ime.commit(), None);
+}
+
+/// N22b (5): committing when the IME is disabled (no active composition)
+/// returns `None` — nothing is sent to the PTY.
+#[test]
+fn ime_ui_disabled() {
+    let mut ime = ImeState::new();
+    // No `Ime::Enabled` has arrived; the machine is inactive.
+    assert_eq!(ime.commit(), None);
+
+    // After a `Ime::Disabled` (cancel), a commit also returns `None`.
+    ime.start_composition();
+    ime.update_preedit("abc");
+    ime.cancel(); // `Ime::Disabled`
+    assert_eq!(ime.commit(), None);
+}

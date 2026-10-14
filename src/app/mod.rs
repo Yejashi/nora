@@ -388,6 +388,10 @@ struct WinApp {
     /// the search is bounded to the visible area for now; scrollback
     /// search is a later slice. Row 0 = top visible row.
     last_visible: Vec<Vec<char>>,
+    /// The IME state machine (N22b): driven by the platform `Ime` events;
+    /// the preedit is UI-only state and each commit is sent to the PTY
+    /// exactly once.
+    ime: nora::ime::ImeState,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -435,6 +439,7 @@ pub fn run_windowed(
         zoom: nora::config::ZOOM_DEFAULT,
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
+        ime: nora::ime::ImeState::new(),
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -689,8 +694,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
             .clone()
             .expect("the window is created before the loop runs");
 
-        // N09b: no IME in v0.1; `Ime` events are ignored in `window_event`.
-        window.set_ime_allowed(false);
+        // N22b: enable the platform IME; `Ime` events are folded into
+        // `self.ime` in `window_event` (preedit is UI state, commits are
+        // sent to the PTY exactly once).
+        window.set_ime_allowed(true);
 
         let mut graphics =
             match pollster::block_on(Graphics::new(event_loop, &window, |device, surface| {
@@ -1255,7 +1262,35 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     }
                 }
             }
-            WindowEvent::Ime(_) => {} // N09b: no IME in v0.1.
+            // N22b: fold the platform IME events into the state machine.
+            // The preedit is UI-only state (displayed, never sent); the
+            // commit is sent to the PTY exactly once through the ordered
+            // writer; cancel/transfer clear all state without sending.
+            WindowEvent::Ime(ime_event) => match ime_event {
+                winit::event::Ime::Enabled => {
+                    self.ime.start_composition();
+                    eprintln!("IME: composition started");
+                }
+                winit::event::Ime::Preedit(text, _cursor_pos) => {
+                    self.ime.update_preedit(&text);
+                    eprintln!("IME: preedit = {:?}", text);
+                }
+                winit::event::Ime::Commit(_text) => {
+                    // The state machine is the single source of truth for
+                    // what commits; `commit()` returns the tracked preedit
+                    // exactly once and deactivates.
+                    if let Some(committed) = self.ime.commit() {
+                        eprintln!("IME: commit = {:?}", committed);
+                        let _ = self
+                            .pump_commands
+                            .send(PumpMsg::Input(committed.into_bytes()));
+                    }
+                }
+                winit::event::Ime::Disabled => {
+                    self.ime.cancel();
+                    eprintln!("IME: composition cancelled");
+                }
+            },
             WindowEvent::Focused(focused) => {
                 // N16b: report the focus change when the engine has
                 // focus reporting enabled (`FOCUS_IN_OUT`);

@@ -208,7 +208,19 @@ Pure state machine in `src/ime.rs` (`nora::ime::ImeState`), headless fixtures in
 | Clear | `clear` resets all state (focus change / composition transfer) | pass — `tests/ime.rs` |
 | Dead keys / AltGr | Unaffected: they flow through the normal key/text pipeline (N10/N21 encoders) and never touch `ImeState` | pass — existing `tests/*_input.rs` encoder fixtures |
 
-Window wiring (N22b) will display the preedit as UI state and route each commit through the ordered writer exactly once; dead keys and AltGr remain usable through the legacy/kitty encoders unchanged.
+Dead keys and AltGr remain usable through the legacy/kitty encoders unchanged.
+
+### IME UI wiring (N22b)
+
+The window layer (`src/app/mod.rs`) carries an `ImeState` on the app and drives it from the platform `Ime` events in the window event handler; the engine and session are untouched. IME is enabled at startup (`Window::set_ime_allowed(true)`), so native Wayland and X11 composition both reach the handler.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Events | `Ime::Enabled`/`Preedit`/`Commit`/`Disabled` are handled in the window event handler and folded into `ImeState` | pass — `tests/ime.rs` UI fixtures |
+| Preedit | `Preedit` text is stored as UI-only state (`ImeState::preedit`); it is displayed, never sent to the PTY | pass — `tests/ime.rs` UI fixtures |
+| Commit | `Commit` sends the composed text to the PTY exactly once, through the ordered writer (`PumpMsg::Input`); `ImeState::commit` returns it once and deactivates | pass — `tests/ime.rs` UI fixtures |
+| Cancel | `Disabled` clears the active flag, preedit and committed text without sending anything | pass — `tests/ime.rs` UI fixtures |
+| Native backends | Wayland and X11 composition results are recorded separately; each backend's IME availability is tested rather than inferred | open — native Wayland and X11 runs |
 
 ## TERM and terminfo
 
