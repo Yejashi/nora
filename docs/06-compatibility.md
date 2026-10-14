@@ -146,6 +146,20 @@ Literal search over an owned scrollback snapshot (`nora::search`, headless fixtu
 
 Highlighting, the search bar and background-job wiring are N20b.
 
+## Search bar UI (N20b)
+
+The search bar is a local UI overlay: it never sends anything to the PTY, and the engine/session are untouched. The bar state (`nora::search::SearchUi`) is a headless state machine driven by the window layer's keyboard handling (before PTY encoding, mirroring the N15/N19b idiom); the render pass draws the current match's span as a fill rectangle under the text (`SEARCH_BG`, after the selection fill so an active match wins over a selection).
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Toggle | Ctrl+F shows/hides the bar; hiding clears the query and matches (physical `F` + Ctrl, layout-independent, auto-repeat ignored) | wiring in `src/app/mod.rs` |
+| Input | while visible, typed characters append to the query and re-search immediately (logical key, layout-dependent); Backspace removes the last character and re-searches | `tests/search.rs` (state machine) + wiring in `src/app/mod.rs` |
+| Next match | Enter moves to the next match, wrapping at the end; no-op when there are no matches | `tests/search.rs` + wiring in `src/app/mod.rs` |
+| Close | Escape hides the bar and clears the query and matches | `tests/search.rs` + wiring in `src/app/mod.rs` |
+| Highlight | the current match's span (query length in cells, clamped to the row) is drawn as a fill rectangle under the text | wiring in `src/app/mod.rs` + `src/app/graphics.rs` |
+| Search scope | bounded to the last presented visible area (a character snapshot refreshed on every presented frame); scrollback search is a later slice | wiring in `src/app/mod.rs` |
+| Re-search on content change | while a search is active, each presented frame re-runs the query against the refreshed visible-area snapshot, so matches track scrolling content | wiring in `src/app/mod.rs` |
+
 ## Native clipboard and IME
 
 Wayland clipboard ownership is a platform integration issue. Prefer a winit-compatible native Wayland helper such as `smithay-clipboard` after verifying the pinned handle/API; use a tested X11 backend for X11 [S25, S26]. Do not quietly start an X11 clipboard path in a native Wayland session. Test ownership lifetime, delayed requests and selection transfer after focus changes. PRIMARY selection is optional and documented independently from ordinary copy/paste.

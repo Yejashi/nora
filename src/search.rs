@@ -1,4 +1,5 @@
-//! N20a scrollback search core (headless).
+//! N20a scrollback search core (headless) and the N20b search bar UI
+//! state machine (headless).
 //!
 //! Literal (no regex) search over an owned snapshot of scrollback rows
 //! (`&[Vec<char>]`, row 0 = oldest). A [`SearchState`] carries the
@@ -68,7 +69,7 @@ impl Default for SearchState {
 }
 
 /// A search result (a match in the scrollback).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchResult {
     /// The row index in the scrollback (0 = oldest).
     pub row: usize,
@@ -156,4 +157,95 @@ pub fn search_snapshot(snapshot: &[Vec<char>], query: &str) -> Vec<SearchResult>
     }
 
     results
+}
+
+/// The search bar UI state machine (N20b): the query, the current match
+/// list and the bar's visibility, driven by key events. Pure and
+/// headless-testable; the window layer routes the search keys here and
+/// hands the match list to the render pass.
+///
+/// Matches are (row, col) pairs in the coordinates of the snapshot the
+/// search ran over — the window searches the last presented visible
+/// area, so the results are directly drawable viewport coordinates.
+#[derive(Debug, Clone, Default)]
+pub struct SearchUi {
+    /// The query and match navigation state.
+    pub state: SearchState,
+    /// Whether the search bar is visible.
+    pub visible: bool,
+    /// The matches of the last search, in snapshot (row, col) order.
+    pub matches: Vec<SearchResult>,
+}
+
+impl SearchUi {
+    /// Create a hidden search bar with an empty query.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Toggle the bar (Ctrl+F). Hiding clears the query and matches.
+    pub fn toggle(&mut self) {
+        self.visible = !self.visible;
+        if !self.visible {
+            self.state.set_query(String::new());
+            self.matches.clear();
+        }
+    }
+
+    /// Append typed text to the query and re-search `snapshot`.
+    pub fn input(&mut self, text: &str, snapshot: &[Vec<char>]) {
+        let mut query = self.state.query.clone();
+        query.push_str(text);
+        self.state.set_query(query);
+        self.research(snapshot);
+    }
+
+    /// Remove the last character of the query and re-search.
+    pub fn backspace(&mut self, snapshot: &[Vec<char>]) {
+        let mut query = self.state.query.clone();
+        query.pop();
+        self.state.set_query(query);
+        self.research(snapshot);
+    }
+
+    /// Move to the next match (wrapping); a no-op without matches.
+    pub fn next(&mut self) {
+        self.state.next();
+    }
+
+    /// Move to the previous match (wrapping); a no-op without matches.
+    pub fn prev(&mut self) {
+        self.state.prev();
+    }
+
+    /// Close the bar (Escape): hide it and clear the query and matches.
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.state.set_query(String::new());
+        self.matches.clear();
+    }
+
+    /// Re-run the search over `snapshot` for the current query.
+    ///
+    /// An empty query matches nothing (no "match every cell" behavior).
+    /// The match index is kept when a re-search still has matches (the
+    /// user stays on their match) and clamped to 0 when the new result
+    /// set is smaller.
+    pub fn research(&mut self, snapshot: &[Vec<char>]) {
+        if self.state.query.is_empty() {
+            self.matches.clear();
+            self.state.total = 0;
+            return;
+        }
+        self.matches = search_snapshot(snapshot, &self.state.query);
+        self.state.total = self.matches.len();
+        if self.state.current >= self.state.total {
+            self.state.current = 0;
+        }
+    }
+
+    /// The (row, col) of the current match, if any.
+    pub fn current_match(&self) -> Option<SearchResult> {
+        self.matches.get(self.state.current).copied()
+    }
 }

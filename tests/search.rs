@@ -5,7 +5,9 @@
 //! the card's acceptance lines on literal matching, match navigation,
 //! and generation tagging.
 
-use nora::search::{SearchOutcome, SearchState, check_stale, run_search, search_snapshot};
+use nora::search::{
+    SearchOutcome, SearchState, SearchUi, check_stale, run_search, search_snapshot,
+};
 
 /// Build a snapshot from raw row strings (row 0 = oldest).
 fn snapshot(lines: &[&str]) -> Vec<Vec<char>> {
@@ -222,4 +224,130 @@ fn search_cancelled() {
         }
         other => panic!("current outcome must pass through, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------
+// N20b: search bar UI state machine (`SearchUi`).
+//
+// Headless: the window layer routes the search keys into this machine
+// and hands the match list to the render pass; these tests assert the
+// card's acceptance lines on toggle, input, backspace, navigation and
+// close.
+// ---------------------------------------------------------------------
+
+/// N20b (1): toggling shows the bar; toggling again hides it and clears
+/// the query and matches.
+#[test]
+fn search_toggle() {
+    let snap = snapshot(&["find me"]);
+    let mut ui = SearchUi::new();
+    assert!(!ui.visible);
+
+    ui.toggle();
+    assert!(ui.visible);
+
+    // A search while visible populates matches.
+    ui.input("find", &snap);
+    assert_eq!(ui.state.total, 1);
+    assert_eq!(
+        ui.matches,
+        vec![nora::search::SearchResult { row: 0, col: 0 }]
+    );
+
+    // Toggling again hides and clears.
+    ui.toggle();
+    assert!(!ui.visible);
+    assert_eq!(ui.state.query, "");
+    assert_eq!(ui.state.total, 0);
+    assert!(ui.matches.is_empty());
+}
+
+/// N20b (2): typing appends to the query and re-searches; an empty
+/// query matches nothing.
+#[test]
+fn search_input() {
+    let snap = snapshot(&["find me"]);
+    let mut ui = SearchUi::new();
+    ui.toggle();
+
+    ui.input("f", &snap);
+    assert_eq!(ui.state.query, "f");
+    assert_eq!(ui.state.total, 1);
+
+    ui.input("i", &snap);
+    assert_eq!(ui.state.query, "fi");
+    assert_eq!(ui.state.total, 1);
+    assert_eq!(
+        ui.matches,
+        vec![nora::search::SearchResult { row: 0, col: 0 }]
+    );
+
+    // A query with no hit clears the matches.
+    ui.input("zz", &snap);
+    assert_eq!(ui.state.query, "fizz");
+    assert_eq!(ui.state.total, 0);
+    assert!(ui.matches.is_empty());
+}
+
+/// N20b (3): backspace removes the last character and re-searches.
+#[test]
+fn search_backspace() {
+    let snap = snapshot(&["find me"]);
+    let mut ui = SearchUi::new();
+    ui.toggle();
+
+    ui.input("fi", &snap);
+    assert_eq!(ui.state.query, "fi");
+
+    ui.backspace(&snap);
+    assert_eq!(ui.state.query, "f");
+    assert_eq!(ui.state.total, 1);
+
+    // Backspacing to empty clears the matches.
+    ui.backspace(&snap);
+    assert_eq!(ui.state.query, "");
+    assert_eq!(ui.state.total, 0);
+    assert!(ui.matches.is_empty());
+}
+
+/// N20b (4): Enter moves to the next match (wrapping); a no-op without
+/// matches.
+#[test]
+fn search_enter_next() {
+    let snap = snapshot(&["aa", "aa", "aa"]);
+    let mut ui = SearchUi::new();
+    ui.toggle();
+    ui.input("aa", &snap);
+    assert_eq!(ui.state.total, 3);
+    assert_eq!(ui.state.current, 0);
+
+    ui.next();
+    assert_eq!(ui.state.current, 1);
+    ui.next();
+    assert_eq!(ui.state.current, 2);
+    // Wraps to the first.
+    ui.next();
+    assert_eq!(ui.state.current, 0);
+
+    // No matches: navigation is a no-op.
+    let mut empty = SearchUi::new();
+    empty.next();
+    assert_eq!(empty.state.current, 0);
+}
+
+/// N20b (5): Escape closes the bar and clears the query and matches.
+#[test]
+fn search_escape() {
+    let snap = snapshot(&["find me"]);
+    let mut ui = SearchUi::new();
+    ui.toggle();
+    ui.input("find", &snap);
+    assert!(ui.visible);
+    assert_eq!(ui.state.total, 1);
+
+    ui.close();
+    assert!(!ui.visible);
+    assert_eq!(ui.state.query, "");
+    assert_eq!(ui.state.total, 0);
+    assert!(ui.matches.is_empty());
 }

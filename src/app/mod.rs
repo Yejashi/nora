@@ -21,7 +21,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
 };
 
@@ -216,6 +216,7 @@ impl ApplicationHandler for App {
                     &mut fonts,
                     &[],
                     &[],
+                    &[],
                     1.0,
                     nora::config::ZOOM_DEFAULT,
                 ) {
@@ -375,6 +376,13 @@ struct WinApp {
     /// Current zoom level (N19b): 1.0 = 100%; scales the shaping font
     /// size passed to `draw_frame`.
     zoom: f32,
+    /// Search bar UI (N20b): the query, matches and visibility, driven
+    /// by the keyboard before PTY encoding.
+    search: nora::search::SearchUi,
+    /// Character snapshot of the last presented visible area (N20b):
+    /// the search is bounded to the visible area for now; scrollback
+    /// search is a later slice. Row 0 = top visible row.
+    last_visible: Vec<Vec<char>>,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -419,6 +427,8 @@ pub fn run_windowed(
         pressed_buttons: Vec::new(),
         clipboard: create_clipboard(),
         zoom: nora::config::ZOOM_DEFAULT,
+        search: nora::search::SearchUi::new(),
+        last_visible: Vec::new(),
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -532,6 +542,36 @@ impl WinApp {
                     }
                     return;
                 }
+                // N20b: the search is bounded to the visible area —
+                // refresh the character snapshot of what was just taken
+                // and re-run an active search against it (the content
+                // may have scrolled). Field-level calls only: the
+                // `graphics`/`window` borrows above are still live, so
+                // no `&mut self` methods here.
+                let mut visible: Vec<Vec<char>> = Vec::with_capacity(snap.rows);
+                for row in 0..snap.rows {
+                    let mut line = Vec::with_capacity(snap.cols);
+                    for col in 0..snap.cols {
+                        line.push(snap.cells[row * snap.cols + col].ch);
+                    }
+                    visible.push(line);
+                }
+                self.last_visible = visible;
+                if self.search.visible && !self.search.state.query.is_empty() {
+                    self.search.research(&self.last_visible);
+                }
+                // N20b: highlight span of the current match, in viewport
+                // (row, col) cells; empty when there is no current match.
+                let mut search_cells: Vec<(u32, u32)> = Vec::new();
+                if let Some(m) = self.search.current_match() {
+                    let rows = self.last_visible.len();
+                    let cols = self.last_visible.first().map_or(0, |row| row.len());
+                    if m.row < rows {
+                        let start = m.col.min(cols);
+                        let end = (start + self.search.state.query.chars().count()).min(cols);
+                        search_cells.extend((start..end).map(|col| (m.row as u32, col as u32)));
+                    }
+                }
                 let fonts = self.fonts.as_mut().expect("fonts are loaded at startup");
                 // Row-major visible cells (N13a): each cell's full cluster is
                 // shaped with its resolved style; spacers and concealed cells
@@ -585,6 +625,7 @@ impl WinApp {
                     fonts,
                     &draw_cells,
                     &selection_cells,
+                    &search_cells,
                     window.scale_factor() as f32,
                     self.zoom,
                 ) {
@@ -971,6 +1012,67 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         }
                         _ => {}
                     }
+                }
+                // N20b: search bar. Local UI actions (not PTY escapes),
+                // checked before `encode` and returning early, mirroring
+                // the N15/N19b idiom. While the bar is visible the
+                // logical key drives the query (typed text is
+                // layout-dependent); the toggle is keyed on the
+                // physical `F` + Ctrl (layout-independent).
+                if self.search.visible {
+                    match &event.logical_key {
+                        Key::Character(text) => {
+                            self.search.input(text, &self.last_visible);
+                            eprintln!(
+                                "search: {} match(es) for '{}'",
+                                self.search.state.total, self.search.state.query
+                            );
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            // Enter = next match, Shift+Enter = previous
+                            // (both wrap); the highlight span is
+                            // recomputed on the next presented frame.
+                            if self.mods.shift_key() {
+                                self.search.prev();
+                            } else {
+                                self.search.next();
+                            }
+                            if let Some(m) = self.search.current_match() {
+                                eprintln!("search highlight: row={}, col={}", m.row, m.col);
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.search.backspace(&self.last_visible);
+                            eprintln!(
+                                "search: {} match(es) for '{}'",
+                                self.search.state.total, self.search.state.query
+                            );
+                            return;
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.search.close();
+                            eprintln!("search: hidden");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if self.mods.control_key()
+                    && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyF)
+                {
+                    self.search.toggle();
+                    eprintln!(
+                        "search: {}",
+                        if self.search.visible {
+                            "shown"
+                        } else {
+                            "hidden"
+                        }
+                    );
+                    return;
                 }
                 if let Some(action) = encode(
                     &event.logical_key,
