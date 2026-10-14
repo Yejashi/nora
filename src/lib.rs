@@ -10,4 +10,5 @@ pub mod config;
 pub mod engine;
 pub mod input;
 pub mod render;
+pub mod search;
 pub mod session;

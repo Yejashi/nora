@@ -131,6 +131,21 @@ Pure encoding in `src/input/mouse.rs` (`encode_mouse_event`), headless fixtures 
 
 Selection uses engine-supported coordinates and wrapped-line information. Copy joins soft wraps without injecting newlines, preserves real newlines, and handles wide spacers/combining marks. During history trimming or reflow, use the engine's selection remapping or invalidate visibly; do not retain stale raw row indices.
 
+## Scrollback search (N20a)
+
+Literal search over an owned scrollback snapshot (`nora::search`, headless fixtures in `tests/search.rs`). Search is core terminal-state logic: the engine and session are untouched, and the search never reaches into unbounded history.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Matching | literal (no regex, no case folding); case-sensitive, per code point | pass — `tests/search.rs` |
+| Scope | bounded to the provided snapshot (`&[Vec<char>]`, row 0 = oldest) | pass — `tests/search.rs` |
+| Wrapped lines | each physical row is searched separately; a query spanning a wrap boundary matches nothing | pass — `tests/search.rs` |
+| Navigation | next/previous over the match list, wrap-around at both ends; no-op when there are no matches | pass — `tests/search.rs` |
+| Stale results | every search is tagged with the query's generation; a result that completes after a newer query is `Cancelled` and must be dropped without touching the state | pass — `tests/search.rs` |
+| Empty query | returns no matches (no "match every cell" behavior) | pass — `tests/search.rs` |
+
+Highlighting, the search bar and background-job wiring are N20b.
+
 ## Native clipboard and IME
 
 Wayland clipboard ownership is a platform integration issue. Prefer a winit-compatible native Wayland helper such as `smithay-clipboard` after verifying the pinned handle/API; use a tested X11 backend for X11 [S25, S26]. Do not quietly start an X11 clipboard path in a native Wayland session. Test ownership lifetime, delayed requests and selection transfer after focus changes. PRIMARY selection is optional and documented independently from ordinary copy/paste.
