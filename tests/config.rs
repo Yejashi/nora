@@ -1,0 +1,286 @@
+//! N18a configuration regression suite: types, defaults, validation, TOML
+//! parsing, and XDG discovery in `nora::config`.
+//!
+//! All filesystem tests use unique temp directories (removed on drop). The
+//! single test that mutates the process environment (`xdg_discovery`) is the
+//! only one that does, so no env-var race is possible under parallel test
+//! threads.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use nora::config::{
+    ConfigError, FontConfig, KeysConfig, NoraConfig, TerminalConfig, ThemeConfig, load_config,
+    load_config_with_candidates, parse_config,
+};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A unique temp directory, removed on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nora-config-test-{}-{}-{}",
+            std::process::id(),
+            n,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_config(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, content).expect("write config file");
+    path
+}
+
+#[test]
+fn default_config() {
+    let c = NoraConfig::default();
+    assert_eq!(c.terminal.history, 1000);
+    assert!(!c.terminal.mouse);
+    assert_eq!(c.font.family, "monospace");
+    assert_eq!(c.font.size, 12.0);
+    assert_eq!(c.theme.background, "#000000");
+    assert_eq!(c.theme.foreground, "#ffffff");
+    assert_eq!(c.theme.cursor, "#ffffff");
+    assert!(c.theme.colors.is_empty());
+    assert!(c.keys.bindings.is_empty());
+    // The built-in defaults must always be valid.
+    assert!(c.validate().is_empty());
+}
+
+#[test]
+fn validate_valid_config() {
+    let c = NoraConfig {
+        terminal: TerminalConfig {
+            history: 5000,
+            mouse: true,
+        },
+        font: FontConfig {
+            family: "DejaVu Sans Mono".to_string(),
+            size: 14.0,
+        },
+        theme: ThemeConfig {
+            background: "#101418".to_string(),
+            foreground: "#c5c8c6".to_string(),
+            cursor: "#ffffff".to_string(),
+            colors: vec!["#000000".to_string(), "#ff0000".to_string()],
+        },
+        keys: KeysConfig {
+            bindings: HashMap::new(),
+        },
+    };
+    assert!(c.validate().is_empty());
+}
+
+#[test]
+fn validate_invalid_history() {
+    let mut c = NoraConfig::default();
+    c.terminal.history = 1_000_001;
+    let errors = c.validate();
+    assert!(
+        errors.iter().any(|e| e.starts_with("terminal.history")),
+        "expected a history error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_invalid_font_size() {
+    let mut zero = NoraConfig::default();
+    zero.font.size = 0.0;
+    assert!(
+        zero.validate().iter().any(|e| e.starts_with("font.size")),
+        "expected a font.size error for 0.0"
+    );
+
+    let mut negative = NoraConfig::default();
+    negative.font.size = -1.0;
+    assert!(
+        negative
+            .validate()
+            .iter()
+            .any(|e| e.starts_with("font.size")),
+        "expected a font.size error for -1.0"
+    );
+
+    let mut huge = NoraConfig::default();
+    huge.font.size = 1000.1;
+    assert!(
+        huge.validate().iter().any(|e| e.starts_with("font.size")),
+        "expected a font.size error for 1000.1"
+    );
+}
+
+#[test]
+fn validate_invalid_color() {
+    let mut c = NoraConfig::default();
+    c.theme.background = "not-a-color".to_string();
+    let errors = c.validate();
+    assert!(
+        errors.iter().any(|e| e.starts_with("theme.background")),
+        "expected a theme.background error, got: {errors:?}"
+    );
+
+    let mut d = NoraConfig::default();
+    d.theme.colors.push("zzz".to_string());
+    assert!(
+        d.validate()
+            .iter()
+            .any(|e| e.starts_with("theme.colors[0]")),
+        "expected a theme.colors[0] error"
+    );
+}
+
+#[test]
+fn parse_valid_toml() {
+    let toml_text = r##"
+[terminal]
+history = 2000
+mouse = true
+
+[font]
+family = "DejaVu Sans Mono"
+size = 14.0
+
+[theme]
+background = "#101418"
+foreground = "#c5c8c6"
+cursor = "#ffffff"
+colors = ["#000000", "#ff0000"]
+
+[keys]
+bindings = { "Ctrl+Shift+C" = "copy" }
+"##;
+    let c = parse_config(toml_text).expect("valid TOML should parse");
+    assert_eq!(c.terminal.history, 2000);
+    assert!(c.terminal.mouse);
+    assert_eq!(c.font.family, "DejaVu Sans Mono");
+    assert_eq!(c.font.size, 14.0);
+    assert_eq!(c.theme.background, "#101418");
+    assert_eq!(c.theme.colors.len(), 2);
+    assert_eq!(
+        c.keys.bindings.get("Ctrl+Shift+C"),
+        Some(&"copy".to_string())
+    );
+}
+
+#[test]
+fn parse_invalid_toml() {
+    let toml_text = "[terminal\nhistory = 100";
+    let err = parse_config(toml_text).expect_err("invalid TOML should fail");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected a Parse error, got: {err:?}"
+    );
+}
+
+#[test]
+fn parse_unknown_field() {
+    let toml_text = r#"
+[terminal]
+history = 100
+not_a_real_field = 5
+"#;
+    let err = parse_config(toml_text).expect_err("unknown field should be rejected");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected a Parse error for the unknown field, got: {err:?}"
+    );
+}
+
+#[test]
+fn parse_valid_but_out_of_range() {
+    // Structurally valid TOML that fails *validation*, not parsing.
+    let toml_text = "[terminal]\nhistory = 999999999\n";
+    let err = parse_config(toml_text).expect_err("out-of-range history should fail");
+    match err {
+        ConfigError::Validation { errors, .. } => {
+            assert!(errors.iter().any(|e| e.starts_with("terminal.history")));
+        }
+        other => panic!("expected a Validation error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn load_config_defaults() {
+    // No explicit path, no candidates -> built-in defaults, `path: None`.
+    let loaded = load_config_with_candidates(None, &[]).expect("defaults should load");
+    assert!(loaded.path.is_none());
+    assert_eq!(loaded.config.terminal.history, 1000);
+    assert!(!loaded.config.terminal.mouse);
+    assert_eq!(loaded.config.font.family, "monospace");
+}
+
+#[test]
+fn load_config_explicit_path() {
+    let tmp = TempDir::new();
+    let path = write_config(
+        &tmp.0,
+        "config.toml",
+        "[terminal]\nhistory = 4321\nmouse = true\n",
+    );
+    let loaded = load_config(Some(path.to_str().unwrap())).expect("explicit path should load");
+    assert_eq!(loaded.path.as_deref(), Some(path.as_path()));
+    assert_eq!(loaded.config.terminal.history, 4321);
+    assert!(loaded.config.terminal.mouse);
+}
+
+#[test]
+fn load_config_nonexistent_path() {
+    let missing = std::env::temp_dir()
+        .join(format!("nora-missing-{}", std::process::id()))
+        .join("config.toml");
+    let err = load_config(Some(missing.to_str().unwrap())).expect_err("missing file should error");
+    assert!(
+        matches!(err, ConfigError::Io { .. }),
+        "expected an Io error, got: {err:?}"
+    );
+}
+
+#[test]
+fn xdg_discovery() {
+    let tmp = TempDir::new();
+    let cfg_dir = tmp.0.join("nora");
+    std::fs::create_dir_all(&cfg_dir).expect("create nora dir");
+    let cfg_path = cfg_dir.join("config.toml");
+    std::fs::write(&cfg_path, "[terminal]\nhistory = 4321\n").expect("write xdg config");
+
+    let prev = std::env::var_os("XDG_CONFIG_HOME");
+    // SAFETY: this is the only test in this binary that mutates
+    // XDG_CONFIG_HOME, and no other thread reads or writes the process
+    // environment concurrently.
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", tmp.0.as_os_str());
+    }
+
+    let loaded = load_config(None).expect("should load from XDG_CONFIG_HOME");
+    assert_eq!(loaded.path.as_deref(), Some(cfg_path.as_path()));
+    assert_eq!(loaded.config.terminal.history, 4321);
+
+    match prev {
+        Some(v) => unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", v);
+        },
+        None => unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        },
+    }
+}

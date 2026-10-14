@@ -6,6 +6,7 @@
 //! `tests/engine_adapter.rs`.
 
 pub mod clipboard;
+pub mod config;
 pub mod engine;
 pub mod input;
 pub mod render;

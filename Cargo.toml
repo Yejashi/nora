@@ -15,6 +15,11 @@ cosmic-text = { version = "0.19", features = ["monospace_fallback"] }
 glyphon = "0.12.0"
 libc = "0.2"
 pollster = "0.4"
+# Pinned to the `serde` already in the lock (1.0.229) via `glyphon`/`winit`.
+serde = { version = "1", features = ["derive"] }
+# Validated TOML configuration (N18a). Resolves against the existing
+# `toml_edit`/`serde` family in the lock.
+toml = "0.8"
 wgpu = "30.0.1"
 winit = "0.30.13"
 

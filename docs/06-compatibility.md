@@ -154,3 +154,30 @@ Documented limitations (no width policy invented):
 - **Monochrome only** — no color-emoji format/blending path; emoji render as the fallback face's monochrome glyphs.
 - **No complex grapheme clustering** — each cell is one grapheme; ZWJ sequences and other multi-cell emoji are shaped per cell, so joined sequences may render as separate components.
 - **Left-to-right only** — no RTL shaping; RTL scripts render in logical order without direction-aware shaping.
+
+## Configuration (N18a)
+
+Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless fixtures in `tests/config.rs`. CLI precedence over the loaded config is N18b and is not part of this slice.
+
+**Discovery order** (first existing file wins; otherwise built-in defaults with no source path):
+
+1. An explicit path (loaded directly; a missing file is an error).
+2. `$XDG_CONFIG_HOME/nora/config.toml` (when the variable is set).
+3. `$HOME/.config/nora/config.toml`.
+4. Built-in defaults.
+
+**Available settings** (all sections optional; omitted sections/fields take defaults):
+
+| Setting | Type | Default | Constraint |
+| --- | --- | --- | --- |
+| `terminal.history` | integer | `1000` | `0`..=`1000000` |
+| `terminal.mouse` | boolean | `false` | — |
+| `font.family` | string | `"monospace"` | — |
+| `font.size` | float | `12.0` | `> 0` and `<= 1000` |
+| `theme.background` | string | `"#000000"` | `#RRGGBB` |
+| `theme.foreground` | string | `"#ffffff"` | `#RRGGBB` |
+| `theme.cursor` | string | `"#ffffff"` | `#RRGGBB` |
+| `theme.colors` | array of strings | `[]` | each `#RRGGBB` |
+| `keys.bindings` | table (string → string) | `{}` | — |
+
+**Validation.** Unknown fields are rejected at parse time (`deny_unknown_fields` on every section). Numeric ranges and `#RRGGBB` colors are checked after parsing and reported as `ConfigError::Validation` with one line per problem; I/O and TOML syntax failures are `ConfigError::Io` / `ConfigError::Parse`. Only settings that are actually implemented are accepted — the schema is intentionally minimal and grows with the features that consume it.
