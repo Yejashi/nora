@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nora::config::{
     ConfigChange, ConfigError, ConfigState, FontConfig, KeysConfig, NoraConfig, TerminalConfig,
-    ThemeConfig, classify_change, load_config, load_config_with_candidates, parse_config,
+    ThemeConfig, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, classify_change, load_config,
+    load_config_with_candidates, parse_config,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -409,4 +410,61 @@ fn classify_change_no_change() {
     let new = NoraConfig::default();
     let changes = classify_change(&old, &new);
     assert!(changes.is_empty(), "no changes expected; got: {changes:?}");
+}
+
+// --- N19b zoom logic -------------------------------------------------------
+//
+// The zoom functions are called through their full paths (`nora::config::
+// zoom_*`) so the test names below can match the brief's names without
+// colliding with the imported function names.
+
+/// The initial zoom level is 100%.
+#[test]
+fn zoom_initial() {
+    assert_eq!(ZOOM_DEFAULT, 1.0);
+    assert_eq!(nora::config::zoom_reset(), ZOOM_DEFAULT);
+}
+
+/// Zooming in adds one 10% step.
+#[test]
+fn zoom_in() {
+    assert_eq!(nora::config::zoom_in(1.0), 1.1);
+    assert_eq!(nora::config::zoom_in(1.1), 1.2);
+}
+
+/// Zooming out subtracts one 10% step.
+#[test]
+fn zoom_out() {
+    assert_eq!(nora::config::zoom_out(1.0), 0.9);
+    assert_eq!(nora::config::zoom_out(0.9), 0.8);
+}
+
+/// Reset returns the zoom to 100%.
+#[test]
+fn zoom_reset() {
+    assert_eq!(nora::config::zoom_reset(), 1.0);
+}
+
+/// Zoom in caps at 4.0x.
+#[test]
+fn zoom_max() {
+    assert_eq!(nora::config::zoom_in(4.0), ZOOM_MAX);
+    // Repeated steps from below land exactly on the cap.
+    let mut z = ZOOM_DEFAULT;
+    for _ in 0..100 {
+        z = nora::config::zoom_in(z);
+    }
+    assert_eq!(z, ZOOM_MAX);
+}
+
+/// Zoom out caps at 0.5x.
+#[test]
+fn zoom_min() {
+    assert_eq!(nora::config::zoom_out(0.5), ZOOM_MIN);
+    // Repeated steps from above land exactly on the floor.
+    let mut z = ZOOM_DEFAULT;
+    for _ in 0..100 {
+        z = nora::config::zoom_out(z);
+    }
+    assert_eq!(z, ZOOM_MIN);
 }

@@ -120,6 +120,12 @@ impl Fonts {
     }
 }
 
+/// The shaping font size at a zoom level (N19b): the base [`FONT_SIZE`]
+/// scaled by the zoom factor.
+pub fn zoomed_font_size(zoom: f32) -> f32 {
+    FONT_SIZE * zoom
+}
+
 /// The whole cell grid that fits in a physical window size, from the mono cell
 /// metrics. Pure: no GPU, no display.
 // The N08b2b-2 window loop drives it; b-1 draws an empty grid, so it is
@@ -163,5 +169,12 @@ mod tests {
     fn font_constants_match_the_n02_test() {
         assert_eq!(FONT_SIZE, 20.0);
         assert_eq!(CELL_H, 24.0);
+    }
+
+    #[test]
+    fn zoomed_font_size_scales_the_base_size() {
+        assert_eq!(zoomed_font_size(1.0), FONT_SIZE);
+        assert_eq!(zoomed_font_size(2.0), FONT_SIZE * 2.0);
+        assert_eq!(zoomed_font_size(0.5), FONT_SIZE * 0.5);
     }
 }

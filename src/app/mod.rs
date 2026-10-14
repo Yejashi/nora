@@ -211,7 +211,14 @@ impl ApplicationHandler for App {
             } else {
                 let mut frame = graphics.acquire();
                 println!("smoke: acquire status {:?}", frame.status);
-                if let Err(message) = graphics.draw_frame(&mut frame, &mut fonts, &[], &[], 1.0) {
+                if let Err(message) = graphics.draw_frame(
+                    &mut frame,
+                    &mut fonts,
+                    &[],
+                    &[],
+                    1.0,
+                    nora::config::ZOOM_DEFAULT,
+                ) {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
                 graphics.present(frame);
@@ -365,6 +372,9 @@ struct WinApp {
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
+    /// Current zoom level (N19b): 1.0 = 100%; scales the shaping font
+    /// size passed to `draw_frame`.
+    zoom: f32,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -408,6 +418,7 @@ pub fn run_windowed(
         cursor: (0.0, 0.0),
         pressed_buttons: Vec::new(),
         clipboard: create_clipboard(),
+        zoom: nora::config::ZOOM_DEFAULT,
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -575,6 +586,7 @@ impl WinApp {
                     &draw_cells,
                     &selection_cells,
                     window.scale_factor() as f32,
+                    self.zoom,
                 ) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
@@ -923,6 +935,38 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                     }
                                 }
                             }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // N19b: zoom controls. Local UI actions (not PTY escapes),
+                // so they are checked before `encode` and return early,
+                // mirroring the N15 idiom. Keyed on the physical key +
+                // Ctrl (layout-independent), so the shortcuts work on any
+                // layout.
+                if self.mods.control_key() {
+                    match event.physical_key {
+                        // Ctrl+= / Ctrl++: zoom in one step, capped at
+                        // 4.0x. The main-row `+` is the `Equal` key with
+                        // Shift; the numpad `+` is `NumpadAdd` (winit
+                        // 0.30.13 has no `Plus` code).
+                        PhysicalKey::Code(KeyCode::Equal)
+                        | PhysicalKey::Code(KeyCode::NumpadAdd) => {
+                            self.zoom = nora::config::zoom_in(self.zoom);
+                            eprintln!("zoom: {:.1}x", self.zoom);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Minus) => {
+                            // Ctrl+-: zoom out one step, floored at 0.5x.
+                            self.zoom = nora::config::zoom_out(self.zoom);
+                            eprintln!("zoom: {:.1}x", self.zoom);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Digit0) => {
+                            // Ctrl+0: reset zoom to 100%.
+                            self.zoom = nora::config::zoom_reset();
+                            eprintln!("zoom: reset to {:.1}x", self.zoom);
                             return;
                         }
                         _ => {}

@@ -457,6 +457,38 @@ pub enum ConfigChange {
     NewSession,
 }
 
+/// One zoom step (10%) and the zoom limits (N19b): zoom ranges from
+/// [`ZOOM_MIN`] to [`ZOOM_MAX`], starting at [`ZOOM_DEFAULT`].
+pub const ZOOM_STEP: f32 = 0.1;
+/// Minimum zoom level (50%).
+pub const ZOOM_MIN: f32 = 0.5;
+/// Maximum zoom level (400%).
+pub const ZOOM_MAX: f32 = 4.0;
+/// The initial zoom level (100%).
+pub const ZOOM_DEFAULT: f32 = 1.0;
+
+/// Zoom in by one step, clamped to [`ZOOM_MAX`].
+///
+/// The result is rounded to one decimal place so repeated steps land on
+/// exact tenths instead of drifting in floating point.
+pub fn zoom_in(zoom: f32) -> f32 {
+    let steps = (zoom + ZOOM_STEP) * 10.0;
+    steps.round().min(ZOOM_MAX * 10.0) / 10.0
+}
+
+/// Zoom out by one step, clamped to [`ZOOM_MIN`].
+///
+/// The result is rounded to one decimal place, as in [`zoom_in`].
+pub fn zoom_out(zoom: f32) -> f32 {
+    let steps = (zoom - ZOOM_STEP) * 10.0;
+    steps.round().max(ZOOM_MIN * 10.0) / 10.0
+}
+
+/// Reset the zoom to the default level (100%).
+pub fn zoom_reset() -> f32 {
+    ZOOM_DEFAULT
+}
+
 /// Classify the differences between two configs, one entry per changed field.
 ///
 /// The result follows a fixed field order (terminal, font, theme, keys), so

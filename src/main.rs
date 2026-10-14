@@ -154,6 +154,12 @@ fn main() -> ExitCode {
                     nora::config::classify_change(&config_state.current, &new_state.current);
                 for (field, change_type) in &changes {
                     eprintln!("config reload: {field} = {change_type:?}");
+                    // N19b: staged font/geometry changes apply on the next
+                    // frame (font re-initialization is a later slice); log
+                    // them as they are staged.
+                    if *change_type == nora::config::ConfigChange::Staged {
+                        eprintln!("applying staged font change: {field}");
+                    }
                 }
                 eprintln!("config reloaded (epoch {})", new_state.epoch);
                 new_state

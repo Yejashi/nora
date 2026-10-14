@@ -500,6 +500,9 @@ impl Graphics {
     ///
     /// `scale` is the window's scale factor (native DPI, N13d), applied as
     /// each area's `TextArea.scale`; logical cell metrics are unchanged.
+    /// `zoom` is the window's zoom level (N19b), which scales the shaping
+    /// font size; cell-metric and grid re-derivation are staged for a
+    /// later slice.
     pub fn draw_frame(
         &mut self,
         frame: &mut Frame,
@@ -507,6 +510,7 @@ impl Graphics {
         cells: &[DrawCell],
         selection_cells: &[(u32, u32)],
         scale: f32,
+        zoom: f32,
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
             return Ok(());
@@ -514,7 +518,7 @@ impl Graphics {
 
         let cell_w = fonts.cell_w;
         let cw = cell_w as f32;
-        let metrics = Metrics::new(glyphs::FONT_SIZE, glyphs::CELL_H);
+        let metrics = Metrics::new(glyphs::zoomed_font_size(zoom), glyphs::CELL_H);
 
         // Shape every cell first: glyphon's `TextArea` borrows its `Buffer`,
         // so all buffers must be pushed before any area borrows the vector.

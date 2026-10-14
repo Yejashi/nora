@@ -211,3 +211,19 @@ Headless CLI fixtures in `tests/cli.rs`: `check_config_valid`, `check_config_inv
 **Trigger.** `nora --reload` re-reads the config before launch and logs each classified change plus `config reloaded (epoch N)` on stderr; a failed reload logs the error and `keeping last valid config` and continues with the last valid state. `--reload` is headless-safe (it runs before any display/GPU work). A runtime keybinding is a later slice; the config schema and the headless session pump are unchanged.
 
 Headless fixtures: `tests/config.rs` (`config_state_new`, `config_state_reload_success`, `config_state_reload_failure`, `classify_change_immediate`, `classify_change_staged`, `classify_change_new_session`, `classify_change_no_change`) and `tests/cli.rs` (`reload_flag`).
+
+### Zoom and geometry (N19b)
+
+The window carries a zoom level (1.0 = 100%), stored on the app and scaled into the shaping font size at draw time (`glyphs::zoomed_font_size`); cell metrics and grid re-derivation are staged for a later slice.
+
+| Shortcut | Behavior |
+| --- | --- |
+| `Ctrl+=` / `Ctrl++` | Zoom in one step (10%), capped at 4.0x |
+| `Ctrl+-` | Zoom out one step (10%), floored at 0.5x |
+| `Ctrl+0` | Reset zoom to 1.0x |
+
+- **Range:** 0.5x to 4.0x in 10% steps, starting at 1.0x. Steps are rounded to one decimal place so repeated presses land on exact tenths.
+- **Keying:** the shortcuts key on the physical key plus Ctrl (layout-independent), are checked before PTY encoding, and return early — they never send bytes to the child.
+- **Staged font/geometry changes:** a reload that changes `font.family` or `font.size` is classified `Staged` (N19a) and logged as `applying staged font change: <field>`; the change takes effect on the next frame. Font re-initialization is a later slice, so the staged change is logged, not yet applied to the loaded font.
+
+Headless fixtures: `tests/config.rs` (`zoom_initial`, `zoom_in`, `zoom_out`, `zoom_reset`, `zoom_max`, `zoom_min`) cover the pure zoom arithmetic in `nora::config`.
