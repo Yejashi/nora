@@ -52,6 +52,88 @@ pub struct Engine {
     /// both touch it through `&self` accessors, so it lives behind a
     /// mutex. `None` when nothing is selected.
     selection: Arc<Mutex<Option<Selection>>>,
+    /// Kitty keyboard protocol modes (N21a): the negotiated protocol's
+    /// push/pop mode stack and whether the protocol is currently enabled.
+    kitty_modes: KittyKeyboardModes,
+}
+
+/// Kitty keyboard protocol modes (N21a).
+///
+/// The kitty keyboard protocol is negotiated by the application as a
+/// push/pop mode stack. `enabled` is `false` (legacy mode) until the first
+/// push; the stack holds the pushed flag sets, most recent last.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KittyKeyboardModes {
+    /// Whether the kitty keyboard protocol is enabled.
+    pub enabled: bool,
+    /// The current mode stack (push/pop support), most recent last.
+    pub stack: Vec<KittyKeyboardFlags>,
+}
+
+/// Maximum depth of the kitty keyboard mode stack. Pushes beyond this depth
+/// drop the oldest entry, keeping the stack bounded.
+pub const MAX_KITTY_STACK: usize = 10;
+
+/// Kitty keyboard protocol flags (bit flags).
+///
+/// Each bit selects one negotiated enhancement. The bits are the low nine
+/// bits of the kitty protocol's mode parameter; [`KittyKeyboardFlags::ALL`]
+/// is the mask over every defined flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KittyKeyboardFlags(pub u16);
+
+impl KittyKeyboardFlags {
+    /// None (legacy mode).
+    pub const NONE: Self = Self(0);
+    /// Disambiguate key events.
+    pub const DISAMBIGUATE: Self = Self(1 << 0);
+    /// Report event types (down/up/press).
+    pub const REPORT_EVENTS: Self = Self(1 << 1);
+    /// Report system modifiers.
+    pub const SYSTEM: Self = Self(1 << 2);
+    /// Report alternate characters.
+    pub const ALTERNATE: Self = Self(1 << 3);
+    /// Report cursor position.
+    pub const CURSOR_POS: Self = Self(1 << 4);
+    /// Report unicode name.
+    pub const UNICODE_NAME: Self = Self(1 << 5);
+    /// Report unicode value.
+    pub const UNICODE_VALUE: Self = Self(1 << 6);
+    /// Report text.
+    pub const TEXT: Self = Self(1 << 7);
+    /// Report list of keys.
+    pub const LIST: Self = Self(1 << 8);
+    /// Report all modifiers.
+    pub const ALL: Self = Self((1 << 9) - 1);
+
+    /// Check if a flag is set.
+    pub fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Set a flag.
+    pub fn set(&mut self, flag: Self) {
+        self.0 |= flag.0;
+    }
+
+    /// Clear a flag.
+    pub fn clear(&mut self, flag: Self) {
+        self.0 &= !flag.0;
+    }
+}
+
+impl std::ops::BitOr for KittyKeyboardFlags {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitAnd for KittyKeyboardFlags {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
 }
 
 /// Viewport size for a zero-scrollback [`Term`].
@@ -409,6 +491,7 @@ impl Engine {
             snapshot_epoch: 0,
             recorder,
             selection: Arc::new(Mutex::new(None)),
+            kitty_modes: KittyKeyboardModes::default(),
         }
     }
 
@@ -458,6 +541,52 @@ impl Engine {
     /// Current terminal modes.
     pub fn modes(&self) -> TermMode {
         *self.term.lock().mode()
+    }
+
+    /// Push a new kitty keyboard mode onto the stack (N21a).
+    ///
+    /// Pushing enables the protocol. The stack is bounded to
+    /// [`MAX_KITTY_STACK`] levels; a push beyond that depth drops the
+    /// oldest entry (the most recently pushed entry wins).
+    pub fn push_kitty_mode(&mut self, flags: KittyKeyboardFlags) {
+        if self.kitty_modes.stack.len() >= MAX_KITTY_STACK {
+            self.kitty_modes.stack.remove(0);
+        }
+        self.kitty_modes.stack.push(flags);
+        self.kitty_modes.enabled = true;
+    }
+
+    /// Pop the most recent kitty keyboard mode from the stack (N21a).
+    ///
+    /// Returns the popped flags, or `None` when the stack is empty. When
+    /// the stack becomes empty, the protocol returns to legacy mode
+    /// (`enabled` is cleared).
+    pub fn pop_kitty_mode(&mut self) -> Option<KittyKeyboardFlags> {
+        let flags = self.kitty_modes.stack.pop();
+        if self.kitty_modes.stack.is_empty() {
+            self.kitty_modes.enabled = false;
+        }
+        flags
+    }
+
+    /// Query the current kitty keyboard mode (the top of the stack,
+    /// N21a). Returns [`KittyKeyboardFlags::NONE`] when the protocol is
+    /// disabled or the stack is empty.
+    pub fn kitty_mode(&self) -> KittyKeyboardFlags {
+        if !self.kitty_modes.enabled {
+            KittyKeyboardFlags::NONE
+        } else {
+            self.kitty_modes
+                .stack
+                .last()
+                .copied()
+                .unwrap_or(KittyKeyboardFlags::NONE)
+        }
+    }
+
+    /// Get the current kitty keyboard mode stack (N21a), oldest first.
+    pub fn kitty_mode_stack(&self) -> &[KittyKeyboardFlags] {
+        &self.kitty_modes.stack
     }
 
     /// Raw color-table read under the shared term guard (pinned

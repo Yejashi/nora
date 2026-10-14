@@ -63,6 +63,19 @@ Mode-drive citations: DECCKM (`APP_CURSOR`) is `CSI ? 1 h/l` (pinned alacritty_t
 
 Modern kitty keyboard behavior is negotiated by the application, with a legacy default. Implement only the flags actually supported end to end; verify stack/query/pop handling, modifiers, repeat/release and associated text. The engine exposes flags, but frontend encoding remains separate [S11, S23]. The Alacritty frontend keyboard implementation is a useful Apache-licensed reference [S30, S35]; record the exact revision/notice if adapting code.
 
+### Kitty keyboard protocol (N21a)
+
+The kitty keyboard protocol is negotiated by the application as a **push/pop mode stack** owned by the engine (`nora::engine::KittyKeyboardModes`, `KittyKeyboardFlags`). The default is **legacy mode** (protocol disabled, empty stack) — no kitty protocol until the application pushes a mode.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Mode stack | `Engine::push_kitty_mode` / `pop_kitty_mode` push/pop flag sets; the stack is bounded to 10 levels (a push past the bound drops the oldest entry) | pass — `tests/kitty_keyboard.rs` |
+| Query | `Engine::kitty_mode` returns the top of the stack, or `KittyKeyboardFlags::NONE` when disabled | pass — `tests/kitty_keyboard.rs` |
+| Enable semantics | The first push enables the protocol; popping the last entry returns to legacy mode | pass — `tests/kitty_keyboard.rs` |
+| Flags | `DISAMBIGUATE`, `REPORT_EVENTS`, `SYSTEM`, `ALTERNATE`, `CURSOR_POS`, `UNICODE_NAME`, `UNICODE_VALUE`, `TEXT`, `LIST` (bits 0–8; `ALL` = bits 0–8 set) | pass — `tests/kitty_keyboard.rs` |
+
+Frontend encoding of negotiated key events (modifiers, repeat/release, functional keys, associated text) is N21b and reads the negotiated flags through `Engine::kitty_mode`; the engine exposes the flags and stack, but byte encoding remains separate [S11, S23].
+
 ## Paste
 
 Read clipboard text through the platform adapter. Validate maximum accepted size before any bytes are written. Normalize newlines by a documented policy (CRLF/LF to CR for terminal paste), and distinguish ordinary paste from bracketed paste. Prevent injected bracket terminators according to a tested sanitization policy; never let pasted escape delimiters prematurely terminate the transaction. Explain any removed control characters in the user docs.
