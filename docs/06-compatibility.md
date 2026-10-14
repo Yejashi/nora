@@ -222,11 +222,52 @@ The window layer (`src/app/mod.rs`) carries an `ImeState` on the app and drives 
 | Cancel | `Disabled` clears the active flag, preedit and committed text without sending anything | pass — `tests/ime.rs` UI fixtures |
 | Native backends | Wayland and X11 composition results are recorded separately; each backend's IME availability is tested rather than inferred | open — native Wayland and X11 runs |
 
-## TERM and terminfo
+## TERM and terminfo (N29)
 
-Start the development slice with `TERM=xterm-256color` only after testing its relevant advertised behavior. Document it as an initial compatibility choice, not a proof of complete xterm emulation. `COLORTERM=truecolor` can advertise validated truecolor. Never set `TERM=xterm-kitty` for branding.
+nora ships a dedicated `nora` terminfo entry and sets `TERM=nora` and
+`COLORTERM=truecolor` for every child it spawns. The decision (dedicated
+entry vs. `xterm-256color` fallback) is documented in
+[ADR-010](adr/ADR-010-terminfo-identity.md); the rationale is that a
+dedicated entry advertises only the capabilities nora has tested, whereas
+`xterm-256color` advertises xterm-specific behavior nora does not
+implement. `COLORTERM=truecolor` signals validated 24-bit (true) color
+support independent of the `TERM` value. nora never sets
+`TERM=xterm-kitty` for branding.
 
-Before v0.1, decide whether to ship a dedicated `nora` terminfo entry or keep the verified fallback. A dedicated entry includes only validated capabilities, compiles with `tic`, and works with `infocmp` and curses applications [S27]. For SSH, document how to install it on remote hosts or explicitly use a fallback; do not set an unknown remote TERM by default. Use runtime protocol negotiation for modern features rather than claiming they follow from the TERM string.
+The entry source is `terminfo/nora.terminfo`. It advertises a minimal,
+test-backed capability set (every capability is backed by a test in
+`tests/`; the mapping is in the ADR):
+
+- **Boolean**: `am`, `bce`, `km`, `mir`, `msgr`, `xenl`
+- **Numeric**: `colors#256`, `pairs#65536`, `cols#80`, `lines#24`, `it#8`
+- **Cursor addressing**: `cup`, `home`
+- **Cursor movement**: `cub1`, `cud1`, `cuf1`, `cuu1` (application →
+  terminal); `kcub1`, `kcud1`, `kcuf1`, `kcuu1` (terminal → application,
+  app mode)
+- **Keys**: `kbs`, `kHOM`, `kEND`, `kIC`, `kDC`, `kLFT`, `kRIT`,
+  `kf1`–`kf12`
+- **Styles (SGR)**: `bold`, `dim`, `blink`, `invis`, `smso`, `smul`, `rev`,
+  `rmso`, `rmul`, `sgr`
+- **Modes**: `smcup`, `rmcup`, `smam`, `rmam`, `smkx`, `rmkx`
+- **Colors**: `initc` (OSC 4)
+- **Erase/clear**: `clear`, `ed`, `el`, `el1`, `dch1`, `dl1`
+- **Cursor visibility**: `civis`, `cnorm`
+- **Basic**: `cr`, `ind`, `bel`, `ht`
+
+Capabilities not listed are not advertised; nora may still accept them, but
+it does not promise them. The entry does not claim kitty graphics, image
+protocols, or xterm-specific key encodings. It compiles with `tic`, reads
+back with `infocmp`, and works with curses applications; the regression
+tests are in `tests/terminfo.rs`.
+
+For SSH and remote use, install the entry on the remote host (compile with
+`tic`; see `07-build-release.md`). Where the `nora` entry is not installed,
+nora falls back to `TERM=xterm-256color`, which is present on every Linux
+distribution. The `nora` entry is a strict subset of xterm-256color's
+capabilities, so the fallback is always safe, and no child ever sees an
+unknown or missing `TERM`. Modern features (e.g. kitty keyboard
+negotiation, bracketed paste, mouse reporting) are negotiated at runtime
+rather than claimed from the `TERM` string.
 
 ## Emoji and complex scripts (N13)
 

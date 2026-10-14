@@ -180,12 +180,22 @@ fn main() -> ExitCode {
     }
 
     let explicit = !command.is_empty();
+    // N29: advertise only validated capabilities. Set `TERM` to the
+    // dedicated `nora` terminfo entry when it is resolvable, else fall
+    // back to the ubiquitous `xterm-256color` (the `nora` entry is a
+    // strict subset of xterm-256color, so the fallback is always safe).
+    // `COLORTERM=truecolor` signals validated 24-bit color support.
+    let term = resolve_term();
+    let child_env = vec![
+        ("TERM".to_string(), term),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+    ];
     let spec = if let Some((program, rest)) = command.split_first() {
         LaunchSpec {
             program: program.clone(),
             args: rest.to_vec(),
             cwd: working_directory,
-            env: vec![],
+            env: child_env,
         }
     } else {
         // No `-- COMMAND ...`: the default shell ($SHELL, else /bin/sh).
@@ -194,7 +204,7 @@ fn main() -> ExitCode {
             program: shell,
             args: vec![],
             cwd: working_directory,
-            env: vec![],
+            env: child_env,
         }
     };
     // Bare `nora` and `nora -- COMMAND ARG...` both open the windowed
@@ -358,6 +368,38 @@ fn run_windowed(
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pump.join();
     code
+}
+
+/// N29: resolve the `TERM` value to advertise to children. Returns
+/// `"nora"` when the dedicated `nora` terminfo entry is resolvable in one
+/// of the standard search paths, else falls back to `"xterm-256color"`.
+/// The `nora` entry is a strict subset of xterm-256color, so the fallback
+/// is always safe and no child ever sees an unknown or missing `TERM`.
+fn resolve_term() -> String {
+    // Search order: `$TERMINFO/n/nora`, `~/.terminfo/n/nora`,
+    // `/etc/terminfo/n/nora`, `/usr/local/share/terminfo/n/nora`,
+    // `/usr/share/terminfo/n/nora`.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(terminfo) = env::var_os("TERMINFO") {
+        candidates.push(std::path::Path::new(&terminfo).join("n").join("nora"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        candidates.push(
+            std::path::Path::new(&home)
+                .join(".terminfo")
+                .join("n")
+                .join("nora"),
+        );
+    }
+    candidates.push(std::path::PathBuf::from("/etc/terminfo/n/nora"));
+    candidates.push(std::path::PathBuf::from("/usr/local/share/terminfo/n/nora"));
+    candidates.push(std::path::PathBuf::from("/usr/share/terminfo/n/nora"));
+
+    if candidates.iter().any(|path| path.is_file()) {
+        "nora".to_string()
+    } else {
+        "xterm-256color".to_string()
+    }
 }
 
 #[cfg(test)]

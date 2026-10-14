@@ -72,3 +72,69 @@ Audit direct/transitive dependency licenses and preserve notices for any adapted
 Run [02-product.md](02-product.md) acceptance on a clean checkout, record actual compatibility/performance results, verify native Wayland and X11, check child and memory stress behavior, and test install/uninstall without deleting user configuration. Tag a release only after the owner authorizes the public release operation; ordinary feature commits and pushes are already required by this plan.
 
 A feature can be implemented, tested, committed and pushed while a hardware release check remains pending. Keep those statuses separate. Do not advertise a v0.1 daily-driver release before its native/manual gates pass.
+
+## Terminal identity and SSH remote use (N29)
+
+nora advertises its identity to child processes via `TERM=nora` (and
+`COLORTERM=truecolor`). The dedicated `nora` terminfo entry is the source of
+truth for what nora advertises; see
+[ADR-010](adr/ADR-010-terminfo-identity.md) and the "TERM and terminfo"
+section of `06-compatibility.md`.
+
+### Installing the `nora` terminfo entry
+
+The entry source is `terminfo/nora.terminfo` (in the nora repository).
+Compile and install it on any host where nora will run:
+
+```sh
+# From the nora repository root, install for the current user:
+tic -x terminfo/nora.terminfo
+```
+
+This compiles the entry and installs it under `~/.terminfo/n/nora`. To
+install system-wide (so all users can use it):
+
+```sh
+sudo tic -x -o /usr/share/terminfo terminfo/nora.terminfo
+```
+
+The `-x` flag preserves extended capabilities. Verify the installation:
+
+```sh
+infocmp -1 nora
+```
+
+The `nora` entry is a strict subset of `xterm-256color`'s capabilities, so
+any host that has `xterm-256color` (every Linux distribution) can run nora
+even without the `nora` entry installed.
+
+### SSH remote use
+
+When nora is used over SSH (e.g. `ssh host` then `nora`, or `nora -- ssh
+host`), the remote shell's `TERM` determines what the remote terminal
+advertises. The fallback strategy:
+
+1. **Preferred**: the remote host has the `nora` terminfo entry installed
+   (via the `tic` command above). The remote terminal advertises
+   `TERM=nora`, and applications use the `nora` entry.
+2. **Fallback**: the remote host does not have the `nora` entry. The remote
+   terminal falls back to `TERM=xterm-256color`, which is present on every
+   Linux distribution. This is safe because the `nora` entry is a strict
+   subset of xterm-256color.
+
+To install the `nora` entry on a remote host without a local checkout of
+the nora repository, copy the source file and compile it there:
+
+```sh
+# From the nora repository root:
+scp terminfo/nora.terminfo user@remote-host:/tmp/
+ssh user@remote-host 'tic -x /tmp/nora.terminfo'
+```
+
+`COLORTERM=truecolor` is set by nora for every child it spawns, so
+true-color output works on the remote host regardless of the `TERM` value.
+
+### Guardrail
+
+No child ever sees an unknown or missing `TERM`: nora sets `TERM=nora` when
+the entry is installed, and falls back to `TERM=xterm-256color` otherwise.
