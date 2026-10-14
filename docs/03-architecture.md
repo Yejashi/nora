@@ -59,6 +59,16 @@ Proposed operations are semantic contracts, not assumed upstream method signatur
 
 Snapshots carry cell text/combining marks, style, resolved or symbolic color, width flags, hyperlink identity, viewport/geometry epoch, cursor and overlay information. Engine references and borrowed renderable iterators cannot escape the lock scope. Take O(visible cells) snapshots first; optimize measured costs by reusing row buffers and copying changed rows. Never clone the entire scrollback per frame.
 
+## Workspace (N23a)
+
+`src/workspace.rs` owns the tab and pane tree and the active-tab/active-pane focus. It is a pure, headless data structure: no I/O, PTY or window dependency, so it is testable without a display. `TabId` and `PaneId` are small owned integer handles (`u32`), minted monotonically by the workspace and never reused within a process.
+
+- **The workspace owns all tabs and panes.** `Workspace` holds the ordered tab list, the per-tab pane lists, and the active tab and per-tab active pane. Adding a tab creates it with one pane and makes it active only when no tab is active yet; the first tab is the initial focus.
+- **Each tab has independent output/history/cwd/session lifecycle.** A tab is a container for one or more panes; each pane is the routing target for one independent session owned by the `session` module (its own `Engine`, scrollback, working directory and PTY lifecycle). The workspace only *routes* — it holds no engine, PTY or session state, so a tab's data cannot leak into another tab's.
+- **Active input never reaches another tab.** Input, focus, clipboard and search actions are routed through the workspace's active tab/pane. Because each pane refers to exactly one session and the workspace exposes only the active pane, a keystroke delivered to the active pane cannot be observed by a background tab.
+- **Closing a tab reaps its sessions.** `close_tab` removes the tab and its pane list. When the closed tab was active, focus falls back to the last remaining tab (or none when the workspace becomes empty). The session module reaps the closed tab's sessions (bounded drain, reap-once, idempotent close) using the same lifecycle as a single session.
+- **Stale events are ignored.** Events carry a session generation (the `SessionId` minted at spawn). Queued work — a snapshot, a reply, a resize — from an exited or replaced session is tagged with that generation and discarded if it no longer matches the pane it targets, so a background flood cannot build a snapshot queue for a tab that is no longer active.
+
 ## Damage and snapshot retention
 
 Use engine damage for content plus nora-owned invalidation for cursor, selection, search, focus, DPI, palette, atlas rebuild and viewport changes. Upstream damage excludes some UI-controlled elements [S07].

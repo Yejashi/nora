@@ -13,3 +13,4 @@ pub mod input;
 pub mod render;
 pub mod search;
 pub mod session;
+pub mod workspace;
