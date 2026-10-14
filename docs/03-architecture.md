@@ -160,3 +160,11 @@ Session lifecycle: `Starting → Running → Exiting → Exited → Closed`; fai
 ## Configuration and logging
 
 Parse TOML into a validated immutable configuration. Reload builds a change plan: colors/keys immediate; font/geometry staged; launch settings for new sessions only. A malformed reload keeps the old config. Store only local diagnostic metadata; raw key/output logs require deliberate development opt-in and must not be committed.
+
+## Graphics filter (N32a)
+
+A bounded graphics (kitty-protocol) filter, `GraphicsFilter` in `src/graphics_filter.rs`, extracts kitty-graphics APCs (`ESC _ ... ST`) in parallel with the vte parser. It is a byte-level state machine (`Pass` → `SawEsc` → `Apc` → `ApcEsc`) that sees the same bytes as the parser, accumulates APC payloads, parses them into `GraphicsEvent`s (command char + params + base64-decoded data), and forwards ALL bytes to the parser (no transformation). The vte parser drops APC bytes correctly, so forwarding all bytes keeps the parser in sync and terminal byte semantics are preserved.
+
+The filter is plugged into `Engine::feed` (headless path): it runs before `processor.advance`, pushing extracted events into a byte-bounded `GraphicsQueue` (1 MiB cap, matching the recorder cap; evicts the oldest event over cap). The render tick drains the queue via `Engine::drain_graphics` (N33). The PTY path (N32b) will use the same filter via a `Filter` trait hook in the pinned `EventLoop::pty_read`, with a shared `Arc<Mutex<GraphicsQueue>>` handle polled by the render tick.
+
+The filter is bounded: the internal accumulation buffer grows only while an APC is in progress (terminated by ST/CAN/SUB), and the queue is byte-bounded. No unbounded growth.

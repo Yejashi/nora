@@ -9,6 +9,7 @@ pub mod clipboard;
 pub mod config;
 pub mod dev;
 pub mod engine;
+pub mod graphics_filter;
 pub mod ime;
 pub mod input;
 pub mod layout;

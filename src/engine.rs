@@ -55,6 +55,11 @@ pub struct Engine {
     /// Kitty keyboard protocol modes (N21a): the negotiated protocol's
     /// push/pop mode stack and whether the protocol is currently enabled.
     kitty_modes: KittyKeyboardModes,
+    /// Bounded graphics filter (N32a): extracts kitty-graphics APCs in
+    /// parallel with the vte parser.
+    graphics_filter: crate::graphics_filter::GraphicsFilter,
+    /// Byte-bounded queue of graphics events, drained by the render tick.
+    graphics_queue: crate::graphics_filter::GraphicsQueue,
 }
 
 /// Kitty keyboard protocol modes (N21a).
@@ -492,6 +497,8 @@ impl Engine {
             recorder,
             selection: Arc::new(Mutex::new(None)),
             kitty_modes: KittyKeyboardModes::default(),
+            graphics_filter: crate::graphics_filter::GraphicsFilter::new(),
+            graphics_queue: crate::graphics_filter::GraphicsQueue::new(),
         }
     }
 
@@ -533,9 +540,24 @@ impl Engine {
     }
 
     /// Feed raw PTY bytes into the engine, preserving parser state.
+    ///
+    /// The graphics filter (N32a) runs before the vte parser: it extracts
+    /// kitty-graphics APCs into the byte-bounded [`GraphicsQueue`] and
+    /// forwards all bytes to the parser (no transformation), so terminal
+    /// byte semantics are preserved.
     pub fn feed(&mut self, bytes: &[u8]) {
+        let (forward, events) = self.graphics_filter.process(bytes);
+        for event in events {
+            self.graphics_queue.push(event);
+        }
         let mut term = self.term.lock();
-        self.processor.advance(&mut *term, bytes);
+        self.processor.advance(&mut *term, forward);
+    }
+
+    /// Drain the graphics queue (N32a), returning all pending graphics
+    /// events in order. Called by the render tick (N33).
+    pub fn drain_graphics(&mut self) -> Vec<crate::graphics_filter::GraphicsEvent> {
+        self.graphics_queue.drain()
     }
 
     /// Current terminal modes.
