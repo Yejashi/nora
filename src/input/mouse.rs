@@ -6,8 +6,17 @@
 //! into [`MouseEvent`], derives [`MouseMode`] from the engine's `TermMode`
 //! via [`MouseMode::from_term_mode`] and calls [`encode_mouse_event`] with
 //! the current grid size.
+//!
+//! N16b adds the pure window-side decisions the wiring makes per event:
+//! coordinate conversion ([`physical_to_cell`], [`logical_to_cell`]),
+//! button press tracking ([`track_button`]), the modifier mapping
+//! ([`mouse_modifiers`]), the report-vs-local routing decision
+//! ([`should_report`]) and the wheel direction mapping
+//! ([`wheel_directions`]).
 
 use alacritty_terminal::term::TermMode;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::keyboard::ModifiersState;
 
 /// The terminal's effective mouse reporting mode (N16a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,4 +199,116 @@ fn button_code(event: &MouseEvent) -> u16 {
         code += 64;
     }
     code
+}
+
+// ================================================================= N16b ===
+//
+// Pure window-side decisions the N16b wiring makes per event. Each is
+// headless-testable: plain fields, no winit `Window`, no PTY, no clocks.
+
+/// The button number a winit [`MouseButton`] maps to for the protocol:
+/// 0 = left, 1 = middle, 2 = right, then the xterm extra-button codes
+/// 4 = back, 5 = forward, and `Other(n)` carries its own number.
+pub fn button_number(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::Back => 4,
+        MouseButton::Forward => 5,
+        MouseButton::Other(n) => n as u8,
+    }
+}
+
+/// Map winit's modifier state to the N16a modifier fields (N16b).
+pub fn mouse_modifiers(mods: &ModifiersState) -> MouseModifiers {
+    MouseModifiers {
+        shift: mods.shift_key(),
+        ctrl: mods.control_key(),
+        alt: mods.alt_key(),
+    }
+}
+
+/// Whether a mouse event should be reported to the terminal at all (N16b):
+/// `false` when Shift is held (the event belongs to local selection) or
+/// when the terminal reports no mouse.
+pub fn should_report(mode: MouseMode, shift: bool) -> bool {
+    !shift && mode != MouseMode::None
+}
+
+/// Map a logical-pixel position to the grid `(col, row)` (N16b): the pinned
+/// mono cell metrics are logical pixels (N11a), so the position is divided
+/// by the cell size and truncated. `None` when a cell metric is not
+/// positive. Negative positions saturate to cell 0.
+pub fn logical_to_cell(x: f64, y: f64, cell_w: u32, cell_h: u32) -> Option<(u16, u16)> {
+    let cell_w = cell_w as f64;
+    let cell_h = cell_h as f64;
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    Some(((x / cell_w) as u16, (y / cell_h) as u16))
+}
+
+/// Map a physical-pixel position (winit's `CursorMoved`/`MouseWheel`
+/// coordinate space) to the grid `(col, row)` (N16b): divide by the window
+/// scale factor first, then by the logical cell metrics. `None` when the
+/// scale or a cell metric is not positive.
+pub fn physical_to_cell(
+    x: f64,
+    y: f64,
+    scale: f64,
+    cell_w: u32,
+    cell_h: u32,
+) -> Option<(u16, u16)> {
+    if scale <= 0.0 {
+        return None;
+    }
+    logical_to_cell(x / scale, y / scale, cell_w, cell_h)
+}
+
+/// Track a mouse button press/release in `pressed` (N16b): a press records
+/// the button (first press first), a release removes it. Returns the event
+/// kind to encode for a real state transition, or `None` for a duplicate
+/// press/release (no state change).
+pub fn track_button(pressed: &mut Vec<u8>, button: u8, state: ElementState) -> Option<MouseKind> {
+    match state {
+        ElementState::Pressed => {
+            if pressed.contains(&button) {
+                return None;
+            }
+            pressed.push(button);
+            Some(MouseKind::Press)
+        }
+        ElementState::Released => {
+            if !pressed.contains(&button) {
+                return None;
+            }
+            pressed.retain(|b| *b != button);
+            Some(MouseKind::Release)
+        }
+    }
+}
+
+/// The wheel direction(s) a scroll delta produces (N16b): positive
+/// `y` = content moves down = scroll up; positive `x` = content moves
+/// right = scroll right (winit's sign convention). Vertical is reported
+/// before horizontal, so a diagonal delta yields `[vertical, horizontal]`.
+/// A zero delta yields no direction.
+pub fn wheel_directions(delta: MouseScrollDelta) -> Vec<MouseKind> {
+    let (dx, dy) = match delta {
+        MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+        MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+    };
+    let mut kinds: Vec<MouseKind> = Vec::with_capacity(2);
+    if dy > 0.0 {
+        kinds.push(MouseKind::WheelUp);
+    } else if dy < 0.0 {
+        kinds.push(MouseKind::WheelDown);
+    }
+    if dx > 0.0 {
+        kinds.push(MouseKind::WheelRight);
+    } else if dx < 0.0 {
+        kinds.push(MouseKind::WheelLeft);
+    }
+    kinds
 }

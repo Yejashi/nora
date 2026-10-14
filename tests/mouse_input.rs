@@ -22,7 +22,14 @@
 
 use alacritty_terminal::term::TermMode;
 use nora::input::focus::encode_focus_event;
-use nora::input::mouse::{MouseEvent, MouseKind, MouseMode, MouseModifiers, encode_mouse_event};
+use nora::input::mouse::{
+    MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number, encode_mouse_event,
+    logical_to_cell, mouse_modifiers, physical_to_cell, should_report, track_button,
+    wheel_directions,
+};
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::keyboard::ModifiersState;
 
 /// The grid every coordinate test is encoded against: 80x24.
 const COLS: u16 = 80;
@@ -471,4 +478,224 @@ fn focus_reports_when_enabled() {
 fn focus_reports_nothing_when_disabled() {
     assert_eq!(encode_focus_event(false, true), None);
     assert_eq!(encode_focus_event(false, false), None);
+}
+
+// ========================================================== N16b wiring ===
+//
+// Headless rows for the pure window-side decisions the N16b wiring in
+// `src/app/mod.rs` makes per event: coordinate conversion, button
+// tracking, modifier mapping, the report-vs-local routing decision and
+// the wheel direction mapping.
+
+/// The pinned mono cell metrics in logical pixels (N13).
+const CELL_W: u32 = 10;
+const CELL_H: u32 = 20;
+
+// --------------------------------------------------------- coordinates ---
+
+#[test]
+fn logical_to_cell_truncates_to_the_grid() {
+    assert_eq!(logical_to_cell(0.0, 0.0, CELL_W, CELL_H), Some((0, 0)));
+    assert_eq!(logical_to_cell(9.9, 19.9, CELL_W, CELL_H), Some((0, 0)));
+    assert_eq!(logical_to_cell(10.0, 20.0, CELL_W, CELL_H), Some((1, 1)));
+    assert_eq!(logical_to_cell(123.0, 61.0, CELL_W, CELL_H), Some((12, 3)));
+}
+
+#[test]
+fn logical_to_cell_rejects_degenerate_metrics() {
+    assert_eq!(logical_to_cell(5.0, 5.0, 0, CELL_H), None);
+    assert_eq!(logical_to_cell(5.0, 5.0, CELL_W, 0), None);
+}
+
+#[test]
+fn logical_to_cell_saturates_negative_positions() {
+    // A cursor above/left of the origin maps to cell (0, 0).
+    assert_eq!(logical_to_cell(-1.0, -1.0, CELL_W, CELL_H), Some((0, 0)));
+}
+
+#[test]
+fn physical_to_cell_divides_by_the_scale_factor() {
+    // Scale 2.0: physical (25, 45) = logical (12.5, 22.5) = cell (1, 1).
+    assert_eq!(
+        physical_to_cell(25.0, 45.0, 2.0, CELL_W, CELL_H),
+        Some((1, 1))
+    );
+    // Scale 1.0: identical to the logical mapping.
+    assert_eq!(
+        physical_to_cell(123.0, 61.0, 1.0, CELL_W, CELL_H),
+        Some((12, 3))
+    );
+    // Scale 0.5: physical (10, 10) = logical (20, 20) = cell (2, 1).
+    assert_eq!(
+        physical_to_cell(10.0, 10.0, 0.5, CELL_W, CELL_H),
+        Some((2, 1))
+    );
+}
+
+#[test]
+fn physical_to_cell_rejects_non_positive_scale() {
+    assert_eq!(physical_to_cell(5.0, 5.0, 0.0, CELL_W, CELL_H), None);
+    assert_eq!(physical_to_cell(5.0, 5.0, -1.0, CELL_W, CELL_H), None);
+}
+
+// ------------------------------------------------------ button tracking ---
+
+#[test]
+fn track_button_press_release_transitions() {
+    let mut pressed = Vec::new();
+    assert_eq!(
+        track_button(&mut pressed, 0, ElementState::Pressed),
+        Some(MouseKind::Press)
+    );
+    assert_eq!(pressed, vec![0]);
+    // A duplicate press is not a transition.
+    assert_eq!(track_button(&mut pressed, 0, ElementState::Pressed), None);
+    assert_eq!(pressed, vec![0]);
+    // A release removes the button.
+    assert_eq!(
+        track_button(&mut pressed, 0, ElementState::Released),
+        Some(MouseKind::Release)
+    );
+    assert_eq!(pressed, Vec::<u8>::new());
+    // A duplicate release is not a transition.
+    assert_eq!(track_button(&mut pressed, 0, ElementState::Released), None);
+}
+
+#[test]
+fn track_button_keeps_each_button_in_press_order() {
+    let mut pressed = Vec::new();
+    track_button(&mut pressed, 2, ElementState::Pressed);
+    track_button(&mut pressed, 0, ElementState::Pressed);
+    track_button(&mut pressed, 1, ElementState::Pressed);
+    assert_eq!(pressed, vec![2, 0, 1]);
+    // The first held button is the one motion events report.
+    assert_eq!(pressed.first().copied(), Some(2));
+    track_button(&mut pressed, 0, ElementState::Released);
+    assert_eq!(pressed, vec![2, 1]);
+}
+
+#[test]
+fn button_number_maps_winit_buttons() {
+    assert_eq!(button_number(MouseButton::Left), 0);
+    assert_eq!(button_number(MouseButton::Middle), 1);
+    assert_eq!(button_number(MouseButton::Right), 2);
+    assert_eq!(button_number(MouseButton::Back), 4);
+    assert_eq!(button_number(MouseButton::Forward), 5);
+    assert_eq!(button_number(MouseButton::Other(7)), 7);
+}
+
+// ------------------------------------------------------- routing decision ---
+
+#[test]
+fn should_report_gates_on_mode_and_shift() {
+    // No mouse reporting: nothing goes to the terminal.
+    assert!(!should_report(MouseMode::None, false));
+    assert!(!should_report(MouseMode::None, true));
+    // Shift held: the event is for local selection.
+    assert!(!should_report(MouseMode::X10, true));
+    assert!(!should_report(MouseMode::AllMotion, true));
+    // Otherwise: report.
+    assert!(should_report(MouseMode::X10, false));
+    assert!(should_report(MouseMode::Normal, false));
+    assert!(should_report(MouseMode::CellMotion, false));
+    assert!(should_report(MouseMode::AllMotion, false));
+}
+
+#[test]
+fn mouse_modifiers_map_winit_state() {
+    assert_eq!(
+        mouse_modifiers(&ModifiersState::empty()),
+        MouseModifiers::default()
+    );
+    assert_eq!(
+        mouse_modifiers(&ModifiersState::SHIFT),
+        MouseModifiers {
+            shift: true,
+            ctrl: false,
+            alt: false
+        }
+    );
+    assert_eq!(
+        mouse_modifiers(&ModifiersState::CONTROL),
+        MouseModifiers {
+            shift: false,
+            ctrl: true,
+            alt: false
+        }
+    );
+    assert_eq!(
+        mouse_modifiers(&ModifiersState::ALT),
+        MouseModifiers {
+            shift: false,
+            ctrl: false,
+            alt: true
+        }
+    );
+    assert_eq!(
+        mouse_modifiers(&(ModifiersState::SHIFT | ModifiersState::CONTROL | ModifiersState::ALT)),
+        MouseModifiers {
+            shift: true,
+            ctrl: true,
+            alt: true
+        }
+    );
+}
+
+// ----------------------------------------------------------------- wheel ---
+
+#[test]
+fn wheel_directions_map_lines() {
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(0.0, 3.0)),
+        vec![MouseKind::WheelUp]
+    );
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(0.0, -1.0)),
+        vec![MouseKind::WheelDown]
+    );
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(2.0, 0.0)),
+        vec![MouseKind::WheelRight]
+    );
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(-2.0, 0.0)),
+        vec![MouseKind::WheelLeft]
+    );
+    // A diagonal delta reports both, vertical first.
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(1.0, 1.0)),
+        vec![MouseKind::WheelUp, MouseKind::WheelRight]
+    );
+}
+
+#[test]
+fn wheel_directions_map_pixels() {
+    let px = |x: f64, y: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(x, y));
+    assert_eq!(wheel_directions(px(0.0, 120.0)), vec![MouseKind::WheelUp]);
+    assert_eq!(
+        wheel_directions(px(0.0, -120.0)),
+        vec![MouseKind::WheelDown]
+    );
+    assert_eq!(
+        wheel_directions(px(120.0, 0.0)),
+        vec![MouseKind::WheelRight]
+    );
+    assert_eq!(
+        wheel_directions(px(-120.0, 0.0)),
+        vec![MouseKind::WheelLeft]
+    );
+}
+
+#[test]
+fn wheel_directions_zero_is_nothing() {
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::LineDelta(0.0, 0.0)),
+        Vec::<MouseKind>::new()
+    );
+    assert_eq!(
+        wheel_directions(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, 0.0
+        ))),
+        Vec::<MouseKind>::new()
+    );
 }

@@ -85,9 +85,13 @@ Pure encoding in `src/input/mouse.rs` (`encode_mouse_event`), headless fixtures 
 | Modifiers | shift +4, ctrl +8, alt +64 on the button code | all modes | pass — table rows |
 | Coordinates | `col+1`/`row+1` (1-based); on-grid-edge clamps to the last cell; beyond the grid edge or coordinate >= 256 returns no report | all modes | pass — table rows |
 | Mode derivation | engine `TermMode`: `MOUSE_DRAG` -> AllMotion, `MOUSE_MOTION` -> Normal, `MOUSE_REPORT_CLICK` -> X10, none -> None (most specific flag wins) | — | pass — table rows |
-| SGR format (1006) / UTF-8 (1005) | same bytes as the rows above (N16a format is SGR-style for every mode); flag wiring is N16b | — | **deferred** — N16b |
+| SGR format (1006) / UTF-8 (1005) | same bytes as the rows above (N16a format is SGR-style for every mode); the N16b wiring confirmed no byte change | — | pass — wiring in `src/app/mod.rs` |
 | Focus reporting | `CSI I` focus in / `CSI O` focus out; no report when `FOCUS_IN_OUT` is off | — | pass — table rows |
-| Window wiring (winit events, Shift selection override, wheel routing) | — | — | **deferred** — N16b |
+| Window wiring (winit events, Shift selection override, wheel routing) | `CursorMoved`/`MouseInput`/`MouseWheel`/`Focused` → `encode_mouse_event`/`encode_focus_event` against the engine's live `TermMode` and the current window grid, bytes via `PumpMsg::Input`; Shift held = local selection only; wheel to the terminal when a reporting mode is active, else local scrollback | all modes | pass — wiring in `src/app/mod.rs`, headless rows in `tests/mouse_input.rs` (N16b) |
+
+### Window wiring (N16b)
+
+`src/app/mod.rs` connects the winit events to the N16a encoders: `CursorMoved` reports motion (the engine's mode decides whether anything is encoded), `MouseInput` reports presses/releases at the last tracked cursor position (winit carries no position on the event) and tracks the pressed buttons in press order, `MouseWheel` reports one event per nonzero delta axis at the last tracked cursor position, and `Focused` reports `CSI I`/`CSI O` when `FOCUS_IN_OUT` is set. All coordinates convert from physical pixels to grid cells through the window scale factor and the pinned mono cell metrics; positions beyond the grid edge or ≥ 256 encode to no report (N16a). While Shift is held, no mouse event is reported — the event is left to local selection — and the wheel scrolls the local scrollback instead of the terminal only when no reporting mode is active. The pure decisions (coordinate conversion, button tracking, modifier mapping, the report-vs-local gate, wheel direction) are headless-tested in `tests/mouse_input.rs`; the bytes themselves are the N16a fixtures.
 
 Selection uses engine-supported coordinates and wrapped-line information. Copy joins soft wraps without injecting newlines, preserves real newlines, and handles wide spacers/combining marks. During history trimming or reflow, use the engine's selection remapping or invalidate visibly; do not retain stale raw row indices.
 

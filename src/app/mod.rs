@@ -30,6 +30,11 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
 use nora::engine::Snapshot;
+use nora::input::focus::encode_focus_event;
+use nora::input::mouse::{
+    MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event, logical_to_cell,
+    mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions,
+};
 use nora::input::{BindingTable, InputAction, encode};
 use nora::render::policy::{clamp_grid, snapshot_is_stale};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
@@ -353,6 +358,10 @@ struct WinApp {
     /// `CursorMoved` in physical pixels and `MouseInput` carries no
     /// position, so the drag tracks the last moved cursor.
     cursor: (f64, f64),
+    /// Mouse buttons currently pressed, in press order (N16b): motion
+    /// events report the first held button; each release removes its
+    /// button.
+    pressed_buttons: Vec<u8>,
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
@@ -389,6 +398,7 @@ pub fn run_windowed(
         last_grid: (0, 0),
         selection: None,
         cursor: (0.0, 0.0),
+        pressed_buttons: Vec::new(),
         clipboard: create_clipboard(),
     };
     match event_loop.run_app(&mut app) {
@@ -437,6 +447,24 @@ impl WinApp {
             return None;
         }
         Some((row, col))
+    }
+
+    /// Encode one mouse event against the engine's live mouse mode and
+    /// the current window grid, and send the bytes to the PTY (N16b).
+    /// No-op when Shift is held (the event belongs to local selection),
+    /// the terminal reports no mouse, or the fonts are not loaded yet.
+    fn send_mouse_event(&self, event: &MouseEvent, window: &Window) {
+        let mode = MouseMode::from_term_mode(self.modes);
+        if !should_report(mode, self.mods.shift_key()) {
+            return;
+        }
+        let Some(fonts) = self.fonts.as_ref() else {
+            return;
+        };
+        let (cols, rows) = window_grid(window, fonts);
+        if let Some(seq) = encode_mouse_event(mode, event, cols, rows) {
+            let _ = self.pump_commands.send(PumpMsg::Input(seq.into_bytes()));
+        }
     }
 
     /// Render the pending snapshot through one acquire → fold → draw →
@@ -908,10 +936,41 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::MouseWheel { delta, .. } => {
+                let kinds = wheel_directions(delta);
+                if kinds.is_empty() {
+                    return;
+                }
+                // N16b: when the terminal reports mouse (and Shift is
+                // not held), the application owns the scroll: report
+                // the wheel event(s) at the last tracked cursor
+                // position. Otherwise the wheel scrolls the local
+                // scrollback (N14a).
+                if should_report(MouseMode::from_term_mode(self.modes), self.mods.shift_key()) {
+                    let (x, y) = self.cursor;
+                    if let Some(fonts) = self.fonts.as_ref()
+                        && let Some((col, row)) =
+                            logical_to_cell(x, y, fonts.cell_w, fonts.cell_h())
+                    {
+                        for kind in kinds {
+                            self.send_mouse_event(
+                                &MouseEvent {
+                                    kind,
+                                    button: None,
+                                    col,
+                                    row,
+                                    modifiers: mouse_modifiers(&self.mods),
+                                },
+                                window,
+                            );
+                        }
+                    }
+                    return;
+                }
                 // N14a: the wheel scrolls the scrollback. winit reports
-                // positive y as "content moves down" (scroll up) for both
-                // delta kinds, so positive lines = into history; the pump
-                // applies the delta to the engine on its next tick.
+                // positive y as "content moves down" (scroll up) for
+                // both delta kinds, so positive lines = into history;
+                // the pump applies the delta to the engine on its next
+                // tick.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * 3,
                     MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
@@ -937,32 +996,87 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         .pump_commands
                         .send(PumpMsg::Select(start_row, start_col, end_row, end_col));
                 }
+                // N16b: report the motion to the terminal (gated by the
+                // engine's mouse mode inside `send_mouse_event`; `X10`
+                // and `Normal` encode to nothing without a held
+                // button).
+                if let Some(fonts) = self.fonts.as_ref()
+                    && let Some((col, row)) = physical_to_cell(
+                        position.x,
+                        position.y,
+                        scale,
+                        fonts.cell_w,
+                        fonts.cell_h(),
+                    )
+                {
+                    self.send_mouse_event(
+                        &MouseEvent {
+                            kind: MouseKind::Motion,
+                            button: self.pressed_buttons.first().copied(),
+                            col,
+                            row,
+                            modifiers: mouse_modifiers(&self.mods),
+                        },
+                        window,
+                    );
+                }
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 // N14b: primary-button drag selects. `MouseInput` carries
                 // no position, so use the last tracked cursor.
-                if button != MouseButton::Left {
-                    return;
-                }
-                let (x, y) = self.cursor;
-                match state {
-                    ElementState::Pressed => {
-                        if let Some(cell) = self.grid_cell_at(window, x, y) {
-                            self.selection = Some(cell);
-                            let _ = self
-                                .pump_commands
-                                .send(PumpMsg::Select(cell.0, cell.1, cell.0, cell.1));
+                if button == MouseButton::Left {
+                    let (x, y) = self.cursor;
+                    match state {
+                        ElementState::Pressed => {
+                            if let Some(cell) = self.grid_cell_at(window, x, y) {
+                                self.selection = Some(cell);
+                                let _ = self
+                                    .pump_commands
+                                    .send(PumpMsg::Select(cell.0, cell.1, cell.0, cell.1));
+                            }
+                        }
+                        ElementState::Released => {
+                            // Finalize: the engine keeps the last
+                            // selection; drop the drag state.
+                            self.selection = None;
                         }
                     }
-                    ElementState::Released => {
-                        // Finalize: the engine keeps the last selection;
-                        // drop the drag state.
-                        self.selection = None;
+                }
+                // N16b: report the press/release to the terminal at the
+                // last tracked cursor position (logical pixels).
+                let button_num = button_number(button);
+                if let Some(kind) = track_button(&mut self.pressed_buttons, button_num, state) {
+                    let (x, y) = self.cursor;
+                    if let Some(fonts) = self.fonts.as_ref()
+                        && let Some((col, row)) =
+                            logical_to_cell(x, y, fonts.cell_w, fonts.cell_h())
+                    {
+                        self.send_mouse_event(
+                            &MouseEvent {
+                                kind,
+                                button: Some(button_num),
+                                col,
+                                row,
+                                modifiers: mouse_modifiers(&self.mods),
+                            },
+                            window,
+                        );
                     }
                 }
             }
-            WindowEvent::Ime(_) => {}     // N09b: no IME in v0.1.
-            WindowEvent::Focused(_) => {} // N09b: synthetic filtering covers duplicates.
+            WindowEvent::Ime(_) => {} // N09b: no IME in v0.1.
+            WindowEvent::Focused(focused) => {
+                // N16b: report the focus change when the engine has
+                // focus reporting enabled (`FOCUS_IN_OUT`);
+                // `encode_focus_event` returns `None` otherwise. The
+                // startup `Focused(true)` arrives before the first
+                // `AppEvent::Modes` tick, so it reports nothing.
+                if let Some(seq) =
+                    encode_focus_event(self.modes.contains(TermMode::FOCUS_IN_OUT), focused)
+                {
+                    let _ = self.pump_commands.send(PumpMsg::Input(seq.into_bytes()));
+                }
+            }
             _ => {}
         }
     }
