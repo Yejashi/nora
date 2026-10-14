@@ -6,6 +6,19 @@ rust-version = "1.95"
 description = "A fast, efficient, maintainable Linux desktop terminal"
 license = "MIT"
 
+# Explicit windowing backend configurations (N30). winit's default
+# feature set enables both X11 and Wayland; these features let CI and
+# users build each documented backend in isolation:
+#   default (both backends):  cargo build
+#   X11 only:                 cargo build --no-default-features --features x11
+#   Wayland only:             cargo build --no-default-features --features wayland
+[features]
+default = ["x11", "wayland"]
+x11 = ["winit/x11"]
+# Mirrors winit's default Wayland stack (client + dlopen backend +
+# client-side decorations).
+wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+
 [dependencies]
 alacritty_terminal = "0.26.0"
 arboard = "3.6"

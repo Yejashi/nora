@@ -1,22 +1,188 @@
+# nora CI (N30): clean-checkout build, headless checks, explicit backend
+# configurations and display smoke jobs.
+#
+# Jobs:
+#   checks         cargo fmt --check + clippy -D warnings
+#   build          release build on a clean checkout + binary runs
+#   test           full test suite, headless, with a software GPU
+#   backends       explicit X11-only / Wayland-only build configurations
+#   x11-smoke      windowed smoke under a virtual X11 display (Xvfb)
+#   wayland-smoke  windowed smoke under a nested Wayland compositor
+#
+# A software GPU (lavapipe) validates lifecycle and rendering paths; it
+# is not hardware performance evidence.
+
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # rust-toolchain.toml pins the project toolchain; CI installs exactly
+  # that channel so results match the documented build inputs.
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
-  check:
+  checks:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal -t x86_64-unknown-linux-gnu
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Build
-        run: cargo build
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: release build (clean checkout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: Verify the binary runs
+        run: |
+          ./target/release/nora --version
+          ./target/release/nora --help
+      - name: Headless config check (no display or GPU needed)
+        run: ./target/release/nora --check-config
+
+  test:
+    name: tests (headless + software GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # Software Vulkan (lavapipe) so the offscreen GPU tests have a
+          # real adapter in CI. A software GPU validates lifecycle and
+          # rendering paths; it is not hardware performance evidence.
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - name: cargo test
+        run: cargo test --no-fail-fast --locked
+      - name: Headless launch smoke (no display server)
+        run: |
+          # With no display server the launch path falls back to the
+          # headless session pump (CI-safe); the child's exit status is
+          # propagated.
+          ./target/debug/nora -- /bin/echo nora-headless-smoke
+          set +e
+          ./target/debug/nora -- /bin/sh -c 'exit 3'
+          STATUS=$?
+          set -e
+          test "$STATUS" -eq 3
+
+  backends:
+    name: backend matrix (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: X11 only
+            features: x11
+          - name: Wayland only
+            features: wayland
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.name }}
+      - name: cargo build (explicit backend configuration)
+        run: >
+          cargo build --release --locked
+          --no-default-features --features ${{ matrix.features }}
+      - name: Verify the binary runs
+        run: ./target/release/nora --version
+
+  x11-smoke:
+    name: X11 display smoke (Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb xkb-data libxkbcommon0 libxkbcommon-x11-0 \
+            libvulkan1 mesa-vulkan-drivers
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: Windowed smoke under Xvfb
+        run: |
+          # One automated open/resize/minimize/close cycle plus one
+          # windowed launch, under a virtual X11 display.
+          xvfb-run -a ./target/release/nora --smoke
+          xvfb-run -a ./target/release/nora -- /bin/echo x11-smoke
+
+  wayland-smoke:
+    name: Wayland display smoke (Weston headless)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            weston xkb-data libxkbcommon0 \
+            libvulkan1 mesa-vulkan-drivers
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: Windowed smoke under Weston headless
+        env:
+          DISPLAY: ""
+        run: |
+          # Nested compositor: weston's headless backend creates
+          # /tmp/wayland-N (N = first free index, usually 0).
+          weston --backend=headless --log=weston.log &
+          WESTON_PID=$!
+          SOCKET=""
+          for _ in $(seq 1 30); do
+            for cand in /tmp/wayland-0 /tmp/wayland-1 /tmp/wayland-2; do
+              if [ -S "$cand" ]; then SOCKET="$cand"; break; fi
+            done
+            [ -n "$SOCKET" ] && break
+            sleep 1
+          done
+          if [ -z "$SOCKET" ]; then
+            cat weston.log
+            exit 1
+          fi
+          set +e
+          WAYLAND_DISPLAY="${SOCKET#/tmp/}" ./target/release/nora --smoke
+          STATUS=$?
+          set -e
+          kill "$WESTON_PID" 2>/dev/null || true
+          exit "$STATUS"

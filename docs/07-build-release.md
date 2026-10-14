@@ -28,7 +28,9 @@ Use `cargo tree -d` and actual compile errors to reconcile versions. A developme
 | `tests/`, `tests/fixtures/` | Deterministic engine/input/session tests |
 | `tools/nora-dev/` | Rust test/benchmark generator and harness |
 | `assets/` | Embedded shader/config/desktop assets and attributed test fonts |
-| `packaging/` | Desktop entry, icon, terminfo and install metadata |
+| `resources/` | Desktop entry, icon and example config |
+| `scripts/` | Clean-build, install and uninstall scripts |
+| `packaging/` | Additional install metadata (grow as needed) |
 | `docs/status/`, `docs/decisions/`, `docs/performance/` | Recovery, decisions, measured results |
 
 Do not create all directories as empty abstractions in N00. Grow them with the feature that needs them. Keep the early app in a single crate; add the tools package when a real helper is implemented.
@@ -66,6 +68,17 @@ Nora should report version, commit/build metadata when available, renderer/backe
 Package a desktop entry, icon, executable, example TOML, optional compiled terminfo and notices. Follow XDG directories for configuration, state and caches [S21]. Cache files are disposable and versioned; configuration is never overwritten during install/update. Provide a portable install procedure and one tested distro packaging recipe first. A package filename does not prove installation or desktop launch succeeds.
 
 Audit direct/transitive dependency licenses and preserve notices for any adapted upstream files. Alacritty publishes Apache-2.0 [S30]; Ghostty publishes MIT [S31]; kitty publishes GPLv3 [S32]. These are inspected upstream labels, not permission to remove component notices. Implement protocols from their specifications; importing kitty code changes the licensing analysis and requires a separate explicit decision.
+
+### Implemented (N30)
+
+- **CI** (`.github/workflows/ci.yml`): clean-checkout release build, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the full test suite with a software GPU (lavapipe, for the offscreen GPU tests), and display smoke jobs — `nora --smoke` under Xvfb (X11) and under Weston's headless backend (native Wayland; a successful XWayland run does not validate native Wayland).
+- **Explicit backend configurations**: `cargo build --no-default-features --features x11` (X11 only) and `cargo build --no-default-features --features wayland` (Wayland only) are documented, CI-tested configurations; the default build enables both.
+- **Clean build**: `scripts/clean-build.sh` runs `cargo clean` + `cargo build --release` and verifies the binary. Set `CARGO_TARGET_DIR` to keep the shared target directory intact.
+- **Verified Linux install recipe** (per user, no root required): `git clone <repo> && cd <repo>`, then `./scripts/install.sh` — builds the release binary, then installs `~/.local/bin/nora`, the compiled terminfo entry (`tic` into `~/.terminfo`), the desktop entry (`~/.local/share/applications/nora.desktop`) and the icon (`~/.local/share/icons/hicolor/128x128/apps/nora.png`). An existing `~/.config/nora/config.toml` is never touched; when absent, `resources/nora.example.toml` is copied in as a starting point. `./scripts/uninstall.sh` removes the installed artifacts and preserves the user config.
+- **Desktop entry** (`resources/nora.desktop`): `Name`, `Exec=nora` (resolved from `PATH`), `Icon=nora`, `Categories=Utility;TerminalEmulator;`, `Terminal=false` (nora itself is the terminal, per the freedesktop spec).
+- **Headless smoke in CI**: with no display server, the launch path (`nora -- CMD`) falls back to the headless session pump; CI runs it and checks child exit-status propagation. `nora --smoke` requires a display and runs in the display smoke jobs.
+- **Packaging tests**: `tests/packaging.rs` covers the clean build, install, desktop entry, example config, and uninstall-preserves-config acceptance.
+- No external release is published or tagged by this work; a release requires the owner's release authorization.
 
 ## Release gate
 

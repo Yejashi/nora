@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Nora
+GenericName=Terminal
+Comment=A fast, efficient, maintainable Linux desktop terminal
+Exec=nora
+Icon=nora
+Terminal=false
+Categories=Utility;TerminalEmulator;
+StartupNotify=true

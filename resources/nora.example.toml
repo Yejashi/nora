@@ -1,0 +1,35 @@
+# nora example configuration (N30).
+#
+# Copy to ~/.config/nora/config.toml and edit. Every section and key is
+# optional; omitted values use nora's built-in defaults.
+#
+# Validate without launching:
+#   nora --config ~/.config/nora/config.toml --check-config
+
+[terminal]
+# Scrollback lines (0..1000000).
+history = 1000
+# Enable mouse support by default.
+mouse = false
+
+[font]
+# Font family, and size in points (0 < size <= 1000).
+family = "monospace"
+size = 12.0
+
+[theme]
+# Colors are #RRGGBB.
+background = "#000000"
+foreground = "#ffffff"
+cursor = "#ffffff"
+# Optional: override the ANSI colors (1..16 entries, #RRGGBB).
+# colors = ["#000000", "#ff0000", "#00ff00", "#ffff00", "#0000ff",
+#           "#ff00ff", "#00ffff", "#ffffff", "#888888", "#ff5555",
+#           "#55ff55", "#ffff55", "#5555ff", "#ff55ff", "#55ffff",
+#           "#cccccc"]
+
+[keys]
+# Custom key bindings: key sequence -> action.
+[keys.bindings]
+# "ctrl+shift+c" = "copy"
+# "ctrl+shift+v" = "paste"
