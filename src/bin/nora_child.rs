@@ -20,6 +20,10 @@
 //!   hex-decoded query bytes to stdout, then read stdin in chunks until the
 //!   contiguous hex-decoded expect bytes are seen (print `CHECK:<marker>`,
 //!   exit 0) or stdin reaches EOF first (print `CHECKFAIL:<marker>`, exit 0);
+//! - `flood <total>`: print `READY`, write `total` bytes of a deterministic
+//!   repeating pattern to stdout (flushed every 4 KiB), then read stdin
+//!   until EOF (stay alive) — a sustained output load for the N28
+//!   multi-session benchmark;
 //! - `checkhold <marker> <q-hex> <expect-hex>`: like `check`, but after
 //!   printing the verdict the child keeps reading stdin until EOF instead of
 //!   exiting, so a pump test can read the verdict from a non-terminated
@@ -55,6 +59,10 @@ fn main() {
         Some("stop") => {
             let limit = args.get(1).map(String::as_str).unwrap_or("0");
             stop(&mut out, limit);
+        }
+        Some("flood") => {
+            let total = args.get(1).map(String::as_str).unwrap_or("0");
+            flood(&mut out, total);
         }
         Some("ws") => winsize(&mut out),
         Some("dying") => {
@@ -130,6 +138,37 @@ fn stop(out: &mut impl Write, limit: &str) {
             let _ = writeln!(out, "STOPPED");
             let _ = out.flush();
         }
+    }
+}
+
+/// Write `total` bytes of a deterministic repeating pattern to `out`,
+/// flushing every 4 KiB, then read stdin until EOF (stay alive).
+///
+/// Used by the N28 multi-session benchmark as a sustained output load:
+/// each flood pane keeps its PTY master, the pinned reader and the shared
+/// parse lock busy while the probe pane's input latency is measured. The
+/// pattern is a fixed repeating sequence, so the load is deterministic
+/// without passing a corpus to the child.
+fn flood(out: &mut impl Write, _total: &str) {
+    ready(out);
+
+    // Deterministic repeating pattern: "0123456789\r\n" (12 bytes).
+    let pattern = b"0123456789\r\n";
+    let mut buf = Vec::with_capacity(4096);
+    while buf.len() < 4096 {
+        buf.extend_from_slice(pattern);
+    }
+    buf.truncate(4096);
+
+    // Write the pattern continuously (flushing each 4 KiB chunk) until the
+    // session closes: a sustained output load for as long as the pane is
+    // alive. When the session closes, the slave PTY closes and the writes
+    // fail with EPIPE, ending the loop.
+    loop {
+        if out.write_all(&buf).is_err() {
+            break;
+        }
+        let _ = out.flush();
     }
 }
 
