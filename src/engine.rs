@@ -58,8 +58,10 @@ pub struct Engine {
     /// Bounded graphics filter (N32a): extracts kitty-graphics APCs in
     /// parallel with the vte parser.
     graphics_filter: crate::graphics_filter::GraphicsFilter,
-    /// Byte-bounded queue of graphics events, drained by the render tick.
-    graphics_queue: crate::graphics_filter::GraphicsQueue,
+    /// Byte-bounded queue of graphics events, shared between the headless
+    /// `Engine::feed` path and the PTY `EventLoop` filter (N32b), drained
+    /// by the render tick (N33).
+    graphics_queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
 }
 
 /// Kitty keyboard protocol modes (N21a).
@@ -498,7 +500,7 @@ impl Engine {
             selection: Arc::new(Mutex::new(None)),
             kitty_modes: KittyKeyboardModes::default(),
             graphics_filter: crate::graphics_filter::GraphicsFilter::new(),
-            graphics_queue: crate::graphics_filter::GraphicsQueue::new(),
+            graphics_queue: Arc::new(Mutex::new(crate::graphics_filter::GraphicsQueue::new())),
         }
     }
 
@@ -547,8 +549,14 @@ impl Engine {
     /// byte semantics are preserved.
     pub fn feed(&mut self, bytes: &[u8]) {
         let (forward, events) = self.graphics_filter.process(bytes);
-        for event in events {
-            self.graphics_queue.push(event);
+        if !events.is_empty() {
+            let mut queue = self
+                .graphics_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for event in events {
+                queue.push(event);
+            }
         }
         let mut term = self.term.lock();
         self.processor.advance(&mut *term, forward);
@@ -557,7 +565,18 @@ impl Engine {
     /// Drain the graphics queue (N32a), returning all pending graphics
     /// events in order. Called by the render tick (N33).
     pub fn drain_graphics(&mut self) -> Vec<crate::graphics_filter::GraphicsEvent> {
-        self.graphics_queue.drain()
+        self.graphics_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+    }
+
+    /// A clone of the shared graphics-queue handle (N32b): the PTY
+    /// `EventLoop` filter pushes graphics events into the same queue the
+    /// headless [`Engine::feed`] path uses, so both paths feed one
+    /// byte-bounded queue drained by the render tick.
+    pub fn graphics_handle(&self) -> Arc<Mutex<crate::graphics_filter::GraphicsQueue>> {
+        Arc::clone(&self.graphics_queue)
     }
 
     /// Current terminal modes.

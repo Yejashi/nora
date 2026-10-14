@@ -42,6 +42,30 @@ use crate::engine::{Engine, EventRecord};
 use super::io::{BoundedWriter, WriterConfig, WriterError};
 use super::{NOMINAL_CELL_HEIGHT, NOMINAL_CELL_WIDTH, ReplyLedger, resolve_record};
 
+/// N32b: byte-level graphics pre-filter for the PTY `EventLoop`.
+///
+/// Wraps the N32a [`GraphicsFilter`] so it runs on the pinned PTY reader
+/// thread (via the vendored `Filter` hook), pushing extracted events into
+/// the session's shared [`GraphicsQueue`] handle. The headless
+/// `Engine::feed` path and this PTY path feed the same queue.
+struct PtyGraphicsFilter {
+    filter: crate::graphics_filter::GraphicsFilter,
+    queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
+}
+
+impl alacritty_terminal::event_loop::Filter for PtyGraphicsFilter {
+    fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let (forward, events) = self.filter.process(bytes);
+        if !events.is_empty() {
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            for event in events {
+                queue.push(event);
+            }
+        }
+        forward.to_vec()
+    }
+}
+
 /// Default per-session write budgets (policy values, 03:86-89): 1 MiB
 /// total, 64 KiB reserved for parser replies.
 pub const DEFAULT_CAP: WriterConfig = WriterConfig {
@@ -259,7 +283,16 @@ impl PtySession {
         // the exit token before reading master bytes that arrived in the
         // same poll batch; the flag makes the exit path do one final
         // `pty_read` so trailing output (argv/pwd lines) reaches the term.
+        // N32b: install the graphics pre-filter on the pinned PTY reader
+        // so kitty-graphics APCs are extracted on the PTY path (the
+        // headless `Engine::feed` path already runs its own N32a filter).
+        // Both push into the session's shared graphics queue.
+        let graphics_filter = PtyGraphicsFilter {
+            filter: crate::graphics_filter::GraphicsFilter::new(),
+            queue: engine.graphics_handle(),
+        };
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
+            .map(|loop_| loop_.with_filter(Box::new(graphics_filter)))
             .map_err(PtyError::Spawn)?;
         let sender = loop_.channel();
 

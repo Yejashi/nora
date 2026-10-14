@@ -1162,3 +1162,40 @@ fn close_before_drop_clean() {
     // Explicit drop after close: must not panic or block on a closed session.
     drop(session);
 }
+
+/// N32b: a PTY session that emits a kitty-graphics APC produces a
+/// [`GraphicsEvent`] in the shared graphics queue. The vendored `EventLoop`
+/// filter runs on the PTY reader thread *before* the parser, so the event
+/// is queued before the `APC-DONE` marker is visible in the grid.
+#[test]
+fn pty_graphics_apc_reaches_shared_queue() {
+    // `aGVsbG8=` is the base64 of "hello".
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["apc".to_string(), "aGVsbG8=".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    // Wait for the APC-DONE marker. By the time the marker is visible the
+    // APC has already been filtered (the filter runs before the parser in
+    // the same or an earlier `pty_read`), so the event is in the queue.
+    pump(&mut session, |text, _events| text.contains("APC-DONE"))
+        .expect("APC-DONE marker observed within the deadline");
+
+    let events = session.engine().drain_graphics();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.command == b'e' && event.data == b"hello"),
+        "expected a graphics event with command 'e' and data 'hello'; got {events:?}"
+    );
+
+    session.close();
+}

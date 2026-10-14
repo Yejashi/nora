@@ -86,6 +86,24 @@ fn main() {
             let _ = out.flush();
             std::process::exit(0);
         }
+        Some("apc") => {
+            ready(&mut out);
+            // Let READY reach the screen through the loop's normal master
+            // read before the APC goes out (N32b).
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let b64 = args.get(1).map(String::as_str).unwrap_or("");
+            // kitty-graphics APC: ESC _ <command>;<params> ESC \. The N32a
+            // filter splits on the first ';', so `e;<b64>` yields command
+            // 'e' and base64 data `<b64>`.
+            let payload = format!("e;{b64}");
+            let _ = out.write_all(format!("\x1b_{payload}\x1b\\").as_bytes());
+            let _ = out.flush();
+            // Let the APC reach the master before the marker.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = writeln!(out, "APC-DONE");
+            let _ = out.flush();
+            std::process::exit(0);
+        }
         Some("check") => {
             let marker = args.get(1).map(String::as_str).unwrap_or("?");
             let query = hex_decode(args.get(2).map(String::as_str).unwrap_or(""));
