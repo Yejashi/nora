@@ -8,6 +8,7 @@
 
 pub mod focus;
 pub mod mouse;
+pub mod paste;
 
 use alacritty_terminal::term::TermMode;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};

@@ -69,6 +69,17 @@ Read clipboard text through the platform adapter. Validate maximum accepted size
 
 Wrap bracketed data only when the current application mode requests it. A long paste is one ordered transaction from the user's perspective; accepted keyboard input waits behind it. If canceled after begin, enqueue the end marker before normal input resumes. For v0.1, use bounded bracketed segments: a pending protocol reply may close the current segment at a payload-chunk boundary, emit the reply in query order, then resume the remaining payload in a new segment if the application still requests bracketed paste. This avoids injecting reply bytes inside a paste payload and allows a child to observe multiple paste events. Document this segmentation and test it; preserve the order of the pasted text. Ordinary paste has no delimiters, so retain its accepted byte order and document that application-initiated replies share the same input stream. Neither mode guarantees progress when the child entirely stops reading. Shutdown still has an independent control path. Do not reorder raw keyboard input to improve an artificial latency number.
 
+### Paste policy (N17a)
+
+Pure policy in `src/input/paste.rs` (`validate_paste`, `PasteStream`), headless fixtures in `tests/paste_input.rs`. The pump wiring (N17b) validates clipboard text, then sends the validated bytes through the bounded writer in order.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Bracketed paste | Supported: when bracketed paste mode is active the payload is wrapped in `CSI 200 ~ ... CSI 201 ~` (6 bytes per marker); ordinary paste has no delimiters | pass — `tests/paste_input.rs` |
+| Maximum paste size | 1 MiB (`MAX_PASTE_SIZE`), checked against the final bytes including markers; strictly larger is rejected as `TooLarge`, exactly 1 MiB is accepted | pass — boundary rows in `tests/paste_input.rs` |
+| Newline normalization | `\r\n` and standalone `\r` → `\n`, before bracketing | pass — `tests/paste_input.rs` |
+| Bounded streaming | `PasteStream` delivers the validated bytes as ordered chunks of at most `max_size`; `cancel` drops the remainder, and the pump still sends the bracket terminator before normal input resumes (N17b) | pass — `tests/paste_input.rs` |
+
 ## Mouse, selection and focus
 
 Encode mouse coordinates using current pane/grid geometry and requested mode, with correct release/motion/modifier semantics. Local selection has an explicit override modifier (proposed Shift) when the application requests mouse reporting. Scroll goes to history in normal local mode and to the application when its modes require it. Focus notifications apply to the active session consistently when pane/OS focus changes.
