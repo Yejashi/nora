@@ -139,6 +139,8 @@ Flood audit (N06b) for the protocol-event queue row: the pinned vte parser (`fea
 
 A row limit does not strictly bound memory when cells can carry extra text or links. Audit parser strings, combining marks, hyperlink storage, history extras and third-party font caches. Enforce caps using supported APIs or a documented minimal patch. If a strict cap is impossible, record the specific exception; do not label it bounded. The resource audit is a release gate, not a fixed-size-of-Cell approximation presented as a guarantee.
 
+See [12-resource-limits.md](12-resource-limits.md) for the full audit of all growth limits (N25).
+
 ## Resize, font and shutdown lifecycle
 
 Derive integer physical pixel cell metrics and pane rectangles from the latest scale/size; minimum usable grid is 2 columns × 1 row. Suspend rendering for a zero-sized/minimized surface; keep the last valid PTY size. Resize terminal/grid and PTY under a documented serialized ordering; tag geometry snapshots with an epoch, then request full damage. TUIs must eventually receive SIGWINCH and agree with nora's grid.
