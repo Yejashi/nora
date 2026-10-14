@@ -21,13 +21,14 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::ModifiersState,
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
 };
 
 use self::graphics::{DrawCell, Graphics};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
+use nora::clipboard::{ClipboardBackend, create_clipboard};
 use nora::engine::Snapshot;
 use nora::input::{BindingTable, InputAction, encode};
 use nora::render::policy::{clamp_grid, snapshot_is_stale};
@@ -352,6 +353,9 @@ struct WinApp {
     /// `CursorMoved` in physical pixels and `MouseInput` carries no
     /// position, so the drag tracks the last moved cursor.
     cursor: (f64, f64),
+    /// Native clipboard backend (N15): `None` when no display server is
+    /// available; clipboard operations are no-ops in that case.
+    clipboard: Option<Arc<dyn ClipboardBackend>>,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -385,6 +389,7 @@ pub fn run_windowed(
         last_grid: (0, 0),
         selection: None,
         cursor: (0.0, 0.0),
+        clipboard: create_clipboard(),
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -688,11 +693,16 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 self.modes = modes;
             }
             AppEvent::Copied(text) => {
-                // N14b: the selected text was copied. v0.1 surfaces it to
-                // debug output; a native clipboard write is a later slice
-                // (winit 0.30 exposes no `Window` clipboard API).
+                // N14b: the selected text was copied. N15: write it to the
+                // native clipboard (arboard-backed); the debug line stays
+                // for diagnostics.
                 if debug_enabled() {
                     eprintln!("debug: copied {} byte(s): {:?}", text.len(), text);
+                }
+                if let Some(cb) = &self.clipboard
+                    && let Err(err) = cb.set_text(text.as_str())
+                {
+                    eprintln!("nora: {err}");
                 }
             }
         }
@@ -839,6 +849,41 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // presses are synthetic duplicates.
                 if event.state != ElementState::Pressed || is_synthetic {
                     return;
+                }
+                // N15: native clipboard UI bindings. These are local UI
+                // actions (not PTY escapes), so they are checked before
+                // `encode` and return early. Keyed on the physical key +
+                // modifier state (layout-independent), mirroring the N09
+                // Ctrl+Q idiom; auto-repeat is ignored (one action per key
+                // press).
+                if self.mods.control_key() && self.mods.shift_key() && !event.repeat {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            // Ctrl+Shift+C: copy the selection; the pump
+                            // emits `AppEvent::Copied`, which writes the
+                            // native clipboard.
+                            let _ = self.pump_commands.send(PumpMsg::Copy);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            // Ctrl+Shift+V: paste the clipboard into the
+                            // PTY.
+                            let text = self.clipboard.as_ref().and_then(|cb| cb.get_text().ok());
+                            match text {
+                                Some(text) => {
+                                    let _ =
+                                        self.pump_commands.send(PumpMsg::Input(text.into_bytes()));
+                                }
+                                None => {
+                                    if debug_enabled() {
+                                        eprintln!("debug: paste: clipboard unavailable or empty");
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 if let Some(action) = encode(
                     &event.logical_key,

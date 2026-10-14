@@ -5,6 +5,7 @@
 //! extraction and ordered event capture, validated by the replay fixtures in
 //! `tests/engine_adapter.rs`.
 
+pub mod clipboard;
 pub mod engine;
 pub mod input;
 pub mod render;
