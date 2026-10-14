@@ -895,12 +895,19 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         }
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             // Ctrl+Shift+V: paste the clipboard into the
-                            // PTY.
+                            // PTY (N17b). The pump validates the text
+                            // (size cap, newline normalization, bracketed
+                            // paste markers) and streams it to the PTY in
+                            // order, bounded by the writer's app cap.
+                            // `bracketed` reflects the engine's live
+                            // `TermMode::BRACKETED_PASTE` (set by
+                            // `CSI ? 2004 h`, cleared by `CSI ? 2004 l`).
                             let text = self.clipboard.as_ref().and_then(|cb| cb.get_text().ok());
                             match text {
                                 Some(text) => {
+                                    let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
                                     let _ =
-                                        self.pump_commands.send(PumpMsg::Input(text.into_bytes()));
+                                        self.pump_commands.send(PumpMsg::Paste { text, bracketed });
                                 }
                                 None => {
                                     if debug_enabled() {

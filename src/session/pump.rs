@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::pty::{DRAIN_TIMEOUT, PtySession, SessionEvent};
 use crate::engine::Snapshot;
+use crate::input::paste::{PasteValidation, validate_paste};
 use crate::render::term::is_noop_damage;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
@@ -102,6 +103,119 @@ pub enum PumpMsg {
     /// Copy the selection and emit [`AppEvent::Copied`] (N14b); applied on
     /// the next tick.
     Copy,
+    /// A paste operation (N17b): validated by the pure paste policy
+    /// (size cap, bracketed paste markers, newline normalization) and
+    /// queued into the pending input, streamed to the PTY in order with
+    /// the keystrokes, bounded by the writer's app cap.
+    Paste {
+        /// The paste text (raw, before validation).
+        text: String,
+        /// Whether bracketed paste mode is active (the engine's live
+        /// `TermMode::BRACKETED_PASTE`).
+        bracketed: bool,
+    },
+    /// Cancel the in-flight paste (N17b): the not-yet-fed paste bytes are
+    /// dropped; keystrokes are unaffected.
+    CancelPaste,
+}
+
+/// The outcome of applying a paste to the pump's input state (N17b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteApply {
+    /// The paste was validated and queued; the count of bytes queued.
+    Queued(usize),
+    /// The paste exceeded `crate::input::paste::MAX_PASTE_SIZE`; the final
+    /// size and the cap.
+    TooLarge { size: usize, max: usize },
+}
+
+/// Apply a paste to the pump's input state (N17b): validate with
+/// [`validate_paste`], and on success append the bytes to
+/// `pending_input` and record the in-flight block as the half-open range
+/// `[start, end)`. On rejection, `pending_input` and `paste_block` are
+/// left unchanged.
+///
+/// A new paste replaces any previously tracked block: only the most
+/// recent paste is cancellable.
+pub fn apply_paste(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<(usize, usize)>,
+    text: &str,
+    bracketed: bool,
+) -> PasteApply {
+    match validate_paste(text, bracketed) {
+        PasteValidation::Ok { bytes, .. } => {
+            let start = pending_input.len();
+            pending_input.extend_from_slice(&bytes);
+            *paste_block = Some((start, pending_input.len()));
+            PasteApply::Queued(bytes.len())
+        }
+        PasteValidation::TooLarge { size, max } => PasteApply::TooLarge { size, max },
+    }
+}
+
+/// Cancel the in-flight paste (N17b): remove its bytes from
+/// `pending_input` and clear the block. Keystrokes are unaffected.
+/// Returns the count of bytes dropped.
+pub fn cancel_paste(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<(usize, usize)>,
+) -> usize {
+    match paste_block.take() {
+        Some((start, end)) => {
+            let dropped = end - start;
+            pending_input.drain(start..end);
+            dropped
+        }
+        None => 0,
+    }
+}
+
+/// Advance the in-flight paste block after `drained` bytes were fed from
+/// the front of `pending_input` (N17b). The block shifts left by
+/// `drained`; when it is fully drained it becomes `None`.
+pub fn advance_paste_block(paste_block: &mut Option<(usize, usize)>, drained: usize) {
+    if let Some((start, end)) = *paste_block {
+        let start = start.saturating_sub(drained);
+        let end = end.saturating_sub(drained);
+        *paste_block = if start == end {
+            None
+        } else {
+            Some((start, end))
+        };
+    }
+}
+
+/// Feed `pending_input` to the session through the bounded writer, in
+/// order, until the budget is full, the input is empty, or the loop is
+/// dead (N09b, extended for N17b paste tracking). Advances
+/// `paste_block` as bytes drain, so an in-flight paste's block stays
+/// aligned with `pending_input`. Returns the total bytes fed this call.
+pub fn feed_pending(
+    session: &mut PtySession,
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<(usize, usize)>,
+) -> usize {
+    let mut fed = 0;
+    while !pending_input.is_empty() {
+        match session.feed(pending_input) {
+            Ok(0) => break,
+            Ok(accepted) => {
+                pending_input.drain(..accepted);
+                advance_paste_block(paste_block, accepted);
+                fed += accepted;
+                if debug_enabled() {
+                    eprintln!("debug: pump: fed {accepted} input byte(s)");
+                }
+            }
+            Err(_) => {
+                pending_input.clear();
+                *paste_block = None;
+                break;
+            }
+        }
+    }
+    fed
 }
 
 /// Bounded pump thread: owns the session; ticks until terminated or stopped.
@@ -117,8 +231,9 @@ pub enum PumpMsg {
 /// from the last published one (the first tick always publishes,
 /// correcting the window's initial `SHOW_CURSOR`): send
 /// [`AppEvent::Modes`]; (5) drain [`PumpMsg`] commands — resize the
-/// session, scroll the viewport, or extend the pending input with encoded
-/// keystroke bytes;
+/// session, scroll the viewport, extend the pending input with encoded
+/// keystroke bytes, queue a validated paste (N17b), or cancel the
+/// in-flight paste;
 /// (6) feed the pending input in order (bounded by the writer's app cap;
 /// `Ok(0)` = budget full, remainder waits for the next tick;
 /// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
@@ -132,6 +247,10 @@ pub fn pump_thread(
     stop: Arc<AtomicBool>,
 ) {
     let mut pending_input: Vec<u8> = Vec::new();
+    // N17b: the in-flight paste block within `pending_input`, as a
+    // half-open byte range `[start, end)`. `None` when no paste is in
+    // flight. Kept aligned with `pending_input` by `feed_pending`.
+    let mut paste_block: Option<(usize, usize)> = None;
     // N10b: the last published engine `TermMode`. `None` until the first tick,
     // so the first tick always publishes (correcting the window's initial
     // `SHOW_CURSOR` to the engine's live mode).
@@ -249,6 +368,30 @@ pub fn pump_thread(
                         let _ = events.send_event(AppEvent::Copied(text));
                     }
                 }
+                PumpMsg::Paste { text, bracketed } => {
+                    let applied =
+                        apply_paste(&mut pending_input, &mut paste_block, &text, bracketed);
+                    match applied {
+                        PasteApply::Queued(n) => {
+                            if debug_enabled() {
+                                eprintln!("debug: pump: paste queued {n} byte(s)");
+                            }
+                        }
+                        PasteApply::TooLarge { size, max } => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "debug: paste rejected: {size} byte(s) exceeds max {max}"
+                                );
+                            }
+                        }
+                    }
+                }
+                PumpMsg::CancelPaste => {
+                    let dropped = cancel_paste(&mut pending_input, &mut paste_block);
+                    if debug_enabled() {
+                        eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
+                    }
+                }
             }
         }
 
@@ -256,21 +399,10 @@ pub fn pump_thread(
         // cap: `feed` accepts at most the cap per call, so `Ok(0)` means the
         // budget is full and the remainder waits for the next tick;
         // `Err(Closed)` means the session loop died — drop the remainder.
-        while !pending_input.is_empty() {
-            match session.feed(&pending_input) {
-                Ok(0) => break,
-                Ok(accepted) => {
-                    pending_input.drain(..accepted);
-                    if debug_enabled() {
-                        eprintln!("debug: pump: fed {accepted} input byte(s)");
-                    }
-                }
-                Err(_) => {
-                    pending_input.clear();
-                    break;
-                }
-            }
-        }
+        // N17b: paste bytes flow through the same bounded path as
+        // keystrokes (in order, capped), and the in-flight paste block is
+        // advanced as bytes drain.
+        feed_pending(&mut session, &mut pending_input, &mut paste_block);
         // Per-tick flush: forwards accepted bytes (including ledger replies,
         // which have no other flusher in windowed mode) — the full app cap
         // per tick; empty flushes are cheap.

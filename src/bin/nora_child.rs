@@ -20,6 +20,10 @@
 //!   hex-decoded query bytes to stdout, then read stdin in chunks until the
 //!   contiguous hex-decoded expect bytes are seen (print `CHECK:<marker>`,
 //!   exit 0) or stdin reaches EOF first (print `CHECKFAIL:<marker>`, exit 0);
+//! - `checkhold <marker> <q-hex> <expect-hex>`: like `check`, but after
+//!   printing the verdict the child keeps reading stdin until EOF instead of
+//!   exiting, so a pump test can read the verdict from a non-terminated
+//!   tick's snapshot;
 //! - anything else: echo fallback.
 
 use std::io::{self, BufRead, Read, Write};
@@ -79,6 +83,12 @@ fn main() {
             let query = hex_decode(args.get(2).map(String::as_str).unwrap_or(""));
             let expect = hex_decode(args.get(3).map(String::as_str).unwrap_or(""));
             check(&mut out, marker, &query, &expect);
+        }
+        Some("checkhold") => {
+            let marker = args.get(1).map(String::as_str).unwrap_or("?");
+            let query = hex_decode(args.get(2).map(String::as_str).unwrap_or(""));
+            let expect = hex_decode(args.get(3).map(String::as_str).unwrap_or(""));
+            check_hold(&mut out, marker, &query, &expect);
         }
         Some("descendant") => {
             descendant(&mut out, args.get(1).map(String::as_str).unwrap_or("0"));
@@ -183,6 +193,60 @@ fn check(out: &mut impl Write, marker: &str, query: &[u8], expect: &[u8]) {
         let _ = writeln!(out, "CHECKFAIL:{marker}");
     }
     let _ = out.flush();
+}
+
+/// Like [`check`], but after printing the verdict the child keeps running
+/// (reading stdin until EOF) instead of exiting. This lets a pump test read
+/// the verdict from a non-terminated tick's snapshot: a terminated tick
+/// probes nothing, so a child that exits on the verdict would race the
+/// confirmation output with the termination report.
+fn check_hold(out: &mut impl Write, marker: &str, query: &[u8], expect: &[u8]) {
+    ready(out);
+    let _ = out.write_all(query);
+    let _ = out.flush();
+    let mut input = io::stdin().lock();
+    let mut seen: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut found = false;
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&chunk[..n]);
+        if contains_sequence(&seen, expect) {
+            found = true;
+            break;
+        }
+        // Keep only a tail that can still complete a match, so a long-lived
+        // stream never grows the buffer without bound.
+        let keep = expect.len().saturating_sub(1);
+        if seen.len() > keep {
+            seen.drain(..seen.len() - keep);
+        }
+    }
+    if found {
+        let _ = writeln!(out, "CHECK:{marker}");
+    } else {
+        let _ = writeln!(out, "CHECKFAIL:{marker}");
+    }
+    let _ = out.flush();
+    // Keep the child alive after the verdict: read stdin until EOF so the
+    // session stays live and the verdict is observable in a snapshot.
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+    }
 }
 
 /// True when `buffer` contains `needle` as a contiguous subsequence (an

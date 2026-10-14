@@ -80,6 +80,31 @@ Pure policy in `src/input/paste.rs` (`validate_paste`, `PasteStream`), headless 
 | Newline normalization | `\r\n` and standalone `\r` → `\n`, before bracketing | pass — `tests/paste_input.rs` |
 | Bounded streaming | `PasteStream` delivers the validated bytes as ordered chunks of at most `max_size`; `cancel` drops the remainder, and the pump still sends the bracket terminator before normal input resumes (N17b) | pass — `tests/paste_input.rs` |
 
+### Paste pump wiring (N17b)
+
+`PumpMsg::Paste { text, bracketed }` validates the clipboard text with
+`validate_paste` and, on success, appends the validated bytes to the pump's
+`pending_input` (after any queued keystrokes) and records the in-flight paste
+as a half-open byte range `[start, end)`; `PumpMsg::CancelPaste` drops the
+not-yet-fed paste bytes (the block range) without touching keystrokes. Paste
+bytes stream through the same bounded writer as keystrokes (N09b), in order
+and capped by the writer's app cap; the in-flight block is advanced as bytes
+drain (`feed_pending` → `advance_paste_block`), so a cancel always drops
+exactly the paste's remaining bytes. `bracketed` is the engine's live
+`TermMode::BRACKETED_PASTE` (set by `CSI ? 2004 h`, cleared by `CSI ? 2004
+l`), read from the app's published `self.modes` (N10b). A new paste replaces
+any previously tracked block (only the most recent is cancellable); a
+`TooLarge` paste queues nothing and leaves state unchanged. Headless fixtures
+in `tests/paste_pump.rs` (pure state helpers plus one real-PTY round-trip
+through the bounded writer).
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Paste queued behind keystrokes | `PumpMsg::Paste` appends validated bytes after queued keystrokes; the bounded writer feeds them in order | pass — `tests/paste_pump.rs` |
+| Cancellation | `PumpMsg::CancelPaste` drops only the in-flight paste bytes; keystrokes unaffected | pass — `tests/paste_pump.rs` |
+| Bracketed flag source | `bracketed` is the engine's live `TermMode::BRACKETED_PASTE`, read from the app's published modes | checked — `src/app/mod.rs` |
+| Ordered round-trip | Paste bytes reach a real PTY child in order through the bounded writer | pass — `tests/paste_pump.rs` |
+
 ## Mouse, selection and focus
 
 Encode mouse coordinates using current pane/grid geometry and requested mode, with correct release/motion/modifier semantics. Local selection has an explicit override modifier (proposed Shift) when the application requests mouse reporting. Scroll goes to history in normal local mode and to the application when its modes require it. Focus notifications apply to the active session consistently when pane/OS focus changes.
