@@ -101,3 +101,50 @@ Get correctness and measurements first. Then optimize the largest cost: avoid wh
 Require a before/after profile, a relevant workload and unchanged state/visual tests for each optimization. Regressions over about 10% deserve investigation, but a change within measurement noise is not evidence of a speedup. Do not loosen targets silently: record machine-specific baselines and the reason for any revised goal.
 
 Avoid GPU parsing, one draw per cell, one task/thread per glyph, unconditional `ControlFlow::Poll`, arbitrary sleeps to hide flicker, or disabling rendering to advertise end-to-end speed. Wgpu present modes vary by backend; inspect capabilities rather than assuming mailbox/immediate [S16].
+
+## N27: per-frame glyph shaping cost (measured)
+
+### Profiling (N27a)
+
+The live render pass (`src/app/graphics.rs::draw_frame`) prepares one frame from the engine snapshot. Per frame it does, in order:
+
+1. **Snapshot preparation** — engine → `TerminalSnapshot` (the N26a `snapshot` time; microseconds, state extraction only).
+2. **Frame preparation** — snapshot → draw items + background fills (`crate::render::term`, the same pure mapping N26b `RenderBench` measures) plus the cursor fill.
+3. **Glyph shaping** — one `cosmic_text::Buffer::shape_until_cursor` per non-blank cell (font lookup + harfrust shaping + run layout).
+4. **Upload + draw** — background fills, cursor, glyph raster upload (glyphon `prepare`), vertex upload, draw (GPU).
+
+N26b `RenderBench` measures step 2 (prepare) and a CPU-side upload stand-in (submit) headlessly; it does **not** exercise step 3 (shaping lives in the GPU render pass, which the headless bench replaces with a byte-flatten stand-in). Shaping was therefore measured headlessly on its own (`tests/damage_optimization.rs`), and frame preparation through the N26b runner:
+
+| Cost (debug, 24×80 = 1920 cells) | Measured | Per full frame |
+| --- | --- | --- |
+| Frame preparation (N26b `prepare_time`) | — | ~0.53 ms |
+| Glyph shaping, all cells fresh | 0.97 µs/shape | ~1.86 ms |
+| Glyph shaping, cached lookups only | 0.018 µs/shape | ~0.035 ms |
+
+**Selected cost: per-frame glyph shaping (step 3).** On a full-screen frame it is ~3.5× the frame-preparation cost, and it re-shapes *every* non-blank cell on *every* frame even when the cell's text and style are unchanged from the previous frame — the common case for a mostly-static terminal (a shell prompt, a text editor, a settled `htop`). This is the "cache font lookup/shaping" item in the optimization order above, and it is the largest controllable CPU cost in the render pass. Snapshot preparation and frame preparation are already cheap; the GPU upload/draw steps need a GPU adapter and were not measurable in the headless CI environment.
+
+### Optimization (N27b): retained per-`Graphics` glyph cache
+
+Added `nora::render::glyph::GlyphCache` (library, engine-free) and routed the render pass's shaping through it. `GlyphCache` retains shaped `cosmic_text::Buffer`s keyed by (text, font size, fg, bg, bold, italic, underline, strikethrough); a hit returns the retained buffer and skips the font lookup + shaping + run layout. The cache is retained for the lifetime of the `Graphics` instance (one per window), so it survives across frames, tab switches and panes — the "retained rows/pools/cache reuse" the card prefers over GPU partial redraw.
+
+- **Behavior-preserving**: a hit returns the identical `Buffer` the fresh path would produce for the same key (same text + metrics + style), so the shaped runs — and therefore the rasterized glyphs — are unchanged. The cache never drops or alters terminal damage: cells still flow through the same snapshot → draw-item → shape → upload pipeline; only the shaping of an *unchanged* cell is reused.
+- **Bounded**: entries are keyed by (text, style, size); a terminal's distinct (text, style) pairs are bounded by the screen's cell count times the small style vocabulary, so the cache is bounded by the screen, not unbounded.
+- **No new locks, no new GPU state**: it is a plain `HashMap` inside `Graphics`, touched only on the render thread (the same thread that owns `FontSystem`), so it adds no lock contention and no cross-thread state.
+
+### Before/after (measured, debug, this machine)
+
+`tests/damage_optimization.rs::cache_hits_are_cheaper_than_fresh_shaping` shapes 1000 distinct cells × 200 frames (200k shapes; the live path's per-frame cost) with a warm font system:
+
+| | Time | Per shape |
+| --- | --- | --- |
+| Fresh shaping (before) | 194.5 ms | ~0.97 µs |
+| Cached shaping (after) | 3.56 ms | ~0.018 µs |
+
+~55× faster for repeated frames. The first frame (all misses) is unchanged; each subsequent frame pays only the cache lookups plus fresh shapes for cells that actually changed.
+
+### Tradeoffs
+
+- **Memory**: the cache retains one `Buffer` per distinct (text, style, size). Bounded by the screen's distinct cell vocabulary (a terminal shows a limited set of styled strings at a time), so it is a small, screen-bounded pool — not an unbounded dependency queue.
+- **Misses still shape**: a cell whose text or style changes is a miss and re-shapes (correctly); the cache only skips *unchanged* cells.
+- **Debug-profile, headless**: the before/after and frame-preparation figures are debug (unoptimized) wall times on this machine, measured headlessly. They are relative (the ratio is the evidence), not absolute latency claims; the GPU upload/draw steps were not measurable here (no GPU adapter in CI).
+- **Not a GPU partial redraw**: per the card, this is retained-cache reuse, not GPU-side partial redraw. The GPU still draws the full frame; only the CPU shaping of unchanged cells is reused.

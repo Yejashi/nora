@@ -17,10 +17,9 @@
 use std::sync::Arc;
 
 use super::glyphs;
-use cosmic_text::UnderlineStyle;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Cursor, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Buffer, Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport,
 };
 use wgpu::{
     Adapter, BlendState, BufferDescriptor, BufferUsages, ColorTargetState, CommandEncoder,
@@ -33,6 +32,7 @@ use wgpu::{
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
+use nora::render::glyph::GlyphCache;
 use nora::render::state::SurfaceStatus;
 use nora::render::style::{CellStyle, decoration_style};
 
@@ -52,41 +52,6 @@ pub struct DrawCell {
     pub style: CellStyle,
     /// Advance width in cells (1 or 2).
     pub width: u16,
-}
-
-/// Shape one cell with an explicit weight, style and decorations (N13a,
-/// N13c), mirroring `glyphs::shape_cell` but honoring the resolved cell
-/// style. The family is the generic monospace family so cosmic-text
-/// resolves the same loaded monospace face the rest of the app uses.
-///
-/// The underline and strikethrough decorations are set on the shaping
-/// attributes so cosmic-text emits them in the laid-out line's
-/// `decorations` spans, which the render pass reads back and draws (N13c).
-fn shape_styled(
-    fs: &mut FontSystem,
-    text: &str,
-    metrics: Metrics,
-    bold: bool,
-    italic: bool,
-    underline: UnderlineStyle,
-    strikethrough: bool,
-) -> Buffer {
-    let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
-    let style = if italic { Style::Italic } else { Style::Normal };
-    let mut attrs = Attrs::new()
-        .family(Family::Monospace)
-        .weight(weight)
-        .style(style);
-    if underline != UnderlineStyle::None {
-        attrs.text_decoration.underline = underline;
-    }
-    if strikethrough {
-        attrs.text_decoration.strikethrough = true;
-    }
-    let mut buffer = Buffer::new(fs, metrics);
-    buffer.set_text(text, &attrs, Shaping::Advanced, None);
-    buffer.shape_until_cursor(fs, Cursor::default(), false);
-    buffer
 }
 
 /// One vertex for the N13c decoration fill pass: position in normalized
@@ -319,6 +284,9 @@ pub struct Graphics {
     swash: SwashCache,
     viewport: Viewport,
     renderer: TextRenderer,
+    /// Retained per-cell glyph cache (N27b): reuses an already-shaped buffer
+    /// for an unchanged cell instead of re-shaping every cell every frame.
+    glyph_cache: GlyphCache,
     /// N13c decoration (underline/strikethrough) fill pipeline.
     deco_pipeline: wgpu::RenderPipeline,
 }
@@ -396,6 +364,7 @@ impl Graphics {
             swash,
             viewport,
             renderer,
+            glyph_cache: GlyphCache::new(),
             deco_pipeline,
         })
     }
@@ -530,18 +499,23 @@ impl Graphics {
         let cw = cell_w as f32;
         let metrics = Metrics::new(glyphs::zoomed_font_size(zoom), glyphs::CELL_H);
 
-        // Shape every cell first: glyphon's `TextArea` borrows its `Buffer`,
-        // so all buffers must be pushed before any area borrows the vector.
+        // Shape every cell first (N27b): glyphon's `TextArea` borrows its
+        // `Buffer`, so all buffers must be pushed before any area borrows the
+        // vector. Each cell is shaped through the retained glyph cache, which
+        // reuses an already-shaped buffer for an unchanged cell (same text,
+        // bold/italic/underline/strike and zoom-scaled size) instead of
+        // re-running cosmic-text's shaping.
         let mut buffers: Vec<Buffer> = Vec::with_capacity(cells.len());
         for cell in cells {
-            buffers.push(shape_styled(
+            buffers.push(self.glyph_cache.shape(
                 &mut fonts.fs,
-                &cell.text,
                 metrics,
+                &cell.text,
                 cell.style.bold,
                 cell.style.italic,
                 cell.style.underline,
                 cell.style.strikethrough,
+                metrics.font_size,
             ));
         }
 
