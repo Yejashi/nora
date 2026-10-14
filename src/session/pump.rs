@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::pty::{DRAIN_TIMEOUT, PtySession, SessionEvent};
-use crate::engine::Snapshot;
+use crate::engine::{KittyKeyboardFlags, Snapshot};
 use crate::input::paste::{PasteValidation, validate_paste};
 use crate::render::term::is_noop_damage;
 use alacritty_terminal::grid::Scroll;
@@ -81,6 +81,9 @@ pub enum AppEvent {
     /// The engine's live `TermMode` changed (N10b); the window updates its
     /// `encode` mode source.
     Modes(TermMode),
+    /// The engine's live kitty keyboard flags changed (N21b); the window
+    /// updates its `encode_kitty` flag source.
+    KittyModes(KittyKeyboardFlags),
     /// The selected text was copied (N14b); the window thread copies it to
     /// the clipboard (or debug-prints it for now).
     Copied(String),
@@ -255,6 +258,11 @@ pub fn pump_thread(
     // so the first tick always publishes (correcting the window's initial
     // `SHOW_CURSOR` to the engine's live mode).
     let mut last_modes: Option<TermMode> = None;
+    // N21b: the last published engine kitty keyboard flags. `None` until
+    // the first tick, so the first tick always publishes (correcting
+    // the window's initial legacy `KittyKeyboardFlags::NONE` to the
+    // engine's live flags).
+    let mut last_kitty: Option<KittyKeyboardFlags> = None;
     loop {
         let outcome = pump_tick(&mut session);
 
@@ -327,6 +335,15 @@ pub fn pump_thread(
         if last_modes != Some(modes) {
             last_modes = Some(modes);
             let _ = events.send_event(AppEvent::Modes(modes));
+        }
+
+        // N21b: publish the engine's live kitty keyboard flags on
+        // change. `KittyKeyboardFlags` is `Copy`, so the engine guard
+        // is dropped before the channel send — never held across it.
+        let kitty_flags = session.engine().kitty_mode();
+        if last_kitty != Some(kitty_flags) {
+            last_kitty = Some(kitty_flags);
+            let _ = events.send_event(AppEvent::KittyModes(kitty_flags));
         }
 
         while let Ok(msg) = commands.try_recv() {

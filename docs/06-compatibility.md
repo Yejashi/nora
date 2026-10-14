@@ -74,7 +74,19 @@ The kitty keyboard protocol is negotiated by the application as a **push/pop mod
 | Enable semantics | The first push enables the protocol; popping the last entry returns to legacy mode | pass — `tests/kitty_keyboard.rs` |
 | Flags | `DISAMBIGUATE`, `REPORT_EVENTS`, `SYSTEM`, `ALTERNATE`, `CURSOR_POS`, `UNICODE_NAME`, `UNICODE_VALUE`, `TEXT`, `LIST` (bits 0–8; `ALL` = bits 0–8 set) | pass — `tests/kitty_keyboard.rs` |
 
-Frontend encoding of negotiated key events (modifiers, repeat/release, functional keys, associated text) is N21b and reads the negotiated flags through `Engine::kitty_mode`; the engine exposes the flags and stack, but byte encoding remains separate [S11, S23].
+### Kitty keyboard protocol — frontend encoding (N21b)
+
+The window encodes each key press with the negotiated flags: the pump publishes the engine's live flags through `AppEvent::KittyModes` (the first tick always publishes, correcting the window's initial legacy `KittyKeyboardFlags::NONE`), and the window tries `nora::input::encode_kitty` before the legacy `encode` — when the protocol is disabled (`KittyKeyboardFlags::NONE`), `encode_kitty` returns `None` and the legacy encoding is the fallback. Local UI bindings (clipboard, zoom, search) are checked before both encoders.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Byte format | key code (2 bytes, big-endian) + event type (1 byte, only when `REPORT_EVENTS`) + system modifiers (1 byte, only when `SYSTEM`) | pass — `tests/kitty_keyboard.rs` |
+| Key code | the winit `KeyCode` discriminant for `Code` physicals; 0 for `Unidentified` physicals (pinned winit 0.30.13 has no `Named` variant) | pass — `tests/kitty_keyboard.rs` |
+| Event type | 1 = down, 2 = repeat, 3 = up (the window filters to press events, so 3 is reserved for a future release event) | pass — `tests/kitty_keyboard.rs` |
+| System modifiers | shift = 1, ctrl = 2, alt = 4, super/logo = 8 (OR-combined) | pass — `tests/kitty_keyboard.rs` |
+| Fallback | `KittyKeyboardFlags::NONE` (legacy mode) → `encode_kitty` returns `None`, legacy `encode` applies | pass — `tests/kitty_keyboard.rs` |
+
+Deferred (negotiated and exposed, byte extensions are later slices): `ALTERNATE`, `CURSOR_POS`, `UNICODE_NAME` / `UNICODE_VALUE`, `TEXT` and `LIST` reporting [S11, S23].
 
 ## Paste
 

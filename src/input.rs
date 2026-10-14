@@ -10,6 +10,7 @@ pub mod focus;
 pub mod mouse;
 pub mod paste;
 
+use crate::engine::KittyKeyboardFlags;
 use alacritty_terminal::term::TermMode;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
@@ -169,6 +170,85 @@ pub fn encode(
         // the physical `Numpad*` scancode is still authoritative.
         Key::Unidentified(_) => keypad_key(physical, mods, modes),
     }
+}
+
+/// Encode one key event using the kitty keyboard protocol (N21b).
+///
+/// `kitty_flags` is the protocol's negotiated flag set (the top of the
+/// engine's mode stack; `KittyKeyboardFlags::NONE` = legacy mode). When
+/// the protocol is disabled the function returns `None` and the caller
+/// falls back to the legacy [`encode`]; otherwise the bytes are:
+///
+/// - the key code (2 bytes, big-endian) — always;
+/// - the event type (1 byte: 1 = down, 2 = repeat, 3 = up) — only when
+///   `REPORT_EVENTS` is negotiated;
+/// - the system modifiers (1 byte: shift = 1, ctrl = 2, alt = 4,
+///   super/logo = 8) — only when `SYSTEM` is negotiated.
+///
+/// The window layer filters to `Pressed` events, so `repeat` selects
+/// down (1) vs repeat (2); up (3) is reserved for a future release
+/// event.
+pub fn encode_kitty(
+    key: &Key,
+    physical: &PhysicalKey,
+    mods: &ModifiersState,
+    repeat: bool,
+    kitty_flags: KittyKeyboardFlags,
+) -> Option<Vec<u8>> {
+    // The encoding is physical-key driven; the logical key is accepted
+    // for API symmetry with the legacy `encode`.
+    let _ = key;
+    if kitty_flags == KittyKeyboardFlags::NONE {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+
+    // 1. The key code (2 bytes, big-endian).
+    let key_code = key_code_from_physical(physical);
+    bytes.extend_from_slice(&key_code.to_be_bytes());
+
+    // 2. The event type (1 byte), only when REPORT_EVENTS is negotiated.
+    if kitty_flags.contains(KittyKeyboardFlags::REPORT_EVENTS) {
+        let event_type = if repeat { 2 } else { 1 }; // 1 = down, 2 = repeat, 3 = up
+        bytes.push(event_type);
+    }
+
+    // 3. The system modifiers (1 byte), only when SYSTEM is negotiated.
+    if kitty_flags.contains(KittyKeyboardFlags::SYSTEM) {
+        bytes.push(system_mods_from_modifiers(mods));
+    }
+
+    Some(bytes)
+}
+
+/// The kitty key code for a physical key (N21b): the winit `KeyCode`
+/// discriminant for `Code` physicals, 0 for `Unidentified` physicals
+/// (the kitty convention for keys without a code).
+fn key_code_from_physical(physical: &PhysicalKey) -> u16 {
+    match physical {
+        PhysicalKey::Code(code) => *code as u16,
+        PhysicalKey::Unidentified(_) => 0,
+    }
+}
+
+/// The system modifier byte for a winit modifier state (N21b):
+/// shift = 1, ctrl = 2, alt = 4, super/logo = 8 (OR-combined).
+fn system_mods_from_modifiers(mods: &ModifiersState) -> u8 {
+    let mut sys_mods = 0u8;
+    if mods.shift_key() {
+        sys_mods |= 1;
+    }
+    if mods.control_key() {
+        sys_mods |= 2;
+    }
+    if mods.alt_key() {
+        sys_mods |= 4;
+    }
+    if mods.super_key() {
+        sys_mods |= 8;
+    }
+    sys_mods
 }
 
 /// N10b: prefix an `ESC` for Alt (per the N09/N10a Alt rule); Shift/Ctrl

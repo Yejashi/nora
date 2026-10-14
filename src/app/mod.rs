@@ -29,13 +29,13 @@ use self::graphics::{DrawCell, Graphics};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
-use nora::engine::Snapshot;
+use nora::engine::{KittyKeyboardFlags, Snapshot};
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
     MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event, logical_to_cell,
     mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions,
 };
-use nora::input::{BindingTable, InputAction, encode};
+use nora::input::{BindingTable, InputAction, encode, encode_kitty};
 use nora::render::policy::{clamp_grid, snapshot_is_stale};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::style::cell_style;
@@ -342,6 +342,11 @@ struct WinApp {
     /// Initialized to `SHOW_CURSOR` to match N09b's hard-coded behavior; the
     /// first pump tick corrects it to the engine's live mode within ~10 ms.
     modes: TermMode,
+    /// Live kitty keyboard protocol flags (N21b): the flag source passed
+    /// to `encode_kitty`. Initialized to `NONE` (legacy) to match the
+    /// default; the first pump tick publishes the engine's live flags
+    /// within ~10 ms.
+    kitty_flags: KittyKeyboardFlags,
     fonts: Option<glyphs::Fonts>,
     graphics: Option<Graphics>,
     window: Option<Arc<Window>>,
@@ -414,6 +419,7 @@ pub fn run_windowed(
         state: RenderState::default(),
         mods: ModifiersState::default(),
         modes: TermMode::SHOW_CURSOR,
+        kitty_flags: KittyKeyboardFlags::NONE,
         fonts: None,
         graphics: None,
         window: Some(window),
@@ -781,6 +787,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // screen, so no `request_redraw`.
                 self.modes = modes;
             }
+            AppEvent::KittyModes(flags) => {
+                // N21b: the engine's live kitty keyboard flags changed;
+                // update the flag source for `encode_kitty`. Flag
+                // changes do not dirty the screen, so no
+                // `request_redraw`.
+                self.kitty_flags = flags;
+            }
             AppEvent::Copied(text) => {
                 // N14b: the selected text was copied. N15: write it to the
                 // native clipboard (arboard-backed); the debug line stays
@@ -1072,6 +1085,23 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             "hidden"
                         }
                     );
+                    return;
+                }
+                // N21b: kitty keyboard protocol — when the application
+                // has negotiated the protocol (the engine's live flags
+                // are non-NONE), the key is encoded in the kitty byte
+                // format and sent to the PTY; the legacy `encode` is
+                // the fallback when the protocol is disabled. The
+                // window's initial `NONE` is corrected by the first
+                // pump tick's `AppEvent::KittyModes`.
+                if let Some(bytes) = encode_kitty(
+                    &event.logical_key,
+                    &event.physical_key,
+                    &self.mods,
+                    event.repeat,
+                    self.kitty_flags,
+                ) {
+                    let _ = self.pump_commands.send(PumpMsg::Input(bytes));
                     return;
                 }
                 if let Some(action) = encode(
