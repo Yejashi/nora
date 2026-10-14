@@ -10,6 +10,7 @@ pub mod config;
 pub mod dev;
 pub mod engine;
 pub mod graphics_filter;
+pub mod graphics_image;
 pub mod ime;
 pub mod input;
 pub mod layout;
