@@ -17,8 +17,29 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// A unique temporary directory for one test run.
-fn temp_dir() -> PathBuf {
+/// A unique temporary directory for one test run, removed when the test
+/// ends -- pass or fail. Without that every run leaked one: the clean-build
+/// test's is a whole ~800 MB release build, and nearly 900 of them filled
+/// the system disk during a long session (2026-10-14). A failing script's
+/// output is already in the panic message, so nothing is lost by removing
+/// the directory after a failure too.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir() -> TempDir {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before the Unix epoch")
@@ -29,7 +50,7 @@ fn temp_dir() -> PathBuf {
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    TempDir(dir)
 }
 
 /// Run one of the repository's shell scripts with a controlled
