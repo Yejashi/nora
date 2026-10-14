@@ -8,6 +8,7 @@
 pub mod clipboard;
 pub mod config;
 pub mod engine;
+pub mod ime;
 pub mod input;
 pub mod render;
 pub mod search;

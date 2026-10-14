@@ -193,6 +193,23 @@ Keep clipboard work asynchronous and bounded. OSC 52 reads and writes are disabl
 
 IME preedit is UI-only, not PTY content. Commit text once, move the candidate rectangle with cursor/pane/DPI, and cancel/transfer composition deliberately on focus change [S33]. Platform availability must be tested rather than inferred from replayed events.
 
+### IME state machine (N22a)
+
+Pure state machine in `src/ime.rs` (`nora::ime::ImeState`), headless fixtures in `tests/ime.rs`. The window layer (N22b) drives it from the platform IME events; the engine and session are untouched.
+
+| Area | v0.1 behavior | Status / proof |
+| --- | --- | --- |
+| Composition | `start_composition` activates the machine and clears any previous state; `update_preedit` replaces the preedit text | pass — `tests/ime.rs` |
+| Preedit | UI-only state (`preedit()`); displayed by the window, never sent to the PTY | pass — `tests/ime.rs` |
+| Commit | `commit` returns the composed text exactly once and deactivates the machine; the caller sends it to the PTY once | pass — `tests/ime.rs` |
+| Empty commit | Committing an active composition with no preedit and no committed text returns `None` (no bytes) | pass — `tests/ime.rs` |
+| Inactive commit | Committing while inactive returns `None` | pass — `tests/ime.rs` |
+| Cancel | `cancel` clears the active flag, preedit and committed text without sending anything | pass — `tests/ime.rs` |
+| Clear | `clear` resets all state (focus change / composition transfer) | pass — `tests/ime.rs` |
+| Dead keys / AltGr | Unaffected: they flow through the normal key/text pipeline (N10/N21 encoders) and never touch `ImeState` | pass — existing `tests/*_input.rs` encoder fixtures |
+
+Window wiring (N22b) will display the preedit as UI state and route each commit through the ordered writer exactly once; dead keys and AltGr remain usable through the legacy/kitty encoders unchanged.
+
 ## TERM and terminfo
 
 Start the development slice with `TERM=xterm-256color` only after testing its relevant advertised behavior. Document it as an initial compatibility choice, not a proof of complete xterm emulation. `COLORTERM=truecolor` can advertise validated truecolor. Never set `TERM=xterm-kitty` for branding.
