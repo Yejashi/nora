@@ -27,7 +27,7 @@ fn history_limit() {
 #[test]
 fn extra_cells_limit() {
     let mut engine = Engine::new(24, 80);
-    
+
     // The engine's snapshot contains cells with zerowidth vectors.
     // These are bounded by the input (the terminal only emits combining
     // marks that follow a base character).
@@ -60,7 +60,7 @@ fn control_string_limit() {
 #[test]
 fn hyperlink_limit() {
     let mut engine = Engine::new(24, 80);
-    
+
     // The engine's snapshot contains cells with optional hyperlinks.
     // These are bounded by the terminal protocol (OSC 8).
     let snap = engine.snapshot();

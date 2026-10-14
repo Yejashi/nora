@@ -1,4 +1,16 @@
-# nora: terminal implementation guide
+# nora
+
+A fast, efficient, maintainable desktop terminal for Linux, written in Rust,
+with native Wayland and X11 support.
+
+## v0.1 Release Notes
+
+All 30 feature cards (N00-N30) are complete: terminal engine, PTY sessions,
+windowed and headless rendering, tabs/splits, search, selection, clipboard,
+configuration, benchmarks and release packaging. See
+[docs/13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) for the v0.1
+acceptance assessment (compatibility, performance, resources, known
+limitations).
 
 Research snapshot: 10 October 2026. This is an implementation plan, not a working terminal or a benchmark result.
 
