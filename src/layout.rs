@@ -52,7 +52,7 @@ impl Default for LayoutNode {
 }
 
 /// The layout tree: owns all panes and their arrangement.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Layout {
     /// The root of the layout tree.
     root: LayoutNode,
@@ -215,11 +215,24 @@ impl Layout {
         self.active_pane
     }
 
+    /// The root of the layout tree (N24b).
+    pub fn root(&self) -> &LayoutNode {
+        &self.root
+    }
+
     /// Get all live panes, in ascending ID order (deterministic).
     pub fn panes(&self) -> Vec<PaneId> {
         let mut ids: Vec<PaneId> = self.panes.keys().copied().collect();
         ids.sort();
         ids
+    }
+
+    /// Whether `id` is a live pane in this layout (N24b).
+    ///
+    /// Used to ignore stale events: an event tagged with a pane that has
+    /// already been closed (or never existed) is dropped, never routed.
+    pub fn has_pane(&self, id: PaneId) -> bool {
+        self.panes.contains_key(&id)
     }
 
     /// Get the number of live panes.

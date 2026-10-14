@@ -73,97 +73,117 @@ fn debug_enabled() -> bool {
     std::env::var_os("NORA_DEBUG").is_some()
 }
 
+/// A pane's identity (N24b): its tab and its position within that tab's
+/// layout. The pump owns one session per pane, so a pane is addressed by
+/// both parts — two tabs may each have a `PaneId(0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaneKey {
+    pub tab: TabId,
+    pub pane: crate::layout::PaneId,
+}
+
+impl PaneKey {
+    /// The first pane of the first tab (the initial session).
+    pub fn first() -> Self {
+        Self {
+            tab: TabId(0),
+            pane: crate::layout::PaneId(0),
+        }
+    }
+}
+
 /// Window-loop events from the pump thread (the ONLY pump→window protocol).
 ///
-/// Every event is tagged with the [`TabId`] it belongs to (N23b); the window
-/// routes it to that tab and ignores events for a tab that no longer exists
-/// (stale).
+/// Every event is tagged with the [`PaneKey`] it belongs to (N24b); the
+/// window routes it to that pane and ignores events for a pane that no
+/// longer exists (stale).
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    /// The pump fetched a snapshot for `tab` (stored in that tab's slot);
-    /// non-noop damage.
-    DirtyPulse { tab: TabId },
-    /// The session child for `tab` exited (exit code, or None if the loop
-    /// died without one).
-    ChildExit { tab: TabId, status: Option<i32> },
-    /// The engine's live `TermMode` for `tab` changed (N10b); the window
-    /// updates that tab's `encode` mode source.
-    Modes { tab: TabId, modes: TermMode },
-    /// The engine's live kitty keyboard flags for `tab` changed (N21b); the
-    /// window updates that tab's `encode_kitty` flag source.
+    /// The pump fetched a snapshot for the pane (stored in that pane's
+    /// slot); non-noop damage.
+    DirtyPulse { pane: PaneKey },
+    /// The session child for the pane exited (exit code, or None if the
+    /// loop died without one).
+    ChildExit { pane: PaneKey, status: Option<i32> },
+    /// The engine's live `TermMode` for the pane changed (N10b); the window
+    /// updates that pane's `encode` mode source.
+    Modes { pane: PaneKey, modes: TermMode },
+    /// The engine's live kitty keyboard flags for the pane changed (N21b);
+    /// the window updates that pane's `encode_kitty` flag source.
     KittyModes {
-        tab: TabId,
+        pane: PaneKey,
         flags: KittyKeyboardFlags,
     },
-    /// The selected text for `tab` was copied (N14b); the window thread
+    /// The selected text for the pane was copied (N14b); the window thread
     /// copies it to the clipboard (or debug-prints it for now).
-    Copied { tab: TabId, text: String },
-    /// A new tab's session is ready (N23b); the window may now route input
+    Copied { pane: PaneKey, text: String },
+    /// A new pane's session is ready (N24b); the window may now route input
     /// to it.
-    TabReady { tab: TabId },
-    /// A tab's session was reaped (N23b); the window drops the tab's state.
-    TabGone { tab: TabId },
+    PaneReady { pane: PaneKey },
+    /// A pane's session was reaped (N24b); the window drops the pane's
+    /// state.
+    PaneGone { pane: PaneKey },
 }
 
 /// Window→pump message.
 ///
-/// Every message is tagged with the [`TabId`] it targets (N23b); the pump
-/// routes it to that tab's session, so active input never reaches another
-/// tab.
+/// Every message is tagged with the [`PaneKey`] it targets (N24b); the pump
+/// routes it to that pane's session, so active input never reaches another
+/// pane (and never another tab).
 pub enum PumpMsg {
-    /// Resize the PTY session for `tab` to (rows, cols) and re-pump.
+    /// Resize the PTY session for the pane to (rows, cols) and re-pump.
     Resize {
-        tab: TabId,
+        pane: PaneKey,
         rows: usize,
         cols: usize,
     },
-    /// Encoded keystroke bytes for `tab`; window→PTY, ordered after earlier
-    /// messages.
-    Input { tab: TabId, bytes: Vec<u8> },
-    /// Scroll the engine's viewport for `tab` (N14a); applied on the next
-    /// tick.
-    Scroll { tab: TabId, scroll: Scroll },
+    /// Encoded keystroke bytes for the pane; window→PTY, ordered after
+    /// earlier messages.
+    Input { pane: PaneKey, bytes: Vec<u8> },
+    /// Scroll the engine's viewport for the pane (N14a); applied on the
+    /// next tick.
+    Scroll { pane: PaneKey, scroll: Scroll },
     /// Select the viewport range
-    /// `(start_row, start_col, end_row, end_col)` for `tab` (N14b); applied
-    /// on the next tick.
+    /// `(start_row, start_col, end_row, end_col)` for the pane (N14b);
+    /// applied on the next tick.
     Select {
-        tab: TabId,
+        pane: PaneKey,
         start_row: usize,
         start_col: usize,
         end_row: usize,
         end_col: usize,
     },
-    /// Clear the selection for `tab` (N14b); applied on the next tick.
-    ClearSelection { tab: TabId },
-    /// Copy the selection for `tab` and emit [`AppEvent::Copied`] (N14b);
-    /// applied on the next tick.
-    Copy { tab: TabId },
-    /// A paste operation for `tab` (N17b): validated by the pure paste
+    /// Clear the selection for the pane (N14b); applied on the next tick.
+    ClearSelection { pane: PaneKey },
+    /// Copy the selection for the pane and emit [`AppEvent::Copied`]
+    /// (N14b); applied on the next tick.
+    Copy { pane: PaneKey },
+    /// A paste operation for the pane (N17b): validated by the pure paste
     /// policy (size cap, bracketed paste markers, newline normalization)
-    /// and queued into the tab's pending input, streamed to the PTY in
+    /// and queued into the pane's pending input, streamed to the PTY in
     /// order with the keystrokes, bounded by the writer's app cap.
     Paste {
-        tab: TabId,
+        pane: PaneKey,
         /// The paste text (raw, before validation).
         text: String,
         /// Whether bracketed paste mode is active (the engine's live
         /// `TermMode::BRACKETED_PASTE`).
         bracketed: bool,
     },
-    /// Cancel the in-flight paste for `tab` (N17b): the not-yet-fed paste
-    /// bytes are dropped; keystrokes are unaffected.
-    CancelPaste { tab: TabId },
-    /// Spawn a new session for `tab` (N23b); the pump uses its launch spec
-    /// and the tab's slot.
-    NewTab {
-        tab: TabId,
+    /// Cancel the in-flight paste for the pane (N17b): the not-yet-fed
+    /// paste bytes are dropped; keystrokes are unaffected.
+    CancelPaste { pane: PaneKey },
+    /// Spawn a new session for the pane (N24b); the pump uses its launch
+    /// spec and the pane's slot.
+    NewPane {
+        pane: PaneKey,
         rows: usize,
         cols: usize,
         slot: Arc<Mutex<Option<Snapshot>>>,
     },
-    /// Reap (close) the session for `tab` (N23b); the pump sends
-    /// [`AppEvent::TabGone`].
-    CloseTab { tab: TabId },
+    /// Reap (close) the session for the pane (N24b); the pump sends
+    /// [`AppEvent::PaneGone`].
+    ClosePane { pane: PaneKey },
 }
 
 /// The outcome of applying a paste to the pump's input state (N17b).
@@ -265,12 +285,12 @@ pub fn feed_pending(
     fed
 }
 
-/// Per-tab pump state (N23b): the session and its in-flight input/paste
-/// state, so each tab's input is routed to its own session and never
-/// reaches another tab.
-struct TabPump {
+/// Per-pane pump state (N24b): the session and its in-flight input/paste
+/// state, so each pane's input is routed to its own session and never
+/// reaches another pane (and never another tab).
+struct PanePump {
     session: PtySession,
-    /// Pending input bytes for this tab (N09b/N17b).
+    /// Pending input bytes for this pane (N09b/N17b).
     pending_input: Vec<u8>,
     /// The in-flight paste block within `pending_input`, as a half-open
     /// byte range `[start, end)` (N17b); `None` when no paste is in flight.
@@ -281,7 +301,7 @@ struct TabPump {
     /// The last published engine kitty keyboard flags (N21b); `None` until
     /// the first tick, so the first tick always publishes.
     last_kitty: Option<KittyKeyboardFlags>,
-    /// Whether this tab's session has terminated and is draining (N12a).
+    /// Whether this pane's session has terminated and is draining (N12a).
     draining: bool,
     /// The drain deadline (N12a); `None` when not draining.
     drain_deadline: Option<Instant>,
@@ -289,7 +309,7 @@ struct TabPump {
     exit_status: Option<ExitStatus>,
 }
 
-impl TabPump {
+impl PanePump {
     fn new(session: PtySession) -> Self {
         Self {
             session,
@@ -304,27 +324,27 @@ impl TabPump {
     }
 }
 
-/// Tick one tab's session (N23b): run its N12a drain state machine, store +
+/// Tick one pane's session (N24b): run its N12a drain state machine, store +
 /// pulse a snapshot on non-noop damage, and publish its modes/kitty flags on
-/// change. Returns `false` when the tab's session has been fully drained
+/// change. Returns `false` when the pane's session has been fully drained
 /// and closed (the caller removes it).
-fn tick_tab(
-    tab: TabId,
-    tab_pump: &mut TabPump,
+fn tick_pane(
+    pane: PaneKey,
+    pane_pump: &mut PanePump,
     slot: &Arc<Mutex<Option<Snapshot>>>,
     events: &winit::event_loop::EventLoopProxy<AppEvent>,
 ) -> bool {
-    if tab_pump.draining {
+    if pane_pump.draining {
         // N12a drain mode: the session loop thread is still finishing (the
         // pinned `drain_on_exit` read). Wait, then probe + snapshot only —
         // no input, no resize — until the loop thread finished or
         // `DRAIN_TIMEOUT` elapsed. A snapshot is fetched only when the
         // damage is not the pinned no-op shape (the final frame).
-        let finished = tab_pump.session.wait_drain(Duration::from_millis(10));
+        let finished = pane_pump.session.wait_drain(Duration::from_millis(10));
         let stored = {
-            let (damage, cursor) = tab_pump.session.engine().probe();
+            let (damage, cursor) = pane_pump.session.engine().probe();
             if !is_noop_damage(&damage, cursor) {
-                let snapshot = tab_pump.session.engine().snapshot();
+                let snapshot = pane_pump.session.engine().snapshot();
                 let (rows, cols) = (snapshot.rows, snapshot.cols);
                 *slot.lock().unwrap() = Some(snapshot);
                 if debug_enabled() {
@@ -336,33 +356,33 @@ fn tick_tab(
             }
         };
         if stored {
-            let _ = events.send_event(AppEvent::DirtyPulse { tab });
+            let _ = events.send_event(AppEvent::DirtyPulse { pane });
         }
-        let timed_out = tab_pump
+        let timed_out = pane_pump
             .drain_deadline
             .map(|deadline| Instant::now() >= deadline)
             .unwrap_or(false);
         if finished || timed_out {
-            let status = tab_pump.exit_status.and_then(|status| status.code());
-            let _ = events.send_event(AppEvent::ChildExit { tab, status });
-            tab_pump.session.close();
+            let status = pane_pump.exit_status.and_then(|status| status.code());
+            let _ = events.send_event(AppEvent::ChildExit { pane, status });
+            pane_pump.session.close();
             return false;
         }
         return true;
     }
 
-    let outcome = pump_tick(&mut tab_pump.session);
+    let outcome = pump_tick(&mut pane_pump.session);
 
     if outcome.terminated {
         // N06b: surface the last title set by the child, on stderr, before
         // the loop folds `ChildExited`. Enter drain mode (N12a); the drain
         // frame is probed on the next tick.
-        if let Some(title) = tab_pump.session.title() {
+        if let Some(title) = pane_pump.session.title() {
             eprintln!("title: {title}");
         }
-        tab_pump.draining = true;
-        tab_pump.drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
-        tab_pump.exit_status = outcome.status;
+        pane_pump.draining = true;
+        pane_pump.drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
+        pane_pump.exit_status = outcome.status;
         return true;
     }
 
@@ -372,26 +392,26 @@ fn tick_tab(
         if debug_enabled() {
             eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
         }
-        let _ = events.send_event(AppEvent::DirtyPulse { tab });
+        let _ = events.send_event(AppEvent::DirtyPulse { pane });
     }
 
     // N10b: publish the engine's live `TermMode` on change. `TermMode` is
     // `Copy`, so the engine guard is dropped before the channel send —
     // never held across it.
-    let modes = tab_pump.session.engine().modes();
-    if tab_pump.last_modes != Some(modes) {
-        tab_pump.last_modes = Some(modes);
-        let _ = events.send_event(AppEvent::Modes { tab, modes });
+    let modes = pane_pump.session.engine().modes();
+    if pane_pump.last_modes != Some(modes) {
+        pane_pump.last_modes = Some(modes);
+        let _ = events.send_event(AppEvent::Modes { pane, modes });
     }
 
     // N21b: publish the engine's live kitty keyboard flags on change.
     // `KittyKeyboardFlags` is `Copy`, so the engine guard is dropped
     // before the channel send — never held across it.
-    let kitty_flags = tab_pump.session.engine().kitty_mode();
-    if tab_pump.last_kitty != Some(kitty_flags) {
-        tab_pump.last_kitty = Some(kitty_flags);
+    let kitty_flags = pane_pump.session.engine().kitty_mode();
+    if pane_pump.last_kitty != Some(kitty_flags) {
+        pane_pump.last_kitty = Some(kitty_flags);
         let _ = events.send_event(AppEvent::KittyModes {
-            tab,
+            pane,
             flags: kitty_flags,
         });
     }
@@ -399,21 +419,24 @@ fn tick_tab(
     true
 }
 
-/// Bounded pump thread: owns one session per tab (N23b); ticks until stopped.
+/// Bounded pump thread: owns one session per pane (N24b); ticks until
+/// stopped.
 ///
-/// Each tick: (1) [`tick_tab`] for every tab — drain its events, store +
+/// Each tick: (1) [`tick_pane`] for every pane — drain its events, store +
 /// pulse a snapshot on non-noop damage, publish its modes/kitty flags, and
-/// run its N12a drain state machine; (2) remove fully-drained tabs and send
-/// [`AppEvent::TabGone`]; (3) drain [`PumpMsg`] commands, routing each to
-/// its tab's session (spawn a new session on [`PumpMsg::NewTab`], reap one on
-/// [`PumpMsg::CloseTab`]); (4) feed each tab's pending input in order
-/// (bounded by the writer's app cap) and flush up to the app cap per tick;
-/// (5) if `stop` is set: close every session and break; else sleep 10 ms.
+/// run its N12a drain state machine; (2) remove fully-drained panes and
+/// send [`AppEvent::PaneGone`]; (3) drain [`PumpMsg`] commands, routing each
+/// to its pane's session (spawn a new session on [`PumpMsg::NewPane`], reap
+/// one on [`PumpMsg::ClosePane`]); (4) feed each pane's pending input in
+/// order (bounded by the writer's app cap) and flush up to the app cap per
+/// tick; (5) if `stop` is set: close every session and break; else sleep
+/// 10 ms.
 ///
-/// Each tab's input is routed to its own session, so active input never
-/// reaches another tab; closing a tab reaps its session.
+/// Each pane's input is routed to its own session, so active input never
+/// reaches another pane (and never another tab); closing a pane reaps its
+/// session.
 pub fn pump_thread(
-    first_tab: TabId,
+    first_pane: PaneKey,
     first_session: PtySession,
     first_slot: Arc<Mutex<Option<Snapshot>>>,
     spec: LaunchSpec,
@@ -421,84 +444,84 @@ pub fn pump_thread(
     commands: mpsc::Receiver<PumpMsg>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut sessions: HashMap<TabId, TabPump> = HashMap::new();
-    let mut slots: HashMap<TabId, Arc<Mutex<Option<Snapshot>>>> = HashMap::new();
-    sessions.insert(first_tab, TabPump::new(first_session));
-    slots.insert(first_tab, first_slot);
+    let mut sessions: HashMap<PaneKey, PanePump> = HashMap::new();
+    let mut slots: HashMap<PaneKey, Arc<Mutex<Option<Snapshot>>>> = HashMap::new();
+    sessions.insert(first_pane, PanePump::new(first_session));
+    slots.insert(first_pane, first_slot);
 
     loop {
-        // (1) Tick every tab; collect the ones that finished draining.
+        // (1) Tick every pane; collect the ones that finished draining.
         let mut removed = Vec::new();
         {
-            for (tab, tab_pump) in sessions.iter_mut() {
-                if !tick_tab(*tab, tab_pump, &slots[tab], &events) {
-                    removed.push(*tab);
+            for (pane, pane_pump) in sessions.iter_mut() {
+                if !tick_pane(*pane, pane_pump, &slots[pane], &events) {
+                    removed.push(*pane);
                 }
             }
         }
-        for tab in removed {
-            sessions.remove(&tab);
-            slots.remove(&tab);
-            let _ = events.send_event(AppEvent::TabGone { tab });
+        for pane in removed {
+            sessions.remove(&pane);
+            slots.remove(&pane);
+            let _ = events.send_event(AppEvent::PaneGone { pane });
         }
 
-        // (2) Drain commands, routing each to its tab's session.
+        // (2) Drain commands, routing each to its pane's session.
         while let Ok(msg) = commands.try_recv() {
             match msg {
-                PumpMsg::NewTab {
-                    tab,
+                PumpMsg::NewPane {
+                    pane,
                     rows,
                     cols,
                     slot,
                 } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: new tab {tab:?} {rows}x{cols}");
+                        eprintln!("debug: pump: new pane {pane:?} {rows}x{cols}");
                     }
                     match PtySession::spawn(spec.clone(), rows, cols, super::pty::DEFAULT_CAP) {
                         Ok(session) => {
-                            sessions.insert(tab, TabPump::new(session));
-                            slots.insert(tab, slot);
-                            let _ = events.send_event(AppEvent::TabReady { tab });
+                            sessions.insert(pane, PanePump::new(session));
+                            slots.insert(pane, slot);
+                            let _ = events.send_event(AppEvent::PaneReady { pane });
                         }
                         Err(err) => {
-                            eprintln!("nora: failed to spawn tab {tab:?}: {err:?}");
-                            let _ = events.send_event(AppEvent::TabGone { tab });
+                            eprintln!("nora: failed to spawn pane {pane:?}: {err:?}");
+                            let _ = events.send_event(AppEvent::PaneGone { pane });
                         }
                     }
                 }
-                PumpMsg::CloseTab { tab } => {
+                PumpMsg::ClosePane { pane } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: close tab {tab:?}");
+                        eprintln!("debug: pump: close pane {pane:?}");
                     }
-                    if let Some(mut tab_pump) = sessions.remove(&tab) {
-                        tab_pump.session.close();
-                        slots.remove(&tab);
-                        let _ = events.send_event(AppEvent::TabGone { tab });
+                    if let Some(mut pane_pump) = sessions.remove(&pane) {
+                        pane_pump.session.close();
+                        slots.remove(&pane);
+                        let _ = events.send_event(AppEvent::PaneGone { pane });
                     }
                 }
-                PumpMsg::Resize { tab, rows, cols } => {
+                PumpMsg::Resize { pane, rows, cols } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: resize {tab:?} {rows}x{cols}");
+                        eprintln!("debug: pump: resize {pane:?} {rows}x{cols}");
                     }
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
-                        tab_pump.session.resize(rows as u16, cols as u16);
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.session.resize(rows as u16, cols as u16);
                     }
                 }
-                PumpMsg::Input { tab, bytes } => {
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
-                        tab_pump.pending_input.extend(bytes);
+                PumpMsg::Input { pane, bytes } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.pending_input.extend(bytes);
                     }
                 }
-                PumpMsg::Scroll { tab, scroll } => {
+                PumpMsg::Scroll { pane, scroll } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: scroll {tab:?} {scroll:?}");
+                        eprintln!("debug: pump: scroll {pane:?} {scroll:?}");
                     }
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
-                        tab_pump.session.engine().scroll(scroll);
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.session.engine().scroll(scroll);
                     }
                 }
                 PumpMsg::Select {
-                    tab,
+                    pane,
                     start_row,
                     start_col,
                     end_row,
@@ -506,43 +529,43 @@ pub fn pump_thread(
                 } => {
                     if debug_enabled() {
                         eprintln!(
-                            "debug: pump: select {tab:?} ({start_row},{start_col})..({end_row},{end_col})"
+                            "debug: pump: select {pane:?} ({start_row},{start_col})..({end_row},{end_col})"
                         );
                     }
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
-                        tab_pump
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump
                             .session
                             .engine()
                             .select((start_row, start_col), (end_row, end_col));
                     }
                 }
-                PumpMsg::ClearSelection { tab } => {
+                PumpMsg::ClearSelection { pane } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: clear selection {tab:?}");
+                        eprintln!("debug: pump: clear selection {pane:?}");
                     }
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
-                        tab_pump.session.engine().clear_selection();
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.session.engine().clear_selection();
                     }
                 }
-                PumpMsg::Copy { tab } => {
-                    if let Some(tab_pump) = sessions.get_mut(&tab)
-                        && let Some(text) = tab_pump.session.engine().copy_selection()
+                PumpMsg::Copy { pane } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane)
+                        && let Some(text) = pane_pump.session.engine().copy_selection()
                     {
                         if debug_enabled() {
                             eprintln!("debug: pump: copied {} byte(s)", text.len());
                         }
-                        let _ = events.send_event(AppEvent::Copied { tab, text });
+                        let _ = events.send_event(AppEvent::Copied { pane, text });
                     }
                 }
                 PumpMsg::Paste {
-                    tab,
+                    pane,
                     text,
                     bracketed,
                 } => {
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
                         let applied = apply_paste(
-                            &mut tab_pump.pending_input,
-                            &mut tab_pump.paste_block,
+                            &mut pane_pump.pending_input,
+                            &mut pane_pump.paste_block,
                             &text,
                             bracketed,
                         );
@@ -562,10 +585,10 @@ pub fn pump_thread(
                         }
                     }
                 }
-                PumpMsg::CancelPaste { tab } => {
-                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                PumpMsg::CancelPaste { pane } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
                         let dropped =
-                            cancel_paste(&mut tab_pump.pending_input, &mut tab_pump.paste_block);
+                            cancel_paste(&mut pane_pump.pending_input, &mut pane_pump.paste_block);
                         if debug_enabled() {
                             eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
                         }
@@ -574,19 +597,19 @@ pub fn pump_thread(
             }
         }
 
-        // (3) Feed each tab's pending input in order (bounded by the
+        // (3) Feed each pane's pending input in order (bounded by the
         // writer's app cap) and flush up to the app cap per tick. Draining
-        // tabs get no new input (the child is exiting), but are still
+        // panes get no new input (the child is exiting), but are still
         // flushed to forward any final ledger replies.
-        for (_tab, tab_pump) in sessions.iter_mut() {
-            if !tab_pump.draining {
+        for (_pane, pane_pump) in sessions.iter_mut() {
+            if !pane_pump.draining {
                 feed_pending(
-                    &mut tab_pump.session,
-                    &mut tab_pump.pending_input,
-                    &mut tab_pump.paste_block,
+                    &mut pane_pump.session,
+                    &mut pane_pump.pending_input,
+                    &mut pane_pump.paste_block,
                 );
             }
-            let _ = tab_pump.session.flush(1024 * 1024);
+            let _ = pane_pump.session.flush(1024 * 1024);
         }
 
         if stop.load(Ordering::Relaxed) {
@@ -594,8 +617,8 @@ pub fn pump_thread(
             // `PeekableReceiver::recv` when its sender is dropped
             // without `Msg::Shutdown` (alacritty_terminal 0.26.0
             // event_loop.rs:483-488); `close()` sends it.
-            for tab_pump in sessions.values_mut() {
-                tab_pump.session.close();
+            for pane_pump in sessions.values_mut() {
+                pane_pump.session.close();
             }
             break;
         }

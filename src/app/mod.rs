@@ -36,10 +36,11 @@ use nora::input::mouse::{
     mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions,
 };
 use nora::input::{BindingTable, InputAction, encode, encode_kitty};
-use nora::render::policy::{clamp_grid, snapshot_is_stale};
+use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
+use nora::render::policy::snapshot_is_stale;
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::style::cell_style;
-use nora::session::pump::{AppEvent, PumpMsg};
+use nora::session::pump::{AppEvent, PaneKey, PumpMsg};
 use nora::workspace::{TabId, Workspace};
 
 /// Fixed smoke-test resize target, in logical pixels.
@@ -144,6 +145,77 @@ pub(crate) fn window_grid(window: &Window, fonts: &glyphs::Fonts) -> (u16, u16) 
         fonts.cell_w,
         fonts.cell_h(),
     )
+}
+
+/// The direction to focus an adjacent pane (N24b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Whether `node`'s subtree contains `pane` (N24b).
+fn contains_pane(node: &LayoutNode, pane: PaneId) -> bool {
+    match node {
+        LayoutNode::Leaf(id) => *id == pane,
+        LayoutNode::Split { first, second, .. } => {
+            contains_pane(first, pane) || contains_pane(second, pane)
+        }
+    }
+}
+
+/// The first leaf of `node` in pre-order (N24b): the leftmost/topmost pane.
+fn first_leaf(node: &LayoutNode) -> Option<PaneId> {
+    match node {
+        LayoutNode::Leaf(id) => Some(*id),
+        LayoutNode::Split { first, .. } => first_leaf(first),
+    }
+}
+
+/// Find the pane adjacent to `active` in `dir` (N24b), walking the layout
+/// tree. Returns `None` when the active pane is at the edge in that
+/// direction (no adjacent pane). For a split whose sibling is itself a
+/// split, the sibling's first leaf (pre-order) is chosen.
+fn adjacent_pane(node: &LayoutNode, active: PaneId, dir: FocusDir) -> Option<PaneId> {
+    match node {
+        LayoutNode::Leaf(_) => None,
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => {
+            let first_has = contains_pane(first, active);
+            let second_has = contains_pane(second, active);
+            match (first_has, second_has) {
+                (true, false) => {
+                    if matches!(
+                        (dir, direction),
+                        (FocusDir::Right, SplitDirection::Horizontal)
+                            | (FocusDir::Down, SplitDirection::Vertical)
+                    ) {
+                        first_leaf(second)
+                    } else {
+                        adjacent_pane(first, active, dir)
+                    }
+                }
+                (false, true) => {
+                    if matches!(
+                        (dir, direction),
+                        (FocusDir::Left, SplitDirection::Horizontal)
+                            | (FocusDir::Up, SplitDirection::Vertical)
+                    ) {
+                        first_leaf(first)
+                    } else {
+                        adjacent_pane(second, active, dir)
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -393,31 +465,43 @@ struct WinApp {
     /// the preedit is UI-only state and each commit is sent to the PTY
     /// exactly once.
     ime: nora::ime::ImeState,
-    /// The workspace (N23b): owns all tabs and panes.
+    /// The workspace (N23b): owns all tabs and focus.
     workspace: Workspace,
-    /// Per-tab snapshot slots (N23b): the pump stores each tab's latest
-    /// snapshot here; `attempt_render` reads the active tab's slot.
-    tab_slots: std::collections::HashMap<TabId, Arc<Mutex<Option<Snapshot>>>>,
-    /// Per-tab grid (N23b): the last grid sent to the pump as
-    /// `PumpMsg::Resize` for that tab; `(0, 0)` = never sent.
-    tab_grid: std::collections::HashMap<TabId, (u16, u16)>,
-    /// Per-tab child exit status (N23b): the pump's `ChildExit` payload once
-    /// delivered for that tab (`None` = not yet delivered).
-    tab_exit: std::collections::HashMap<TabId, Option<Option<i32>>>,
-    /// Per-tab render state machine (N23b): `DirtyPulse`/`ChildExit` fold
-    /// into the tab's own state.
-    tab_render: std::collections::HashMap<TabId, RenderState>,
-    /// Per-tab IME state machine (N23b): each tab's preedit/commit is
+    /// N24b: the active tab's layout (owns that tab's panes and their
+    /// arrangement); one layout per tab, mirrored into `tab_layouts`.
+    layout: nora::layout::Layout,
+    /// N24b: one layout per tab; switching tabs swaps the active `layout`
+    /// without touching the pump.
+    tab_layouts: std::collections::HashMap<TabId, nora::layout::Layout>,
+    /// N24b: one snapshot slot per pane; the pump stores each pane's latest
+    /// snapshot here; `attempt_render` reads the active pane's slot.
+    pane_slots: std::collections::HashMap<PaneKey, Arc<Mutex<Option<Snapshot>>>>,
+    /// N24b: the last grid sent to the pump as `PumpMsg::Resize` for that
+    /// pane; `(0, 0)` = never sent.
+    pane_grid: std::collections::HashMap<PaneKey, (u16, u16)>,
+    /// N24b: the pump's `ChildExit` payload once delivered for that pane
+    /// (`None` = not yet delivered).
+    pane_exit: std::collections::HashMap<PaneKey, Option<Option<i32>>>,
+    /// N24b: per-pane render state machine; `DirtyPulse`/`ChildExit` fold
+    /// into the pane's own state.
+    pane_render: std::collections::HashMap<PaneKey, RenderState>,
+    /// N24b: per-pane IME state machine; each pane's preedit/commit is
     /// independent.
-    tab_ime: std::collections::HashMap<TabId, nora::ime::ImeState>,
-    /// Per-tab search UI (N23b): each tab's search is independent.
-    tab_search: std::collections::HashMap<TabId, nora::search::SearchUi>,
-    /// Per-tab live terminal `TermMode` (N10b/N23b): the mode source passed
-    /// to `encode` for that tab.
-    tab_modes: std::collections::HashMap<TabId, TermMode>,
-    /// Per-tab live kitty keyboard flags (N21b/N23b): the flag source passed
-    /// to `encode_kitty` for that tab.
-    tab_kitty: std::collections::HashMap<TabId, KittyKeyboardFlags>,
+    pane_ime: std::collections::HashMap<PaneKey, nora::ime::ImeState>,
+    /// N24b: per-pane search UI; each pane's search is independent.
+    pane_search: std::collections::HashMap<PaneKey, nora::search::SearchUi>,
+    /// N24b: per-pane live terminal `TermMode` (N10b); the mode source
+    /// passed to `encode` for that pane.
+    pane_modes: std::collections::HashMap<PaneKey, TermMode>,
+    /// N24b: per-pane live kitty keyboard flags (N21b); the flag source
+    /// passed to `encode_kitty` for that pane.
+    pane_kitty: std::collections::HashMap<PaneKey, KittyKeyboardFlags>,
+    /// N24b: per-pane selection drag start (N14b); each pane's selection is
+    /// independent.
+    pane_selection: std::collections::HashMap<PaneKey, Option<(usize, usize)>>,
+    /// N24b: per-pane visible-area character snapshot (N20b); each pane's
+    /// search is bounded to its own visible area.
+    pane_last_visible: std::collections::HashMap<PaneKey, Vec<Vec<char>>>,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -442,27 +526,37 @@ pub fn run_windowed(
         "debug: config loaded: history={}, font.size={}",
         config.terminal.history, config.font.size
     );
-    // N23b: the workspace owns all tabs; the window's first tab is `TabId(0)`,
-    // matching the pump's first session. Its slot is the shared `slot` Arc,
-    // so the pump's writes are visible to `attempt_render`.
+    // N23b/N24b: the workspace owns all tabs; the window's first tab is
+    // `TabId(0)` with a single-pane layout, matching the pump's first
+    // session (`PaneKey::first()`). Its slot is the shared `slot` Arc, so
+    // the pump's writes are visible to `attempt_render`.
     let mut workspace = Workspace::new();
     let (first_tab, _first_pane) = workspace.add_tab();
-    let mut tab_slots = std::collections::HashMap::new();
-    tab_slots.insert(first_tab, slot.clone());
-    let mut tab_grid = std::collections::HashMap::new();
-    tab_grid.insert(first_tab, (0, 0));
-    let mut tab_exit = std::collections::HashMap::new();
-    tab_exit.insert(first_tab, None);
-    let mut tab_render = std::collections::HashMap::new();
-    tab_render.insert(first_tab, RenderState::default());
-    let mut tab_ime = std::collections::HashMap::new();
-    tab_ime.insert(first_tab, nora::ime::ImeState::new());
-    let mut tab_search = std::collections::HashMap::new();
-    tab_search.insert(first_tab, nora::search::SearchUi::new());
-    let mut tab_modes = std::collections::HashMap::new();
-    tab_modes.insert(first_tab, TermMode::SHOW_CURSOR);
-    let mut tab_kitty = std::collections::HashMap::new();
-    tab_kitty.insert(first_tab, KittyKeyboardFlags::NONE);
+    let first_pane = PaneKey::first();
+    // The active tab's layout: one pane, matching `first_pane`.
+    let layout = Layout::new();
+    let mut tab_layouts = std::collections::HashMap::new();
+    tab_layouts.insert(first_tab, layout.clone());
+    let mut pane_slots = std::collections::HashMap::new();
+    pane_slots.insert(first_pane, slot.clone());
+    let mut pane_grid = std::collections::HashMap::new();
+    pane_grid.insert(first_pane, (0, 0));
+    let mut pane_exit = std::collections::HashMap::new();
+    pane_exit.insert(first_pane, None);
+    let mut pane_render = std::collections::HashMap::new();
+    pane_render.insert(first_pane, RenderState::default());
+    let mut pane_ime = std::collections::HashMap::new();
+    pane_ime.insert(first_pane, nora::ime::ImeState::new());
+    let mut pane_search = std::collections::HashMap::new();
+    pane_search.insert(first_pane, nora::search::SearchUi::new());
+    let mut pane_modes = std::collections::HashMap::new();
+    pane_modes.insert(first_pane, TermMode::SHOW_CURSOR);
+    let mut pane_kitty = std::collections::HashMap::new();
+    pane_kitty.insert(first_pane, KittyKeyboardFlags::NONE);
+    let mut pane_selection = std::collections::HashMap::new();
+    pane_selection.insert(first_pane, None);
+    let mut pane_last_visible = std::collections::HashMap::new();
+    pane_last_visible.insert(first_pane, Vec::new());
 
     let mut app = WinApp {
         slot,
@@ -489,14 +583,18 @@ pub fn run_windowed(
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
         workspace,
-        tab_slots,
-        tab_grid,
-        tab_exit,
-        tab_render,
-        tab_ime,
-        tab_search,
-        tab_modes,
-        tab_kitty,
+        layout,
+        tab_layouts,
+        pane_slots,
+        pane_grid,
+        pane_exit,
+        pane_render,
+        pane_ime,
+        pane_search,
+        pane_modes,
+        pane_kitty,
+        pane_selection,
+        pane_last_visible,
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -533,74 +631,145 @@ impl WinApp {
         self.workspace.active_tab()
     }
 
-    /// Initialize a new tab's per-tab state (N23b).
-    fn init_tab_state(&mut self, tab: TabId) {
-        self.tab_grid.insert(tab, (0, 0));
-        self.tab_exit.insert(tab, None);
-        self.tab_render.insert(tab, RenderState::default());
-        self.tab_ime.insert(tab, nora::ime::ImeState::new());
-        self.tab_search.insert(tab, nora::search::SearchUi::new());
-        self.tab_modes.insert(tab, TermMode::SHOW_CURSOR);
-        self.tab_kitty.insert(tab, KittyKeyboardFlags::NONE);
+    /// The active pane's key (N24b): the active tab's active pane. `None`
+    /// when the active tab has no live panes (its layout is empty).
+    fn active_pane_key(&self) -> Option<PaneKey> {
+        let tab = self.active_tab_id()?;
+        let pane = self.layout.active_pane();
+        Some(PaneKey { tab, pane })
     }
 
-    /// Drop a tab's per-tab state (N23b); its session is reaped by the pump.
-    fn drop_tab_state(&mut self, tab: TabId) {
-        self.tab_slots.remove(&tab);
-        self.tab_grid.remove(&tab);
-        self.tab_exit.remove(&tab);
-        self.tab_render.remove(&tab);
-        self.tab_ime.remove(&tab);
-        self.tab_search.remove(&tab);
-        self.tab_modes.remove(&tab);
-        self.tab_kitty.remove(&tab);
+    /// Initialize a new pane's per-pane state (N24b).
+    fn init_pane_state(&mut self, pane: PaneKey) {
+        self.pane_grid.insert(pane, (0, 0));
+        self.pane_exit.insert(pane, None);
+        self.pane_render.insert(pane, RenderState::default());
+        self.pane_ime.insert(pane, nora::ime::ImeState::new());
+        self.pane_search.insert(pane, nora::search::SearchUi::new());
+        self.pane_modes.insert(pane, TermMode::SHOW_CURSOR);
+        self.pane_kitty.insert(pane, KittyKeyboardFlags::NONE);
+        self.pane_selection.insert(pane, None);
+        self.pane_last_visible.insert(pane, Vec::new());
     }
 
-    /// Save the active tab's mirrored state into its per-tab maps (N23b).
-    fn save_active_tab(&mut self, tab: TabId) {
-        self.tab_slots.insert(tab, self.slot.clone());
-        self.tab_grid.insert(tab, self.last_grid);
-        self.tab_exit.insert(tab, self.child_exit);
-        self.tab_render.insert(tab, self.state.clone());
-        self.tab_ime.insert(
-            tab,
+    /// Drop a pane's per-pane state (N24b); its session is reaped by the
+    /// pump.
+    fn drop_pane_state(&mut self, pane: PaneKey) {
+        self.pane_slots.remove(&pane);
+        self.pane_grid.remove(&pane);
+        self.pane_exit.remove(&pane);
+        self.pane_render.remove(&pane);
+        self.pane_ime.remove(&pane);
+        self.pane_search.remove(&pane);
+        self.pane_modes.remove(&pane);
+        self.pane_kitty.remove(&pane);
+        self.pane_selection.remove(&pane);
+        self.pane_last_visible.remove(&pane);
+    }
+
+    /// Save the active pane's mirrored state into its per-pane maps (N24b).
+    fn save_active_pane(&mut self, pane: PaneKey) {
+        self.pane_slots.insert(pane, self.slot.clone());
+        self.pane_grid.insert(pane, self.last_grid);
+        self.pane_exit.insert(pane, self.child_exit);
+        self.pane_render.insert(pane, self.state.clone());
+        self.pane_ime.insert(
+            pane,
             std::mem::replace(&mut self.ime, nora::ime::ImeState::new()),
         );
-        self.tab_search.insert(
-            tab,
+        self.pane_search.insert(
+            pane,
             std::mem::replace(&mut self.search, nora::search::SearchUi::new()),
         );
-        self.tab_modes.insert(tab, self.modes);
-        self.tab_kitty.insert(tab, self.kitty_flags);
+        self.pane_modes.insert(pane, self.modes);
+        self.pane_kitty.insert(pane, self.kitty_flags);
+        self.pane_selection.insert(pane, self.selection);
+        self.pane_last_visible
+            .insert(pane, std::mem::take(&mut self.last_visible));
     }
 
-    /// Load `tab`'s per-tab state into the single fields (N23b), making it
-    /// the active tab's state.
-    fn load_active_tab(&mut self, tab: TabId) {
+    /// Load `pane`'s per-pane state into the single fields (N24b), making
+    /// it the active pane's state.
+    fn load_active_pane(&mut self, pane: PaneKey) {
         self.slot = self
-            .tab_slots
-            .remove(&tab)
+            .pane_slots
+            .remove(&pane)
             .unwrap_or_else(|| self.slot.clone());
-        self.last_grid = self.tab_grid.remove(&tab).unwrap_or((0, 0));
-        self.child_exit = self.tab_exit.remove(&tab).unwrap_or(None);
-        self.state = self.tab_render.remove(&tab).unwrap_or_default();
-        self.ime = self.tab_ime.remove(&tab).unwrap_or_default();
-        self.search = self.tab_search.remove(&tab).unwrap_or_default();
-        self.modes = self.tab_modes.remove(&tab).unwrap_or(TermMode::SHOW_CURSOR);
+        self.last_grid = self.pane_grid.remove(&pane).unwrap_or((0, 0));
+        self.child_exit = self.pane_exit.remove(&pane).unwrap_or(None);
+        self.state = self.pane_render.remove(&pane).unwrap_or_default();
+        self.ime = self.pane_ime.remove(&pane).unwrap_or_default();
+        self.search = self.pane_search.remove(&pane).unwrap_or_default();
+        self.modes = self
+            .pane_modes
+            .remove(&pane)
+            .unwrap_or(TermMode::SHOW_CURSOR);
         self.kitty_flags = self
-            .tab_kitty
-            .remove(&tab)
+            .pane_kitty
+            .remove(&pane)
             .unwrap_or(KittyKeyboardFlags::NONE);
+        self.selection = self.pane_selection.remove(&pane).unwrap_or(None);
+        self.last_visible = self.pane_last_visible.remove(&pane).unwrap_or_default();
+    }
+
+    /// Compute each live pane's grid from the active layout and send a
+    /// `PumpMsg::Resize` to every pane whose grid changed (N24b). Called
+    /// after a split/close/focus and on window resize, so panes always
+    /// match their rectangles.
+    fn resize_all_panes(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(fonts) = self.fonts.as_ref() else {
+            return;
+        };
+        let (cols, rows) = window_grid(window, fonts);
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        for (pane_id, _x, _y, pw, ph) in self.layout.compute_rectangles(cols, rows) {
+            let pane = PaneKey {
+                tab: self.active_tab_id().unwrap_or(TabId(0)),
+                pane: pane_id,
+            };
+            let prev = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
+            if prev != (pw, ph) {
+                self.pane_grid.insert(pane, (pw, ph));
+                let _ = self.pump_commands.send(PumpMsg::Resize {
+                    pane,
+                    rows: ph as usize,
+                    cols: pw as usize,
+                });
+            }
+        }
     }
 
     /// Apply a tab command (N23b): the keyboard handler maps Ctrl+T /
     /// Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab to a [`nora::workspace::TabCommand`]
     /// and calls this. Spawns/reaps the tab's session and swaps the
     /// active tab's mirrored state.
+    /// Switch the active layout to `tab`'s and load its active pane's
+    /// mirrored state into the single fields (N24b).
+    fn switch_to_tab(&mut self, tab: TabId) {
+        self.layout = self
+            .tab_layouts
+            .get(&tab)
+            .cloned()
+            .unwrap_or_else(Layout::new);
+        let pane = self.layout.active_pane();
+        self.load_active_pane(PaneKey { tab, pane });
+    }
+
+    /// Apply a tab command (N23b/N24b): the keyboard handler maps Ctrl+T /
+    /// Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab to a [`nora::workspace::TabCommand`]
+    /// and calls this. Spawns/reaps the tab's pane sessions and swaps the
+    /// active tab's layout and the active pane's mirrored state.
     fn on_tab_command(&mut self, cmd: nora::workspace::TabCommand) {
+        // Capture the old active pane before the command changes focus.
+        let prev_active_pane = self.active_pane_key();
         let prev_active = self.workspace.active_tab();
         let new_active = self.workspace.apply_tab_command(cmd);
-        // N23b: compute the new tab's grid size first (immutable borrows
+        // Compute the new tab's full grid size first (immutable borrows
         // of `self.window` and `self.fonts` end before the mutable
         // operations below).
         let new_tab_grid = if cmd == nora::workspace::TabCommand::New {
@@ -613,53 +782,182 @@ impl WinApp {
         match cmd {
             nora::workspace::TabCommand::New => {
                 if let Some(tab) = new_active {
-                    if let Some(prev) = prev_active {
-                        self.save_active_tab(prev);
+                    if let (Some(prev), Some(prev_pane)) = (prev_active, prev_active_pane) {
+                        self.save_active_pane(prev_pane);
+                        self.tab_layouts.insert(prev, self.layout.clone());
                     }
-                    self.init_tab_state(tab);
+                    // The new tab starts with a single-pane layout.
+                    let new_pane = PaneKey {
+                        tab,
+                        pane: PaneId(0),
+                    };
+                    self.layout = Layout::new();
+                    self.tab_layouts.insert(tab, self.layout.clone());
+                    self.init_pane_state(new_pane);
                     if let Some((cols, rows)) = new_tab_grid {
                         let slot: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
-                        self.tab_slots.insert(tab, slot.clone());
-                        let _ = self.pump_commands.send(PumpMsg::NewTab {
-                            tab,
+                        self.pane_slots.insert(new_pane, slot.clone());
+                        self.pane_grid.insert(new_pane, (cols, rows));
+                        let _ = self.pump_commands.send(PumpMsg::NewPane {
+                            pane: new_pane,
                             rows: rows as usize,
                             cols: cols as usize,
                             slot,
                         });
                     }
-                    self.load_active_tab(tab);
+                    self.load_active_pane(new_pane);
                 }
             }
             nora::workspace::TabCommand::Close => {
                 if let Some(tab) = prev_active {
-                    let _ = self.pump_commands.send(PumpMsg::CloseTab { tab });
-                    self.drop_tab_state(tab);
-                    if let Some(new_active) = self.workspace.active_tab() {
-                        self.load_active_tab(new_active);
+                    // Reap every pane of the closed tab; its layout is still
+                    // the active one, so `self.layout.panes()` is exact.
+                    for pane_id in self.layout.panes() {
+                        let pane = PaneKey { tab, pane: pane_id };
+                        let _ = self.pump_commands.send(PumpMsg::ClosePane { pane });
+                        self.drop_pane_state(pane);
+                    }
+                    self.tab_layouts.remove(&tab);
+                    match self.workspace.active_tab() {
+                        Some(new_active) => self.switch_to_tab(new_active),
+                        None => self.layout = Layout::new(),
                     }
                 }
             }
             nora::workspace::TabCommand::Next | nora::workspace::TabCommand::Prev => {
                 if let Some(tab) = new_active {
-                    if let Some(prev) = prev_active {
-                        self.save_active_tab(prev);
+                    if let (Some(prev), Some(prev_pane)) = (prev_active, prev_active_pane) {
+                        self.save_active_pane(prev_pane);
+                        self.tab_layouts.insert(prev, self.layout.clone());
                     }
-                    self.load_active_tab(tab);
+                    self.switch_to_tab(tab);
                 }
             }
         }
     }
 
-    /// Route a pump [`AppEvent`] to its tab (N23b): stale events (for a
-    /// tab that no longer exists) are ignored; the active tab's state is
-    /// updated in place, other tabs' state in their per-tab maps. Returns
-    /// the render [`Action`] for the fold (used by the caller to decide
-    /// whether to exit).
-    fn on_tab_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) -> Action {
+    /// Split the active pane (N24b): mint a new pane in the active layout,
+    /// spawn its session, and make it active. `vertical` = new pane below
+    /// (split_vertical); otherwise new pane to the right (split_horizontal).
+    fn split_active_pane(&mut self, vertical: bool) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let new_pane_id = if vertical {
+            self.layout.split_vertical()
+        } else {
+            self.layout.split_horizontal()
+        };
+        let new_pane = PaneKey {
+            tab,
+            pane: new_pane_id,
+        };
+        self.init_pane_state(new_pane);
+        // The layout changed: recompute every pane's grid and spawn the new
+        // pane's session at its (now known) size.
+        self.resize_all_panes();
+        let (cols, rows) = self.pane_grid.get(&new_pane).copied().unwrap_or((0, 0));
+        if cols > 0 && rows > 0 {
+            let slot: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
+            self.pane_slots.insert(new_pane, slot.clone());
+            let _ = self.pump_commands.send(PumpMsg::NewPane {
+                pane: new_pane,
+                rows: rows as usize,
+                cols: cols as usize,
+                slot,
+            });
+        }
+        // The new pane becomes active; load its (fresh) state.
+        self.load_active_pane(new_pane);
+    }
+
+    /// Close the active pane (N24b): collapse the layout, reap its session,
+    /// and make the layout's remaining active pane the active one.
+    fn close_active_pane(&mut self) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let active = self.layout.active_pane();
+        if !self.layout.has_pane(active) {
+            return;
+        }
+        let closed = PaneKey { tab, pane: active };
+        self.layout.close_pane(active);
+        let _ = self.pump_commands.send(PumpMsg::ClosePane { pane: closed });
+        self.drop_pane_state(closed);
+        // The layout's active pane is now the first remaining pane (or the
+        // empty root if none remain).
+        let new_active = self.layout.active_pane();
+        // The layout changed: recompute every pane's grid.
+        self.resize_all_panes();
+        let new_pane = PaneKey {
+            tab,
+            pane: new_active,
+        };
+        if self.layout.has_pane(new_active) {
+            self.load_active_pane(new_pane);
+        } else {
+            // The layout is empty: reset the single fields to a fresh pane.
+            self.slot = Arc::new(Mutex::new(None));
+            self.last_grid = (0, 0);
+            self.child_exit = None;
+            self.state = RenderState::default();
+            self.ime = nora::ime::ImeState::new();
+            self.search = nora::search::SearchUi::new();
+            self.modes = TermMode::SHOW_CURSOR;
+            self.kitty_flags = KittyKeyboardFlags::NONE;
+        }
+    }
+
+    /// Focus an adjacent pane (N24b): `dir` is Left/Right/Up/Down. The
+    /// target is the sibling (or ancestor's sibling) in that direction,
+    /// found by walking the active layout tree.
+    fn focus_pane_direction(&mut self, dir: FocusDir) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let active = self.layout.active_pane();
+        let Some(target) = adjacent_pane(self.layout.root(), active, dir) else {
+            return;
+        };
+        if target == active {
+            return;
+        }
+        let prev_pane = PaneKey { tab, pane: active };
+        self.layout.focus_pane(target);
+        let next_pane = PaneKey { tab, pane: target };
+        self.save_active_pane(prev_pane);
+        self.load_active_pane(next_pane);
+    }
+
+    /// Whether `pane` is live: its tab exists and its pane is in that
+    /// tab's current layout (N24b). Stale events (for a pane that no
+    /// longer exists) are ignored by the caller.
+    fn pane_is_live(&self, pane: &PaneKey) -> bool {
+        if !self.workspace.has_tab(pane.tab) {
+            return false;
+        }
+        let live = if self.active_tab_id() == Some(pane.tab) {
+            &self.layout
+        } else {
+            match self.tab_layouts.get(&pane.tab) {
+                Some(l) => l,
+                None => return false,
+            }
+        };
+        live.has_pane(pane.pane)
+    }
+
+    /// Route a pump [`AppEvent`] to its pane (N24b): stale events (for a
+    /// pane that no longer exists) are ignored; the active pane's state is
+    /// updated in place, other panes' state in their per-pane maps.
+    /// Returns the render [`Action`] for the fold (used by the caller to
+    /// decide whether to exit).
+    fn on_pane_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) -> Action {
         match event {
-            AppEvent::DirtyPulse { tab } => {
-                if self.workspace.has_tab(tab) {
-                    if self.workspace.active_tab() == Some(tab) {
+            AppEvent::DirtyPulse { pane } => {
+                if self.pane_is_live(&pane) {
+                    if self.active_pane_key() == Some(pane) {
                         let (state, action) =
                             on_event(self.state.clone(), RenderEvent::Dirty { non_noop: true });
                         self.state = state;
@@ -681,7 +979,7 @@ impl WinApp {
                             }
                         }
                         return action;
-                    } else if let Some(state) = self.tab_render.get_mut(&tab) {
+                    } else if let Some(state) = self.pane_render.get_mut(&pane) {
                         let (new_state, action) =
                             on_event(state.clone(), RenderEvent::Dirty { non_noop: true });
                         *state = new_state;
@@ -692,9 +990,9 @@ impl WinApp {
                     }
                 }
             }
-            AppEvent::ChildExit { tab, status } => {
-                if self.workspace.has_tab(tab) {
-                    if self.workspace.active_tab() == Some(tab) {
+            AppEvent::ChildExit { pane, status } => {
+                if self.pane_is_live(&pane) {
+                    if self.active_pane_key() == Some(pane) {
                         self.child_exit = Some(status);
                         let (state, action) =
                             on_event(self.state.clone(), RenderEvent::ChildExited);
@@ -703,8 +1001,8 @@ impl WinApp {
                             self.failed = true;
                         }
                     } else {
-                        self.tab_exit.insert(tab, Some(status));
-                        if let Some(state) = self.tab_render.get_mut(&tab) {
+                        self.pane_exit.insert(pane, Some(status));
+                        if let Some(state) = self.pane_render.get_mut(&pane) {
                             let (new_state, action) =
                                 on_event(state.clone(), RenderEvent::ChildExited);
                             *state = new_state;
@@ -717,26 +1015,26 @@ impl WinApp {
                     window.request_redraw();
                 }
             }
-            AppEvent::Modes { tab, modes } => {
-                if self.workspace.has_tab(tab) {
-                    if self.workspace.active_tab() == Some(tab) {
+            AppEvent::Modes { pane, modes } => {
+                if self.pane_is_live(&pane) {
+                    if self.active_pane_key() == Some(pane) {
                         self.modes = modes;
                     } else {
-                        self.tab_modes.insert(tab, modes);
+                        self.pane_modes.insert(pane, modes);
                     }
                 }
             }
-            AppEvent::KittyModes { tab, flags } => {
-                if self.workspace.has_tab(tab) {
-                    if self.workspace.active_tab() == Some(tab) {
+            AppEvent::KittyModes { pane, flags } => {
+                if self.pane_is_live(&pane) {
+                    if self.active_pane_key() == Some(pane) {
                         self.kitty_flags = flags;
                     } else {
-                        self.tab_kitty.insert(tab, flags);
+                        self.pane_kitty.insert(pane, flags);
                     }
                 }
             }
-            AppEvent::Copied { tab, text } => {
-                if self.workspace.has_tab(tab) {
+            AppEvent::Copied { pane, text } => {
+                if self.pane_is_live(&pane) {
                     if debug_enabled() {
                         eprintln!("debug: copied {} byte(s): {:?}", text.len(), text);
                     }
@@ -747,14 +1045,17 @@ impl WinApp {
                     }
                 }
             }
-            AppEvent::TabReady { tab } => {
-                // The new tab's session is ready; input is already routed
-                // to it via the active tab.
-                let _ = tab;
+            AppEvent::PaneReady { pane } => {
+                // The new pane's session is ready; input is already routed
+                // to it via the active pane.
+                let _ = pane;
             }
-            AppEvent::TabGone { tab } => {
-                if !self.workspace.has_tab(tab) {
-                    self.drop_tab_state(tab);
+            AppEvent::PaneGone { pane } => {
+                // The pane's session was reaped (or fully drained). Drop
+                // its state only if the pane is no longer in the layout
+                // (stale); a drained-but-open pane keeps its final frame.
+                if !self.pane_is_live(&pane) {
+                    self.drop_pane_state(pane);
                 }
             }
         }
@@ -793,10 +1094,10 @@ impl WinApp {
         };
         let (cols, rows) = window_grid(window, fonts);
         if let Some(seq) = encode_mouse_event(mode, event, cols, rows)
-            && let Some(tab) = self.active_tab_id()
+            && let Some(pane) = self.active_pane_key()
         {
             let _ = self.pump_commands.send(PumpMsg::Input {
-                tab,
+                pane,
                 bytes: seq.into_bytes(),
             });
         }
@@ -805,13 +1106,13 @@ impl WinApp {
     /// Render the pending snapshot through one acquire → fold → draw →
     /// present pass, following the pure machine's [`Action`].
     fn attempt_render(&mut self, event_loop: &ActiveEventLoop) {
-        // N23b: read the active tab's slot first (before the graphics
-        // borrow); the pump stores each tab's latest snapshot in its own
+        // N24b: read the active pane's slot first (before the graphics
+        // borrow); the pump stores each pane's latest snapshot in its own
         // slot.
-        let slot = match self.active_tab_id() {
-            Some(tab) => self
-                .tab_slots
-                .get(&tab)
+        let slot = match self.active_pane_key() {
+            Some(pane) => self
+                .pane_slots
+                .get(&pane)
                 .cloned()
                 .unwrap_or_else(|| self.slot.clone()),
             None => self.slot.clone(),
@@ -1045,23 +1346,29 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        // N23b: exit the window when the last tab's child exits (and not
-        // holding); the tab is still in the workspace at this point.
-        let last_tab_exit = match &event {
-            AppEvent::ChildExit { tab, .. } => {
-                self.workspace.has_tab(*tab) && self.workspace.tab_count() <= 1
+        // N24b: exit the window when the last pane's child exits (and not
+        // holding); the pane is still in its layout at this point.
+        let last_pane_exit = match &event {
+            AppEvent::ChildExit { pane, .. } => {
+                self.pane_is_live(pane)
+                    && self.workspace.tab_count() <= 1
+                    && self
+                        .tab_layouts
+                        .get(&pane.tab)
+                        .map_or(self.layout.panes().len(), |l| l.panes().len())
+                        <= 1
             }
             _ => false,
         };
-        // N23b: extract the exit status before routing (the event is moved
-        // into `on_tab_event`).
+        // N24b: extract the exit status before routing (the event is moved
+        // into `on_pane_event`).
         let child_exit_status = match &event {
             AppEvent::ChildExit { status, .. } => Some(*status),
             _ => None,
         };
-        // N23b: route the event to its tab (stale events are ignored).
-        self.on_tab_event(event_loop, event);
-        if last_tab_exit && let Some(status) = child_exit_status {
+        // N24b: route the event to its pane (stale events are ignored).
+        self.on_pane_event(event_loop, event);
+        if last_pane_exit && let Some(status) = child_exit_status {
             if debug_enabled() {
                 eprintln!("debug: child exit status {status:?}");
             }
@@ -1084,8 +1391,12 @@ impl ApplicationHandler<AppEvent> for WinApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.as_ref() else {
-            return;
+        // N24b: clone the window handle (a cheap `Arc` handle) so the
+        // owned `window` does not hold an immutable borrow of `self`
+        // across the `&mut self` `resize_all_panes()` call below.
+        let window = match &self.window {
+            Some(window) => window.clone(),
+            None => return,
         };
 
         match event {
@@ -1111,7 +1422,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // pinned mono metrics (N11a: logical derivation; pure: no
                 // GPU, no display).
                 let (cols, rows) = match self.fonts.as_ref() {
-                    Some(fonts) => window_grid(window, fonts),
+                    Some(fonts) => window_grid(&window, fonts),
                     None => (0, 0),
                 };
 
@@ -1132,21 +1443,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     return;
                 }
 
-                // (d) Ask the pump thread to resize the PTY session, only
-                // when the clamped grid differs from the last one sent
-                // (N11a: zero retention + change-only sends); the next
-                // pulse carries the post-resize `Full` snapshot, which
-                // the render path presents.
-                let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
-                if (rows, cols) != self.last_grid {
-                    self.last_grid = (rows, cols);
-                    if let Some(tab) = self.active_tab_id() {
-                        let _ = self.pump_commands.send(PumpMsg::Resize {
-                            tab,
-                            rows: rows as usize,
-                            cols: cols as usize,
-                        });
-                    }
+                // (d) N24b: resize every pane to its new fraction of the
+                // window. `resize_all_panes` sends a `PumpMsg::Resize` to
+                // each pane whose grid changed (change-only, so no no-op
+                // resizes reach the pump); the next pulse carries each
+                // pane's post-resize `Full` snapshot.
+                self.resize_all_panes();
+                if let Some(pane) = self.active_pane_key() {
+                    self.last_grid = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
                 }
 
                 // (e) Coalesce the redraw.
@@ -1169,7 +1473,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     return;
                 }
                 let (cols, rows) = match self.fonts.as_ref() {
-                    Some(fonts) => window_grid(window, fonts),
+                    Some(fonts) => window_grid(&window, fonts),
                     None => (0, 0),
                 };
                 // (c) Fold the scale change through the machine with the
@@ -1184,21 +1488,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     return;
                 }
 
-                // (d) Send the clamped resize only on change (N11a); the
-                // redraw arrives via SITE 1 (DirtyPulse) when the pump
-                // takes the post-resize `Full` snapshot — no
-                // `request_redraw` in this arm, keeping the pinned
-                // exactly-three call sites intact.
-                let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
-                if (rows, cols) != self.last_grid {
-                    self.last_grid = (rows, cols);
-                    if let Some(tab) = self.active_tab_id() {
-                        let _ = self.pump_commands.send(PumpMsg::Resize {
-                            tab,
-                            rows: rows as usize,
-                            cols: cols as usize,
-                        });
-                    }
+                // (d) N24b: resize every pane to its new fraction of the
+                // window (change-only per pane). The redraw arrives via
+                // SITE 1 (DirtyPulse) when the pump takes the post-resize
+                // `Full` snapshot — no `request_redraw` in this arm,
+                // keeping the pinned exactly-three call sites intact.
+                self.resize_all_panes();
+                if let Some(pane) = self.active_pane_key() {
+                    self.last_grid = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
                 }
                 if debug_enabled() {
                     eprintln!("debug: scale factor changed, grid {rows}x{cols}");
@@ -1240,8 +1537,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             // Ctrl+Shift+C: copy the selection; the pump
                             // emits `AppEvent::Copied`, which writes the
                             // native clipboard.
-                            if let Some(tab) = self.active_tab_id() {
-                                let _ = self.pump_commands.send(PumpMsg::Copy { tab });
+                            if let Some(pane) = self.active_pane_key() {
+                                let _ = self.pump_commands.send(PumpMsg::Copy { pane });
                             }
                             return;
                         }
@@ -1258,9 +1555,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             match text {
                                 Some(text) => {
                                     let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
-                                    if let Some(tab) = self.active_tab_id() {
+                                    if let Some(pane) = self.active_pane_key() {
                                         let _ = self.pump_commands.send(PumpMsg::Paste {
-                                            tab,
+                                            pane,
                                             text,
                                             bracketed,
                                         });
@@ -1396,6 +1693,43 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             self.on_tab_command(nora::workspace::TabCommand::Next);
                             return;
                         }
+                        PhysicalKey::Code(KeyCode::KeyD) if self.mods.shift_key() => {
+                            // Ctrl+Shift+D: split vertically (new pane
+                            // below the active pane).
+                            self.split_active_pane(true);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyD) => {
+                            // Ctrl+D: split horizontally (new pane to the
+                            // right of the active pane).
+                            self.split_active_pane(false);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyX) => {
+                            // Ctrl+X: close the active pane.
+                            self.close_active_pane();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            // Ctrl+Left: focus the pane to the left.
+                            self.focus_pane_direction(FocusDir::Left);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            // Ctrl+Right: focus the pane to the right.
+                            self.focus_pane_direction(FocusDir::Right);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            // Ctrl+Up: focus the pane above.
+                            self.focus_pane_direction(FocusDir::Up);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            // Ctrl+Down: focus the pane below.
+                            self.focus_pane_direction(FocusDir::Down);
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -1413,8 +1747,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     event.repeat,
                     self.kitty_flags,
                 ) {
-                    if let Some(tab) = self.active_tab_id() {
-                        let _ = self.pump_commands.send(PumpMsg::Input { tab, bytes });
+                    if let Some(pane) = self.active_pane_key() {
+                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
                     }
                     return;
                 }
@@ -1428,8 +1762,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 ) {
                     match action {
                         InputAction::Send(bytes) => {
-                            if let Some(tab) = self.active_tab_id() {
-                                let _ = self.pump_commands.send(PumpMsg::Input { tab, bytes });
+                            if let Some(pane) = self.active_pane_key() {
+                                let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
                             }
                         }
                         InputAction::Quit => {
@@ -1467,7 +1801,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                     row,
                                     modifiers: mouse_modifiers(&self.mods),
                                 },
-                                window,
+                                &window,
                             );
                         }
                     }
@@ -1483,10 +1817,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
                 };
                 if lines != 0
-                    && let Some(tab) = self.active_tab_id()
+                    && let Some(pane) = self.active_pane_key()
                 {
                     let _ = self.pump_commands.send(PumpMsg::Scroll {
-                        tab,
+                        pane,
                         scroll: Scroll::Delta(lines),
                     });
                 }
@@ -1500,11 +1834,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 let (x, y) = (position.x / scale, position.y / scale);
                 self.cursor = (x, y);
                 if let Some((start_row, start_col)) = self.selection
-                    && let Some((end_row, end_col)) = self.grid_cell_at(window, x, y)
-                    && let Some(tab) = self.active_tab_id()
+                    && let Some((end_row, end_col)) = self.grid_cell_at(&window, x, y)
+                    && let Some(pane) = self.active_pane_key()
                 {
                     let _ = self.pump_commands.send(PumpMsg::Select {
-                        tab,
+                        pane,
                         start_row,
                         start_col,
                         end_row,
@@ -1532,7 +1866,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             row,
                             modifiers: mouse_modifiers(&self.mods),
                         },
-                        window,
+                        &window,
                     );
                 }
             }
@@ -1543,11 +1877,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     let (x, y) = self.cursor;
                     match state {
                         ElementState::Pressed => {
-                            if let Some(cell) = self.grid_cell_at(window, x, y) {
+                            if let Some(cell) = self.grid_cell_at(&window, x, y) {
                                 self.selection = Some(cell);
-                                if let Some(tab) = self.active_tab_id() {
+                                if let Some(pane) = self.active_pane_key() {
                                     let _ = self.pump_commands.send(PumpMsg::Select {
-                                        tab,
+                                        pane,
                                         start_row: cell.0,
                                         start_col: cell.1,
                                         end_row: cell.0,
@@ -1580,7 +1914,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                 row,
                                 modifiers: mouse_modifiers(&self.mods),
                             },
-                            window,
+                            &window,
                         );
                     }
                 }
@@ -1604,9 +1938,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     // exactly once and deactivates.
                     if let Some(committed) = self.ime.commit() {
                         eprintln!("IME: commit = {:?}", committed);
-                        if let Some(tab) = self.active_tab_id() {
+                        if let Some(pane) = self.active_pane_key() {
                             let _ = self.pump_commands.send(PumpMsg::Input {
-                                tab,
+                                pane,
                                 bytes: committed.into_bytes(),
                             });
                         }
@@ -1625,10 +1959,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // `AppEvent::Modes` tick, so it reports nothing.
                 if let Some(seq) =
                     encode_focus_event(self.modes.contains(TermMode::FOCUS_IN_OUT), focused)
-                    && let Some(tab) = self.active_tab_id()
+                    && let Some(pane) = self.active_pane_key()
                 {
                     let _ = self.pump_commands.send(PumpMsg::Input {
-                        tab,
+                        pane,
                         bytes: seq.into_bytes(),
                     });
                 }

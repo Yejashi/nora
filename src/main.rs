@@ -330,12 +330,13 @@ fn run_windowed(
     // The pump thread gets its own Arcs; the window loop keeps these.
     let pump_slot = slot.clone();
     let pump_stop = stop.clone();
-    // N23b: the pump owns one session per tab; the window's first tab is
-    // `TabId(0)`, matching the workspace's first `add_tab()`.
-    let first_tab = nora::workspace::TabId(0);
+    // N24b: the pump owns one session per pane; the window's first pane is
+    // tab 0's first pane, matching the workspace's first `add_tab()` and
+    // the layout's first `Layout::new()` pane.
+    let first_pane = nora::session::pump::PaneKey::first();
     let pump = std::thread::spawn(move || {
         nora::session::pump::pump_thread(
-            first_tab,
+            first_pane,
             session,
             pump_slot,
             spec_for_pump,
