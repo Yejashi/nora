@@ -8,5 +8,6 @@
 pub mod bench;
 pub mod corpus;
 pub mod input_bench;
+pub mod multisession_bench;
 pub mod pty_bench;
 pub mod render_bench;
