@@ -19,7 +19,7 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseScrollDelta, StartCause, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
     window::{Window, WindowAttributes, WindowId},
@@ -205,7 +205,7 @@ impl ApplicationHandler for App {
             } else {
                 let mut frame = graphics.acquire();
                 println!("smoke: acquire status {:?}", frame.status);
-                if let Err(message) = graphics.draw_frame(&mut frame, &mut fonts, &[], 1.0) {
+                if let Err(message) = graphics.draw_frame(&mut frame, &mut fonts, &[], &[], 1.0) {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
                 graphics.present(frame);
@@ -345,6 +345,13 @@ struct WinApp {
     /// send only when the derived (clamped) grid differs, so repeated
     /// no-op derivations emit nothing.
     last_grid: (u16, u16),
+    /// Selection drag start in grid `(row, col)` (N14b): `Some` while the
+    /// primary button is held down dragging a selection; `None` otherwise.
+    selection: Option<(usize, usize)>,
+    /// Last cursor position in logical pixels (N14b): `winit` reports
+    /// `CursorMoved` in physical pixels and `MouseInput` carries no
+    /// position, so the drag tracks the last moved cursor.
+    cursor: (f64, f64),
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -376,6 +383,8 @@ pub fn run_windowed(
         child_exit: None,
         hold,
         last_grid: (0, 0),
+        selection: None,
+        cursor: (0.0, 0.0),
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -407,6 +416,24 @@ pub fn run_windowed(
 }
 
 impl WinApp {
+    /// Map a logical-pixel position to a grid `(row, col)`, or `None` if
+    /// the position falls outside the current grid (N14b).
+    fn grid_cell_at(&self, window: &Window, x: f64, y: f64) -> Option<(usize, usize)> {
+        let fonts = self.fonts.as_ref()?;
+        let cell_w = fonts.cell_w as f64;
+        let cell_h = fonts.cell_h() as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let col = (x / cell_w) as usize;
+        let row = (y / cell_h) as usize;
+        let (cols, rows) = window_grid(window, fonts);
+        if col >= cols as usize || row >= rows as usize {
+            return None;
+        }
+        Some((row, col))
+    }
+
     /// Render the pending snapshot through one acquire → fold → draw →
     /// present pass, following the pure machine's [`Action`].
     fn attempt_render(&mut self, event_loop: &ActiveEventLoop) {
@@ -491,11 +518,21 @@ impl WinApp {
                         });
                     }
                 }
+                // N14b: selection highlight — the grid cells covered by the
+                // current selection, drawn as fill rectangles under the text.
+                let mut selection_cells: Vec<(u32, u32)> = Vec::new();
+                for (i, is_selected) in snap.selected.iter().enumerate() {
+                    if *is_selected {
+                        let (row, col) = (i / snap.cols, i % snap.cols);
+                        selection_cells.push((row as u32, col as u32));
+                    }
+                }
                 let line1 = first_non_space_line(&snap, 40);
                 if let Err(message) = graphics.draw_frame(
                     &mut frame,
                     fonts,
                     &draw_cells,
+                    &selection_cells,
                     window.scale_factor() as f32,
                 ) {
                     eprintln!("nora: frame draw failed: {message}");
@@ -649,6 +686,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // mode source for `encode`. Mode changes do not dirty the
                 // screen, so no `request_redraw`.
                 self.modes = modes;
+            }
+            AppEvent::Copied(text) => {
+                // N14b: the selected text was copied. v0.1 surfaces it to
+                // debug output; a native clipboard write is a later slice
+                // (winit 0.30 exposes no `Window` clipboard API).
+                if debug_enabled() {
+                    eprintln!("debug: copied {} byte(s): {:?}", text.len(), text);
+                }
             }
         }
     }
@@ -830,6 +875,45 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     let _ = self
                         .pump_commands
                         .send(PumpMsg::Scroll(Scroll::Delta(lines)));
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                // N14b: track the cursor in logical pixels (`winit`
+                // reports physical). While a selection drag is in
+                // progress, extend the selection to the cell under the
+                // cursor.
+                let scale = window.scale_factor();
+                let (x, y) = (position.x / scale, position.y / scale);
+                self.cursor = (x, y);
+                if let Some((start_row, start_col)) = self.selection
+                    && let Some((end_row, end_col)) = self.grid_cell_at(window, x, y)
+                {
+                    let _ = self
+                        .pump_commands
+                        .send(PumpMsg::Select(start_row, start_col, end_row, end_col));
+                }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                // N14b: primary-button drag selects. `MouseInput` carries
+                // no position, so use the last tracked cursor.
+                if button != MouseButton::Left {
+                    return;
+                }
+                let (x, y) = self.cursor;
+                match state {
+                    ElementState::Pressed => {
+                        if let Some(cell) = self.grid_cell_at(window, x, y) {
+                            self.selection = Some(cell);
+                            let _ = self
+                                .pump_commands
+                                .send(PumpMsg::Select(cell.0, cell.1, cell.0, cell.1));
+                        }
+                    }
+                    ElementState::Released => {
+                        // Finalize: the engine keeps the last selection;
+                        // drop the drag state.
+                        self.selection = None;
+                    }
                 }
             }
             WindowEvent::Ime(_) => {}     // N09b: no IME in v0.1.

@@ -219,6 +219,10 @@ const BG: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// The selection highlight background (N14b), as resolved RGBA: a muted
+/// blue drawn under the selected cells before the glyphs.
+const SELECTION_BG: [u8; 4] = [0x33, 0x55, 0x77, 255];
+
 /// The seven pinned wgpu 30 surface-acquire outcomes, payload-stripped:
 /// `Success` and `Suboptimal` carry a surface texture that nora keeps on the
 /// in-flight [`Frame`], not on the status.
@@ -501,6 +505,7 @@ impl Graphics {
         frame: &mut Frame,
         fonts: &mut glyphs::Fonts,
         cells: &[DrawCell],
+        selection_cells: &[(u32, u32)],
         scale: f32,
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
@@ -568,6 +573,46 @@ impl Graphics {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        // N14b: selection highlight — fill rectangles under the selected
+        // cells, drawn before the glyphs so text composites on top.
+        let mut selection: Vec<DecoVertex> = Vec::new();
+        if let Some(texture) = frame.texture.as_ref() {
+            let size = texture.texture.size();
+            let frame_w = size.width as f32;
+            let frame_h = size.height as f32;
+            for &(row, col) in selection_cells {
+                let x0 = col as f32 * cw;
+                let y0 = row as f32 * glyphs::CELL_H;
+                let line = DecoLine {
+                    x0,
+                    x1: x0 + cw,
+                    top: y0,
+                    bottom: y0 + glyphs::CELL_H,
+                    y: y0,
+                    thickness: glyphs::CELL_H,
+                    color: SELECTION_BG,
+                };
+                push_deco_rect(&mut selection, &line, frame_w, frame_h);
+            }
+        }
+        if !selection.is_empty() {
+            let mut bytes = Vec::with_capacity(selection.len() * 32);
+            for v in &selection {
+                for f in v.pos.iter().chain(v._pad.iter()).chain(v.color.iter()) {
+                    bytes.extend_from_slice(&f.to_bits().to_ne_bytes());
+                }
+            }
+            let buffer = self.device.create_buffer(&BufferDescriptor {
+                label: Some("nora selection vertices"),
+                size: bytes.len() as u64,
+                usage: BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &bytes);
+            pass.set_pipeline(&self.deco_pipeline);
+            pass.set_vertex_buffer(0, buffer.slice(0..));
+            pass.draw(0..selection.len() as u32, 0..1);
+        }
         self.renderer
             .prepare(
                 &self.device,

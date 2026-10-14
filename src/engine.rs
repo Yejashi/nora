@@ -21,10 +21,11 @@
 //!   [`EventRecord::PtyWrite`] and are exposed via [`Engine::replies`].
 
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::{COUNT, Colors};
@@ -47,6 +48,10 @@ pub struct Engine {
     /// [`Engine::snapshot`] is epoch 1).
     snapshot_epoch: u64,
     recorder: Recorder,
+    /// Shared selection state (N14b): the window thread and pump thread
+    /// both touch it through `&self` accessors, so it lives behind a
+    /// mutex. `None` when nothing is selected.
+    selection: Arc<Mutex<Option<Selection>>>,
 }
 
 /// Viewport size for a zero-scrollback [`Term`].
@@ -285,6 +290,18 @@ impl CellText {
     }
 }
 
+/// A text selection in viewport coordinates: `(row, col)` pairs, 0-based.
+///
+/// The selection is a **linear row-major range**: the cell at
+/// `row * cols + col` is selected iff its index lies between
+/// `start.0 * cols + start.1` and `end.0 * cols + end.1` (inclusive, in
+/// either order). This matches how the window thread drags across cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
 /// One owned screen snapshot with viewport metadata.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -294,6 +311,10 @@ pub struct Snapshot {
     pub epoch: u64,
     /// Row-major: `cells[row * cols + col]`.
     pub cells: Vec<CellText>,
+    /// Per-cell selection state (N14b), same length as `cells`:
+    /// `selected[row * cols + col]` is `true` when that cell is within
+    /// the current selection.
+    pub selected: Vec<bool>,
     /// Cursor in viewport coordinates.
     pub cursor: Option<(usize, usize)>,
     pub cursor_shape: CursorShape,
@@ -387,6 +408,7 @@ impl Engine {
             cols,
             snapshot_epoch: 0,
             recorder,
+            selection: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -482,6 +504,82 @@ impl Engine {
         grid.total_lines().saturating_sub(grid.screen_lines())
     }
 
+    /// Set the selection to the range `start..=end` in viewport
+    /// `(row, col)` coordinates (N14b). The range is linear row-major;
+    /// `start` and `end` may be given in either order.
+    pub fn select(&self, start: (usize, usize), end: (usize, usize)) {
+        *self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Selection { start, end });
+    }
+
+    /// Clear the selection (N14b).
+    pub fn clear_selection(&self) {
+        *self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The current selection, if any (N14b).
+    pub fn selection(&self) -> Option<Selection> {
+        *self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Copy the selected text (N14b).
+    ///
+    /// Returns the selected cells' characters joined row-major with `\n`
+    /// between rows, or `None` when there is no selection. Cells are read
+    /// from the same grid the snapshot renders (`Term::grid`), so the
+    /// copied text always matches the on-screen selection.
+    pub fn copy_selection(&self) -> Option<String> {
+        let sel = (*self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))?;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        let rows = self.rows;
+        let cols = self.cols;
+        let start = sel.start.0 * cols + sel.start.1;
+        let end = sel.end.0 * cols + sel.end.1;
+        let lo = start.min(end);
+        let hi = start.max(end);
+        let mut out = String::new();
+        let mut prev_row: Option<usize> = None;
+        for i in lo..=hi {
+            // Guard against a concurrent resize that shrank the grid below
+            // the selection range.
+            if i >= rows * cols {
+                break;
+            }
+            let row = i / cols;
+            let col = i % cols;
+            let grid_line = Line(row as i32 - display_offset as i32);
+            let cell = &grid[grid_line][Column(col)];
+            // Skip wide-char spacers: a wide char occupies two cells; the
+            // second (spacer) cell carries a placeholder space and must
+            // not be duplicated in the copied text.
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            if prev_row.is_some() && prev_row != Some(row) {
+                out.push('\n');
+            }
+            prev_row = Some(row);
+            out.push(cell.c);
+        }
+        Some(out)
+    }
+
     /// Take one owned snapshot of the screen, consuming one damage report.
     pub fn snapshot(&mut self) -> Snapshot {
         let mut term = self.term.lock();
@@ -533,6 +631,30 @@ impl Engine {
         let cursor = point_to_viewport(content.display_offset, content.cursor.point)
             .map(|p| (p.line, p.column.0));
 
+        // Per-cell selection state (N14b): a cell is selected iff its
+        // row-major index lies within the current selection range.
+        let selected = {
+            let sel = self
+                .selection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut selected = vec![false; self.rows * self.cols];
+            if let Some(sel) = sel.as_ref() {
+                let start = sel.start.0 * self.cols + sel.start.1;
+                let end = sel.end.0 * self.cols + sel.end.1;
+                let lo = start.min(end);
+                let hi = start.max(end);
+                for i in lo..=hi {
+                    // Guard against a concurrent resize that shrank the
+                    // grid below the selection range.
+                    if i < selected.len() {
+                        selected[i] = true;
+                    }
+                }
+            }
+            selected
+        };
+
         // Increment before assignment: the first snapshot is epoch 1.
         self.snapshot_epoch += 1;
 
@@ -541,6 +663,7 @@ impl Engine {
             cols: self.cols,
             epoch: self.snapshot_epoch,
             cells,
+            selected,
             cursor,
             cursor_shape: content.cursor.shape,
             modes: content.mode,

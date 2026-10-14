@@ -152,6 +152,7 @@ fn snap(
         rows,
         cols,
         cells,
+        selected: vec![false; rows * cols],
         cursor,
         modes: TermMode::SHOW_CURSOR,
         cursor_shape: CursorShape::default(),

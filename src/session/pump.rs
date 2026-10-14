@@ -80,6 +80,9 @@ pub enum AppEvent {
     /// The engine's live `TermMode` changed (N10b); the window updates its
     /// `encode` mode source.
     Modes(TermMode),
+    /// The selected text was copied (N14b); the window thread copies it to
+    /// the clipboard (or debug-prints it for now).
+    Copied(String),
 }
 
 /// Window→pump message.
@@ -90,6 +93,15 @@ pub enum PumpMsg {
     Input(Vec<u8>),
     /// Scroll the engine's viewport (N14a); applied on the next tick.
     Scroll(Scroll),
+    /// Select the viewport range
+    /// `(start_row, start_col, end_row, end_col)` (N14b); applied on the
+    /// next tick.
+    Select(usize, usize, usize, usize),
+    /// Clear the selection (N14b); applied on the next tick.
+    ClearSelection,
+    /// Copy the selection and emit [`AppEvent::Copied`] (N14b); applied on
+    /// the next tick.
+    Copy,
 }
 
 /// Bounded pump thread: owns the session; ticks until terminated or stopped.
@@ -212,6 +224,30 @@ pub fn pump_thread(
                         eprintln!("debug: pump: scroll {scroll:?}");
                     }
                     session.engine().scroll(scroll);
+                }
+                PumpMsg::Select(start_row, start_col, end_row, end_col) => {
+                    if debug_enabled() {
+                        eprintln!(
+                            "debug: pump: select ({start_row},{start_col})..({end_row},{end_col})"
+                        );
+                    }
+                    session
+                        .engine()
+                        .select((start_row, start_col), (end_row, end_col));
+                }
+                PumpMsg::ClearSelection => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: clear selection");
+                    }
+                    session.engine().clear_selection();
+                }
+                PumpMsg::Copy => {
+                    if let Some(text) = session.engine().copy_selection() {
+                        if debug_enabled() {
+                            eprintln!("debug: pump: copied {} byte(s)", text.len());
+                        }
+                        let _ = events.send_event(AppEvent::Copied(text));
+                    }
                 }
             }
         }
