@@ -8,15 +8,17 @@
 //! are sequential `&mut` calls, so the term mutex is never held across
 //! anything but the pinned engine calls.
 
+use std::collections::HashMap;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use super::pty::{DRAIN_TIMEOUT, PtySession, SessionEvent};
+use super::pty::{DRAIN_TIMEOUT, LaunchSpec, PtySession, SessionEvent};
 use crate::engine::{KittyKeyboardFlags, Snapshot};
 use crate::input::paste::{PasteValidation, validate_paste};
 use crate::render::term::is_noop_damage;
+use crate::workspace::TabId;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 
@@ -72,54 +74,96 @@ fn debug_enabled() -> bool {
 }
 
 /// Window-loop events from the pump thread (the ONLY pump→window protocol).
+///
+/// Every event is tagged with the [`TabId`] it belongs to (N23b); the window
+/// routes it to that tab and ignores events for a tab that no longer exists
+/// (stale).
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    /// The pump fetched a snapshot (stored in the shared slot); non-noop damage.
-    DirtyPulse,
-    /// The session child exited (exit code, or None if the loop died without one).
-    ChildExit(Option<i32>),
-    /// The engine's live `TermMode` changed (N10b); the window updates its
-    /// `encode` mode source.
-    Modes(TermMode),
-    /// The engine's live kitty keyboard flags changed (N21b); the window
-    /// updates its `encode_kitty` flag source.
-    KittyModes(KittyKeyboardFlags),
-    /// The selected text was copied (N14b); the window thread copies it to
-    /// the clipboard (or debug-prints it for now).
-    Copied(String),
+    /// The pump fetched a snapshot for `tab` (stored in that tab's slot);
+    /// non-noop damage.
+    DirtyPulse { tab: TabId },
+    /// The session child for `tab` exited (exit code, or None if the loop
+    /// died without one).
+    ChildExit { tab: TabId, status: Option<i32> },
+    /// The engine's live `TermMode` for `tab` changed (N10b); the window
+    /// updates that tab's `encode` mode source.
+    Modes { tab: TabId, modes: TermMode },
+    /// The engine's live kitty keyboard flags for `tab` changed (N21b); the
+    /// window updates that tab's `encode_kitty` flag source.
+    KittyModes {
+        tab: TabId,
+        flags: KittyKeyboardFlags,
+    },
+    /// The selected text for `tab` was copied (N14b); the window thread
+    /// copies it to the clipboard (or debug-prints it for now).
+    Copied { tab: TabId, text: String },
+    /// A new tab's session is ready (N23b); the window may now route input
+    /// to it.
+    TabReady { tab: TabId },
+    /// A tab's session was reaped (N23b); the window drops the tab's state.
+    TabGone { tab: TabId },
 }
 
 /// Window→pump message.
+///
+/// Every message is tagged with the [`TabId`] it targets (N23b); the pump
+/// routes it to that tab's session, so active input never reaches another
+/// tab.
 pub enum PumpMsg {
-    /// Resize the PTY session to (rows, cols) and re-pump.
-    Resize(usize, usize),
-    /// Encoded keystroke bytes; window→PTY, ordered after earlier messages.
-    Input(Vec<u8>),
-    /// Scroll the engine's viewport (N14a); applied on the next tick.
-    Scroll(Scroll),
+    /// Resize the PTY session for `tab` to (rows, cols) and re-pump.
+    Resize {
+        tab: TabId,
+        rows: usize,
+        cols: usize,
+    },
+    /// Encoded keystroke bytes for `tab`; window→PTY, ordered after earlier
+    /// messages.
+    Input { tab: TabId, bytes: Vec<u8> },
+    /// Scroll the engine's viewport for `tab` (N14a); applied on the next
+    /// tick.
+    Scroll { tab: TabId, scroll: Scroll },
     /// Select the viewport range
-    /// `(start_row, start_col, end_row, end_col)` (N14b); applied on the
-    /// next tick.
-    Select(usize, usize, usize, usize),
-    /// Clear the selection (N14b); applied on the next tick.
-    ClearSelection,
-    /// Copy the selection and emit [`AppEvent::Copied`] (N14b); applied on
-    /// the next tick.
-    Copy,
-    /// A paste operation (N17b): validated by the pure paste policy
-    /// (size cap, bracketed paste markers, newline normalization) and
-    /// queued into the pending input, streamed to the PTY in order with
-    /// the keystrokes, bounded by the writer's app cap.
+    /// `(start_row, start_col, end_row, end_col)` for `tab` (N14b); applied
+    /// on the next tick.
+    Select {
+        tab: TabId,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    },
+    /// Clear the selection for `tab` (N14b); applied on the next tick.
+    ClearSelection { tab: TabId },
+    /// Copy the selection for `tab` and emit [`AppEvent::Copied`] (N14b);
+    /// applied on the next tick.
+    Copy { tab: TabId },
+    /// A paste operation for `tab` (N17b): validated by the pure paste
+    /// policy (size cap, bracketed paste markers, newline normalization)
+    /// and queued into the tab's pending input, streamed to the PTY in
+    /// order with the keystrokes, bounded by the writer's app cap.
     Paste {
+        tab: TabId,
         /// The paste text (raw, before validation).
         text: String,
         /// Whether bracketed paste mode is active (the engine's live
         /// `TermMode::BRACKETED_PASTE`).
         bracketed: bool,
     },
-    /// Cancel the in-flight paste (N17b): the not-yet-fed paste bytes are
-    /// dropped; keystrokes are unaffected.
-    CancelPaste,
+    /// Cancel the in-flight paste for `tab` (N17b): the not-yet-fed paste
+    /// bytes are dropped; keystrokes are unaffected.
+    CancelPaste { tab: TabId },
+    /// Spawn a new session for `tab` (N23b); the pump uses its launch spec
+    /// and the tab's slot.
+    NewTab {
+        tab: TabId,
+        rows: usize,
+        cols: usize,
+        slot: Arc<Mutex<Option<Snapshot>>>,
+    },
+    /// Reap (close) the session for `tab` (N23b); the pump sends
+    /// [`AppEvent::TabGone`].
+    CloseTab { tab: TabId },
 }
 
 /// The outcome of applying a paste to the pump's input state (N17b).
@@ -221,216 +265,338 @@ pub fn feed_pending(
     fed
 }
 
-/// Bounded pump thread: owns the session; ticks until terminated or stopped.
+/// Per-tab pump state (N23b): the session and its in-flight input/paste
+/// state, so each tab's input is routed to its own session and never
+/// reaches another tab.
+struct TabPump {
+    session: PtySession,
+    /// Pending input bytes for this tab (N09b/N17b).
+    pending_input: Vec<u8>,
+    /// The in-flight paste block within `pending_input`, as a half-open
+    /// byte range `[start, end)` (N17b); `None` when no paste is in flight.
+    paste_block: Option<(usize, usize)>,
+    /// The last published engine `TermMode` (N10b); `None` until the first
+    /// tick, so the first tick always publishes.
+    last_modes: Option<TermMode>,
+    /// The last published engine kitty keyboard flags (N21b); `None` until
+    /// the first tick, so the first tick always publishes.
+    last_kitty: Option<KittyKeyboardFlags>,
+    /// Whether this tab's session has terminated and is draining (N12a).
+    draining: bool,
+    /// The drain deadline (N12a); `None` when not draining.
+    drain_deadline: Option<Instant>,
+    /// The child's exit status, captured when first terminating (N12a).
+    exit_status: Option<ExitStatus>,
+}
+
+impl TabPump {
+    fn new(session: PtySession) -> Self {
+        Self {
+            session,
+            pending_input: Vec::new(),
+            paste_block: None,
+            last_modes: None,
+            last_kitty: None,
+            draining: false,
+            drain_deadline: None,
+            exit_status: None,
+        }
+    }
+}
+
+/// Tick one tab's session (N23b): run its N12a drain state machine, store +
+/// pulse a snapshot on non-noop damage, and publish its modes/kitty flags on
+/// change. Returns `false` when the tab's session has been fully drained
+/// and closed (the caller removes it).
+fn tick_tab(
+    tab: TabId,
+    tab_pump: &mut TabPump,
+    slot: &Arc<Mutex<Option<Snapshot>>>,
+    events: &winit::event_loop::EventLoopProxy<AppEvent>,
+) -> bool {
+    if tab_pump.draining {
+        // N12a drain mode: the session loop thread is still finishing (the
+        // pinned `drain_on_exit` read). Wait, then probe + snapshot only —
+        // no input, no resize — until the loop thread finished or
+        // `DRAIN_TIMEOUT` elapsed. A snapshot is fetched only when the
+        // damage is not the pinned no-op shape (the final frame).
+        let finished = tab_pump.session.wait_drain(Duration::from_millis(10));
+        let stored = {
+            let (damage, cursor) = tab_pump.session.engine().probe();
+            if !is_noop_damage(&damage, cursor) {
+                let snapshot = tab_pump.session.engine().snapshot();
+                let (rows, cols) = (snapshot.rows, snapshot.cols);
+                *slot.lock().unwrap() = Some(snapshot);
+                if debug_enabled() {
+                    eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if stored {
+            let _ = events.send_event(AppEvent::DirtyPulse { tab });
+        }
+        let timed_out = tab_pump
+            .drain_deadline
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(false);
+        if finished || timed_out {
+            let status = tab_pump.exit_status.and_then(|status| status.code());
+            let _ = events.send_event(AppEvent::ChildExit { tab, status });
+            tab_pump.session.close();
+            return false;
+        }
+        return true;
+    }
+
+    let outcome = pump_tick(&mut tab_pump.session);
+
+    if outcome.terminated {
+        // N06b: surface the last title set by the child, on stderr, before
+        // the loop folds `ChildExited`. Enter drain mode (N12a); the drain
+        // frame is probed on the next tick.
+        if let Some(title) = tab_pump.session.title() {
+            eprintln!("title: {title}");
+        }
+        tab_pump.draining = true;
+        tab_pump.drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
+        tab_pump.exit_status = outcome.status;
+        return true;
+    }
+
+    if let Some(snapshot) = outcome.snapshot {
+        let (rows, cols) = (snapshot.rows, snapshot.cols);
+        *slot.lock().unwrap() = Some(snapshot);
+        if debug_enabled() {
+            eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
+        }
+        let _ = events.send_event(AppEvent::DirtyPulse { tab });
+    }
+
+    // N10b: publish the engine's live `TermMode` on change. `TermMode` is
+    // `Copy`, so the engine guard is dropped before the channel send —
+    // never held across it.
+    let modes = tab_pump.session.engine().modes();
+    if tab_pump.last_modes != Some(modes) {
+        tab_pump.last_modes = Some(modes);
+        let _ = events.send_event(AppEvent::Modes { tab, modes });
+    }
+
+    // N21b: publish the engine's live kitty keyboard flags on change.
+    // `KittyKeyboardFlags` is `Copy`, so the engine guard is dropped
+    // before the channel send — never held across it.
+    let kitty_flags = tab_pump.session.engine().kitty_mode();
+    if tab_pump.last_kitty != Some(kitty_flags) {
+        tab_pump.last_kitty = Some(kitty_flags);
+        let _ = events.send_event(AppEvent::KittyModes {
+            tab,
+            flags: kitty_flags,
+        });
+    }
+
+    true
+}
+
+/// Bounded pump thread: owns one session per tab (N23b); ticks until stopped.
 ///
-/// Each tick: (1) [`pump_tick`]; (2) on the FIRST tick with
-/// `terminated == true`: enter N12a drain mode — tick
-/// `wait_drain(Duration::from_millis(10))` + probe + snapshot (non-noop
-/// only, the windowed final frame) until the session loop thread
-/// finished or [`DRAIN_TIMEOUT`] elapsed — then send
-/// [`AppEvent::ChildExit`], `session.close()`, break; (3) if a snapshot
-/// was fetched: store it in the slot and send
-/// [`AppEvent::DirtyPulse`]; (4) if the engine's live `TermMode` differs
-/// from the last published one (the first tick always publishes,
-/// correcting the window's initial `SHOW_CURSOR`): send
-/// [`AppEvent::Modes`]; (5) drain [`PumpMsg`] commands — resize the
-/// session, scroll the viewport, extend the pending input with encoded
-/// keystroke bytes, queue a validated paste (N17b), or cancel the
-/// in-flight paste;
-/// (6) feed the pending input in order (bounded by the writer's app cap;
-/// `Ok(0)` = budget full, remainder waits for the next tick;
-/// `Err(Closed)` = loop dead, drop the remainder) and flush up to the app
-/// cap per tick; (7) if `stop` is set: `session.close()` and break; else
-/// sleep 10 ms.
+/// Each tick: (1) [`tick_tab`] for every tab — drain its events, store +
+/// pulse a snapshot on non-noop damage, publish its modes/kitty flags, and
+/// run its N12a drain state machine; (2) remove fully-drained tabs and send
+/// [`AppEvent::TabGone`]; (3) drain [`PumpMsg`] commands, routing each to
+/// its tab's session (spawn a new session on [`PumpMsg::NewTab`], reap one on
+/// [`PumpMsg::CloseTab`]); (4) feed each tab's pending input in order
+/// (bounded by the writer's app cap) and flush up to the app cap per tick;
+/// (5) if `stop` is set: close every session and break; else sleep 10 ms.
+///
+/// Each tab's input is routed to its own session, so active input never
+/// reaches another tab; closing a tab reaps its session.
 pub fn pump_thread(
-    mut session: PtySession,
-    slot: Arc<Mutex<Option<Snapshot>>>,
+    first_tab: TabId,
+    first_session: PtySession,
+    first_slot: Arc<Mutex<Option<Snapshot>>>,
+    spec: LaunchSpec,
     events: winit::event_loop::EventLoopProxy<AppEvent>,
     commands: mpsc::Receiver<PumpMsg>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut pending_input: Vec<u8> = Vec::new();
-    // N17b: the in-flight paste block within `pending_input`, as a
-    // half-open byte range `[start, end)`. `None` when no paste is in
-    // flight. Kept aligned with `pending_input` by `feed_pending`.
-    let mut paste_block: Option<(usize, usize)> = None;
-    // N10b: the last published engine `TermMode`. `None` until the first tick,
-    // so the first tick always publishes (correcting the window's initial
-    // `SHOW_CURSOR` to the engine's live mode).
-    let mut last_modes: Option<TermMode> = None;
-    // N21b: the last published engine kitty keyboard flags. `None` until
-    // the first tick, so the first tick always publishes (correcting
-    // the window's initial legacy `KittyKeyboardFlags::NONE` to the
-    // engine's live flags).
-    let mut last_kitty: Option<KittyKeyboardFlags> = None;
+    let mut sessions: HashMap<TabId, TabPump> = HashMap::new();
+    let mut slots: HashMap<TabId, Arc<Mutex<Option<Snapshot>>>> = HashMap::new();
+    sessions.insert(first_tab, TabPump::new(first_session));
+    slots.insert(first_tab, first_slot);
+
     loop {
-        let outcome = pump_tick(&mut session);
-
-        if outcome.terminated {
-            // N06b: surface the last title set by the child, on stderr,
-            // before the loop folds `ChildExited`.
-            if let Some(title) = session.title() {
-                eprintln!("title: {title}");
-            }
-
-            // N12a drain mode: the session loop thread is still
-            // finishing (the pinned `drain_on_exit` read). Keep ticking
-            // probe + snapshot only — no input, no resize — until the
-            // loop thread finished (`wait_drain` per tick) or
-            // `DRAIN_TIMEOUT` elapsed. A snapshot is fetched only when
-            // the damage is not the pinned no-op shape (the final
-            // frame), stored in the slot and pulsed; the engine guard
-            // is dropped before any channel work.
-            let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-            let mut finished = false;
-            while !finished {
-                // One bounded wait per tick. When `wait_drain` returns
-                // true the loop thread is done, but the probe still
-                // runs once more: the final frame is fetched after the
-                // loop thread's last parse.
-                finished = session.wait_drain(Duration::from_millis(10));
-                let stored = {
-                    let (damage, cursor) = session.engine().probe();
-                    if !is_noop_damage(&damage, cursor) {
-                        let snapshot = session.engine().snapshot();
-                        let (rows, cols) = (snapshot.rows, snapshot.cols);
-                        *slot.lock().unwrap() = Some(snapshot);
-                        if debug_enabled() {
-                            eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if stored {
-                    let _ = events.send_event(AppEvent::DirtyPulse);
-                }
-                if !finished && Instant::now() >= drain_deadline {
-                    eprintln!("nora: final drain timed out; proceeding to close");
-                    break;
+        // (1) Tick every tab; collect the ones that finished draining.
+        let mut removed = Vec::new();
+        {
+            for (tab, tab_pump) in sessions.iter_mut() {
+                if !tick_tab(*tab, tab_pump, &slots[tab], &events) {
+                    removed.push(*tab);
                 }
             }
-
-            let _ = events.send_event(AppEvent::ChildExit(
-                outcome.status.and_then(|status| status.code()),
-            ));
-            session.close();
-            break;
+        }
+        for tab in removed {
+            sessions.remove(&tab);
+            slots.remove(&tab);
+            let _ = events.send_event(AppEvent::TabGone { tab });
         }
 
-        if let Some(snapshot) = outcome.snapshot {
-            let (rows, cols) = (snapshot.rows, snapshot.cols);
-            *slot.lock().unwrap() = Some(snapshot);
-            if debug_enabled() {
-                eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
-            }
-            let _ = events.send_event(AppEvent::DirtyPulse);
-        }
-
-        // N10b: publish the engine's live `TermMode` on change. `TermMode`
-        // is `Copy`, so the engine guard is dropped before the channel
-        // send — never held across it.
-        let modes = session.engine().modes();
-        if last_modes != Some(modes) {
-            last_modes = Some(modes);
-            let _ = events.send_event(AppEvent::Modes(modes));
-        }
-
-        // N21b: publish the engine's live kitty keyboard flags on
-        // change. `KittyKeyboardFlags` is `Copy`, so the engine guard
-        // is dropped before the channel send — never held across it.
-        let kitty_flags = session.engine().kitty_mode();
-        if last_kitty != Some(kitty_flags) {
-            last_kitty = Some(kitty_flags);
-            let _ = events.send_event(AppEvent::KittyModes(kitty_flags));
-        }
-
+        // (2) Drain commands, routing each to its tab's session.
         while let Ok(msg) = commands.try_recv() {
             match msg {
-                PumpMsg::Resize(rows, cols) => {
+                PumpMsg::NewTab {
+                    tab,
+                    rows,
+                    cols,
+                    slot,
+                } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: resize message {rows}x{cols}");
+                        eprintln!("debug: pump: new tab {tab:?} {rows}x{cols}");
                     }
-                    session.resize(rows as u16, cols as u16);
+                    match PtySession::spawn(spec.clone(), rows, cols, super::pty::DEFAULT_CAP) {
+                        Ok(session) => {
+                            sessions.insert(tab, TabPump::new(session));
+                            slots.insert(tab, slot);
+                            let _ = events.send_event(AppEvent::TabReady { tab });
+                        }
+                        Err(err) => {
+                            eprintln!("nora: failed to spawn tab {tab:?}: {err:?}");
+                            let _ = events.send_event(AppEvent::TabGone { tab });
+                        }
+                    }
                 }
-                PumpMsg::Input(bytes) => pending_input.extend(bytes),
-                PumpMsg::Scroll(scroll) => {
+                PumpMsg::CloseTab { tab } => {
                     if debug_enabled() {
-                        eprintln!("debug: pump: scroll {scroll:?}");
+                        eprintln!("debug: pump: close tab {tab:?}");
                     }
-                    session.engine().scroll(scroll);
+                    if let Some(mut tab_pump) = sessions.remove(&tab) {
+                        tab_pump.session.close();
+                        slots.remove(&tab);
+                        let _ = events.send_event(AppEvent::TabGone { tab });
+                    }
                 }
-                PumpMsg::Select(start_row, start_col, end_row, end_col) => {
+                PumpMsg::Resize { tab, rows, cols } => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: resize {tab:?} {rows}x{cols}");
+                    }
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        tab_pump.session.resize(rows as u16, cols as u16);
+                    }
+                }
+                PumpMsg::Input { tab, bytes } => {
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        tab_pump.pending_input.extend(bytes);
+                    }
+                }
+                PumpMsg::Scroll { tab, scroll } => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: scroll {tab:?} {scroll:?}");
+                    }
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        tab_pump.session.engine().scroll(scroll);
+                    }
+                }
+                PumpMsg::Select {
+                    tab,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                } => {
                     if debug_enabled() {
                         eprintln!(
-                            "debug: pump: select ({start_row},{start_col})..({end_row},{end_col})"
+                            "debug: pump: select {tab:?} ({start_row},{start_col})..({end_row},{end_col})"
                         );
                     }
-                    session
-                        .engine()
-                        .select((start_row, start_col), (end_row, end_col));
-                }
-                PumpMsg::ClearSelection => {
-                    if debug_enabled() {
-                        eprintln!("debug: pump: clear selection");
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        tab_pump
+                            .session
+                            .engine()
+                            .select((start_row, start_col), (end_row, end_col));
                     }
-                    session.engine().clear_selection();
                 }
-                PumpMsg::Copy => {
-                    if let Some(text) = session.engine().copy_selection() {
+                PumpMsg::ClearSelection { tab } => {
+                    if debug_enabled() {
+                        eprintln!("debug: pump: clear selection {tab:?}");
+                    }
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        tab_pump.session.engine().clear_selection();
+                    }
+                }
+                PumpMsg::Copy { tab } => {
+                    if let Some(tab_pump) = sessions.get_mut(&tab)
+                        && let Some(text) = tab_pump.session.engine().copy_selection()
+                    {
                         if debug_enabled() {
                             eprintln!("debug: pump: copied {} byte(s)", text.len());
                         }
-                        let _ = events.send_event(AppEvent::Copied(text));
+                        let _ = events.send_event(AppEvent::Copied { tab, text });
                     }
                 }
-                PumpMsg::Paste { text, bracketed } => {
-                    let applied =
-                        apply_paste(&mut pending_input, &mut paste_block, &text, bracketed);
-                    match applied {
-                        PasteApply::Queued(n) => {
-                            if debug_enabled() {
-                                eprintln!("debug: pump: paste queued {n} byte(s)");
+                PumpMsg::Paste {
+                    tab,
+                    text,
+                    bracketed,
+                } => {
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        let applied = apply_paste(
+                            &mut tab_pump.pending_input,
+                            &mut tab_pump.paste_block,
+                            &text,
+                            bracketed,
+                        );
+                        match applied {
+                            PasteApply::Queued(n) => {
+                                if debug_enabled() {
+                                    eprintln!("debug: pump: paste queued {n} byte(s)");
+                                }
                             }
-                        }
-                        PasteApply::TooLarge { size, max } => {
-                            if debug_enabled() {
-                                eprintln!(
-                                    "debug: paste rejected: {size} byte(s) exceeds max {max}"
-                                );
+                            PasteApply::TooLarge { size, max } => {
+                                if debug_enabled() {
+                                    eprintln!(
+                                        "debug: paste rejected: {size} byte(s) exceeds max {max}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
-                PumpMsg::CancelPaste => {
-                    let dropped = cancel_paste(&mut pending_input, &mut paste_block);
-                    if debug_enabled() {
-                        eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
+                PumpMsg::CancelPaste { tab } => {
+                    if let Some(tab_pump) = sessions.get_mut(&tab) {
+                        let dropped =
+                            cancel_paste(&mut tab_pump.pending_input, &mut tab_pump.paste_block);
+                        if debug_enabled() {
+                            eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
+                        }
                     }
                 }
             }
         }
 
-        // N09b: drain pending input in order. Bounded by the writer's app
-        // cap: `feed` accepts at most the cap per call, so `Ok(0)` means the
-        // budget is full and the remainder waits for the next tick;
-        // `Err(Closed)` means the session loop died — drop the remainder.
-        // N17b: paste bytes flow through the same bounded path as
-        // keystrokes (in order, capped), and the in-flight paste block is
-        // advanced as bytes drain.
-        feed_pending(&mut session, &mut pending_input, &mut paste_block);
-        // Per-tick flush: forwards accepted bytes (including ledger replies,
-        // which have no other flusher in windowed mode) — the full app cap
-        // per tick; empty flushes are cheap.
-        let _ = session.flush(1024 * 1024);
+        // (3) Feed each tab's pending input in order (bounded by the
+        // writer's app cap) and flush up to the app cap per tick. Draining
+        // tabs get no new input (the child is exiting), but are still
+        // flushed to forward any final ledger replies.
+        for (_tab, tab_pump) in sessions.iter_mut() {
+            if !tab_pump.draining {
+                feed_pending(
+                    &mut tab_pump.session,
+                    &mut tab_pump.pending_input,
+                    &mut tab_pump.paste_block,
+                );
+            }
+            let _ = tab_pump.session.flush(1024 * 1024);
+        }
 
         if stop.load(Ordering::Relaxed) {
             // N12a: close before break — the pinned loop panics in
             // `PeekableReceiver::recv` when its sender is dropped
             // without `Msg::Shutdown` (alacritty_terminal 0.26.0
             // event_loop.rs:483-488); `close()` sends it.
-            session.close();
+            for tab_pump in sessions.values_mut() {
+                tab_pump.session.close();
+            }
             break;
         }
         std::thread::sleep(Duration::from_millis(10));

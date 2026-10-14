@@ -40,6 +40,7 @@ use nora::render::policy::{clamp_grid, snapshot_is_stale};
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::style::cell_style;
 use nora::session::pump::{AppEvent, PumpMsg};
+use nora::workspace::{TabId, Workspace};
 
 /// Fixed smoke-test resize target, in logical pixels.
 const SMOKE_RESIZE: (f64, f64) = (640.0, 480.0);
@@ -392,6 +393,31 @@ struct WinApp {
     /// the preedit is UI-only state and each commit is sent to the PTY
     /// exactly once.
     ime: nora::ime::ImeState,
+    /// The workspace (N23b): owns all tabs and panes.
+    workspace: Workspace,
+    /// Per-tab snapshot slots (N23b): the pump stores each tab's latest
+    /// snapshot here; `attempt_render` reads the active tab's slot.
+    tab_slots: std::collections::HashMap<TabId, Arc<Mutex<Option<Snapshot>>>>,
+    /// Per-tab grid (N23b): the last grid sent to the pump as
+    /// `PumpMsg::Resize` for that tab; `(0, 0)` = never sent.
+    tab_grid: std::collections::HashMap<TabId, (u16, u16)>,
+    /// Per-tab child exit status (N23b): the pump's `ChildExit` payload once
+    /// delivered for that tab (`None` = not yet delivered).
+    tab_exit: std::collections::HashMap<TabId, Option<Option<i32>>>,
+    /// Per-tab render state machine (N23b): `DirtyPulse`/`ChildExit` fold
+    /// into the tab's own state.
+    tab_render: std::collections::HashMap<TabId, RenderState>,
+    /// Per-tab IME state machine (N23b): each tab's preedit/commit is
+    /// independent.
+    tab_ime: std::collections::HashMap<TabId, nora::ime::ImeState>,
+    /// Per-tab search UI (N23b): each tab's search is independent.
+    tab_search: std::collections::HashMap<TabId, nora::search::SearchUi>,
+    /// Per-tab live terminal `TermMode` (N10b/N23b): the mode source passed
+    /// to `encode` for that tab.
+    tab_modes: std::collections::HashMap<TabId, TermMode>,
+    /// Per-tab live kitty keyboard flags (N21b/N23b): the flag source passed
+    /// to `encode_kitty` for that tab.
+    tab_kitty: std::collections::HashMap<TabId, KittyKeyboardFlags>,
 }
 
 /// Run the windowed terminal (N08b2b-2). `event_loop` carries
@@ -416,6 +442,28 @@ pub fn run_windowed(
         "debug: config loaded: history={}, font.size={}",
         config.terminal.history, config.font.size
     );
+    // N23b: the workspace owns all tabs; the window's first tab is `TabId(0)`,
+    // matching the pump's first session. Its slot is the shared `slot` Arc,
+    // so the pump's writes are visible to `attempt_render`.
+    let mut workspace = Workspace::new();
+    let (first_tab, _first_pane) = workspace.add_tab();
+    let mut tab_slots = std::collections::HashMap::new();
+    tab_slots.insert(first_tab, slot.clone());
+    let mut tab_grid = std::collections::HashMap::new();
+    tab_grid.insert(first_tab, (0, 0));
+    let mut tab_exit = std::collections::HashMap::new();
+    tab_exit.insert(first_tab, None);
+    let mut tab_render = std::collections::HashMap::new();
+    tab_render.insert(first_tab, RenderState::default());
+    let mut tab_ime = std::collections::HashMap::new();
+    tab_ime.insert(first_tab, nora::ime::ImeState::new());
+    let mut tab_search = std::collections::HashMap::new();
+    tab_search.insert(first_tab, nora::search::SearchUi::new());
+    let mut tab_modes = std::collections::HashMap::new();
+    tab_modes.insert(first_tab, TermMode::SHOW_CURSOR);
+    let mut tab_kitty = std::collections::HashMap::new();
+    tab_kitty.insert(first_tab, KittyKeyboardFlags::NONE);
+
     let mut app = WinApp {
         slot,
         pump_commands,
@@ -440,6 +488,15 @@ pub fn run_windowed(
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
+        workspace,
+        tab_slots,
+        tab_grid,
+        tab_exit,
+        tab_render,
+        tab_ime,
+        tab_search,
+        tab_modes,
+        tab_kitty,
     };
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -471,6 +528,239 @@ pub fn run_windowed(
 }
 
 impl WinApp {
+    /// The active tab id (N23b).
+    fn active_tab_id(&self) -> Option<TabId> {
+        self.workspace.active_tab()
+    }
+
+    /// Initialize a new tab's per-tab state (N23b).
+    fn init_tab_state(&mut self, tab: TabId) {
+        self.tab_grid.insert(tab, (0, 0));
+        self.tab_exit.insert(tab, None);
+        self.tab_render.insert(tab, RenderState::default());
+        self.tab_ime.insert(tab, nora::ime::ImeState::new());
+        self.tab_search.insert(tab, nora::search::SearchUi::new());
+        self.tab_modes.insert(tab, TermMode::SHOW_CURSOR);
+        self.tab_kitty.insert(tab, KittyKeyboardFlags::NONE);
+    }
+
+    /// Drop a tab's per-tab state (N23b); its session is reaped by the pump.
+    fn drop_tab_state(&mut self, tab: TabId) {
+        self.tab_slots.remove(&tab);
+        self.tab_grid.remove(&tab);
+        self.tab_exit.remove(&tab);
+        self.tab_render.remove(&tab);
+        self.tab_ime.remove(&tab);
+        self.tab_search.remove(&tab);
+        self.tab_modes.remove(&tab);
+        self.tab_kitty.remove(&tab);
+    }
+
+    /// Save the active tab's mirrored state into its per-tab maps (N23b).
+    fn save_active_tab(&mut self, tab: TabId) {
+        self.tab_slots.insert(tab, self.slot.clone());
+        self.tab_grid.insert(tab, self.last_grid);
+        self.tab_exit.insert(tab, self.child_exit);
+        self.tab_render.insert(tab, self.state.clone());
+        self.tab_ime.insert(
+            tab,
+            std::mem::replace(&mut self.ime, nora::ime::ImeState::new()),
+        );
+        self.tab_search.insert(
+            tab,
+            std::mem::replace(&mut self.search, nora::search::SearchUi::new()),
+        );
+        self.tab_modes.insert(tab, self.modes);
+        self.tab_kitty.insert(tab, self.kitty_flags);
+    }
+
+    /// Load `tab`'s per-tab state into the single fields (N23b), making it
+    /// the active tab's state.
+    fn load_active_tab(&mut self, tab: TabId) {
+        self.slot = self
+            .tab_slots
+            .remove(&tab)
+            .unwrap_or_else(|| self.slot.clone());
+        self.last_grid = self.tab_grid.remove(&tab).unwrap_or((0, 0));
+        self.child_exit = self.tab_exit.remove(&tab).unwrap_or(None);
+        self.state = self.tab_render.remove(&tab).unwrap_or_default();
+        self.ime = self.tab_ime.remove(&tab).unwrap_or_default();
+        self.search = self.tab_search.remove(&tab).unwrap_or_default();
+        self.modes = self.tab_modes.remove(&tab).unwrap_or(TermMode::SHOW_CURSOR);
+        self.kitty_flags = self
+            .tab_kitty
+            .remove(&tab)
+            .unwrap_or(KittyKeyboardFlags::NONE);
+    }
+
+    /// Apply a tab command (N23b): the keyboard handler maps Ctrl+T /
+    /// Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab to a [`nora::workspace::TabCommand`]
+    /// and calls this. Spawns/reaps the tab's session and swaps the
+    /// active tab's mirrored state.
+    fn on_tab_command(&mut self, cmd: nora::workspace::TabCommand) {
+        let prev_active = self.workspace.active_tab();
+        let new_active = self.workspace.apply_tab_command(cmd);
+        // N23b: compute the new tab's grid size first (immutable borrows
+        // of `self.window` and `self.fonts` end before the mutable
+        // operations below).
+        let new_tab_grid = if cmd == nora::workspace::TabCommand::New {
+            let window = self.window.as_ref().expect("the window exists");
+            let fonts = self.fonts.as_ref().expect("fonts are created at startup");
+            Some(window_grid(window, fonts))
+        } else {
+            None
+        };
+        match cmd {
+            nora::workspace::TabCommand::New => {
+                if let Some(tab) = new_active {
+                    if let Some(prev) = prev_active {
+                        self.save_active_tab(prev);
+                    }
+                    self.init_tab_state(tab);
+                    if let Some((cols, rows)) = new_tab_grid {
+                        let slot: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
+                        self.tab_slots.insert(tab, slot.clone());
+                        let _ = self.pump_commands.send(PumpMsg::NewTab {
+                            tab,
+                            rows: rows as usize,
+                            cols: cols as usize,
+                            slot,
+                        });
+                    }
+                    self.load_active_tab(tab);
+                }
+            }
+            nora::workspace::TabCommand::Close => {
+                if let Some(tab) = prev_active {
+                    let _ = self.pump_commands.send(PumpMsg::CloseTab { tab });
+                    self.drop_tab_state(tab);
+                    if let Some(new_active) = self.workspace.active_tab() {
+                        self.load_active_tab(new_active);
+                    }
+                }
+            }
+            nora::workspace::TabCommand::Next | nora::workspace::TabCommand::Prev => {
+                if let Some(tab) = new_active {
+                    if let Some(prev) = prev_active {
+                        self.save_active_tab(prev);
+                    }
+                    self.load_active_tab(tab);
+                }
+            }
+        }
+    }
+
+    /// Route a pump [`AppEvent`] to its tab (N23b): stale events (for a
+    /// tab that no longer exists) are ignored; the active tab's state is
+    /// updated in place, other tabs' state in their per-tab maps. Returns
+    /// the render [`Action`] for the fold (used by the caller to decide
+    /// whether to exit).
+    fn on_tab_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) -> Action {
+        match event {
+            AppEvent::DirtyPulse { tab } => {
+                if self.workspace.has_tab(tab) {
+                    if self.workspace.active_tab() == Some(tab) {
+                        let (state, action) =
+                            on_event(self.state.clone(), RenderEvent::Dirty { non_noop: true });
+                        self.state = state;
+                        match action {
+                            Action::Render => {
+                                let window = self.window.as_ref().expect("the window exists");
+                                window.request_redraw(); // redraw SITE 1
+                                self.attempt_render(event_loop);
+                            }
+                            Action::Skip => {}
+                            Action::ExitFail => {
+                                self.failed = true;
+                                event_loop.exit();
+                            }
+                            Action::Reconfigure | Action::Close => {
+                                // A dirty pulse never reconfigures or
+                                // closes; the resize / child-exit arms
+                                // own those.
+                            }
+                        }
+                        return action;
+                    } else if let Some(state) = self.tab_render.get_mut(&tab) {
+                        let (new_state, action) =
+                            on_event(state.clone(), RenderEvent::Dirty { non_noop: true });
+                        *state = new_state;
+                        if action == Action::ExitFail {
+                            self.failed = true;
+                        }
+                        return action;
+                    }
+                }
+            }
+            AppEvent::ChildExit { tab, status } => {
+                if self.workspace.has_tab(tab) {
+                    if self.workspace.active_tab() == Some(tab) {
+                        self.child_exit = Some(status);
+                        let (state, action) =
+                            on_event(self.state.clone(), RenderEvent::ChildExited);
+                        self.state = state;
+                        if action == Action::ExitFail {
+                            self.failed = true;
+                        }
+                    } else {
+                        self.tab_exit.insert(tab, Some(status));
+                        if let Some(state) = self.tab_render.get_mut(&tab) {
+                            let (new_state, action) =
+                                on_event(state.clone(), RenderEvent::ChildExited);
+                            *state = new_state;
+                            if action == Action::ExitFail {
+                                self.failed = true;
+                            }
+                        }
+                    }
+                    let window = self.window.as_ref().expect("the window exists");
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Modes { tab, modes } => {
+                if self.workspace.has_tab(tab) {
+                    if self.workspace.active_tab() == Some(tab) {
+                        self.modes = modes;
+                    } else {
+                        self.tab_modes.insert(tab, modes);
+                    }
+                }
+            }
+            AppEvent::KittyModes { tab, flags } => {
+                if self.workspace.has_tab(tab) {
+                    if self.workspace.active_tab() == Some(tab) {
+                        self.kitty_flags = flags;
+                    } else {
+                        self.tab_kitty.insert(tab, flags);
+                    }
+                }
+            }
+            AppEvent::Copied { tab, text } => {
+                if self.workspace.has_tab(tab) {
+                    if debug_enabled() {
+                        eprintln!("debug: copied {} byte(s): {:?}", text.len(), text);
+                    }
+                    if let Some(cb) = &self.clipboard
+                        && let Err(err) = cb.set_text(text.as_str())
+                    {
+                        eprintln!("nora: {err}");
+                    }
+                }
+            }
+            AppEvent::TabReady { tab } => {
+                // The new tab's session is ready; input is already routed
+                // to it via the active tab.
+                let _ = tab;
+            }
+            AppEvent::TabGone { tab } => {
+                if !self.workspace.has_tab(tab) {
+                    self.drop_tab_state(tab);
+                }
+            }
+        }
+        Action::Skip
+    }
+
     /// Map a logical-pixel position to a grid `(row, col)`, or `None` if
     /// the position falls outside the current grid (N14b).
     fn grid_cell_at(&self, window: &Window, x: f64, y: f64) -> Option<(usize, usize)> {
@@ -502,14 +792,30 @@ impl WinApp {
             return;
         };
         let (cols, rows) = window_grid(window, fonts);
-        if let Some(seq) = encode_mouse_event(mode, event, cols, rows) {
-            let _ = self.pump_commands.send(PumpMsg::Input(seq.into_bytes()));
+        if let Some(seq) = encode_mouse_event(mode, event, cols, rows)
+            && let Some(tab) = self.active_tab_id()
+        {
+            let _ = self.pump_commands.send(PumpMsg::Input {
+                tab,
+                bytes: seq.into_bytes(),
+            });
         }
     }
 
     /// Render the pending snapshot through one acquire → fold → draw →
     /// present pass, following the pure machine's [`Action`].
     fn attempt_render(&mut self, event_loop: &ActiveEventLoop) {
+        // N23b: read the active tab's slot first (before the graphics
+        // borrow); the pump stores each tab's latest snapshot in its own
+        // slot.
+        let slot = match self.active_tab_id() {
+            Some(tab) => self
+                .tab_slots
+                .get(&tab)
+                .cloned()
+                .unwrap_or_else(|| self.slot.clone()),
+            None => self.slot.clone(),
+        };
         let graphics = self
             .graphics
             .as_mut()
@@ -523,7 +829,7 @@ impl WinApp {
         self.state = state;
         match action {
             Action::Render => {
-                let snap = self.slot.lock().unwrap().take();
+                let snap = slot.lock().unwrap().take();
                 let Some(snap) = snap else {
                     // Coalesced pulse: the pump's single slot held one
                     // snapshot for two rapid pulses (e.g. the
@@ -739,80 +1045,35 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        match event {
-            AppEvent::DirtyPulse => {
+        // N23b: exit the window when the last tab's child exits (and not
+        // holding); the tab is still in the workspace at this point.
+        let last_tab_exit = match &event {
+            AppEvent::ChildExit { tab, .. } => {
+                self.workspace.has_tab(*tab) && self.workspace.tab_count() <= 1
+            }
+            _ => false,
+        };
+        // N23b: extract the exit status before routing (the event is moved
+        // into `on_tab_event`).
+        let child_exit_status = match &event {
+            AppEvent::ChildExit { status, .. } => Some(*status),
+            _ => None,
+        };
+        // N23b: route the event to its tab (stale events are ignored).
+        self.on_tab_event(event_loop, event);
+        if last_tab_exit && let Some(status) = child_exit_status {
+            if debug_enabled() {
+                eprintln!("debug: child exit status {status:?}");
+            }
+            if self.hold {
+                // N12b `--hold`: skip the exit; the window keeps its
+                // final frame (pulse-gated rendering — the pump has
+                // exited, so nothing re-renders).
                 if debug_enabled() {
-                    eprintln!("debug: pulse received");
+                    eprintln!("debug: hold active; window stays open");
                 }
-                let (state, action) =
-                    on_event(self.state.clone(), RenderEvent::Dirty { non_noop: true });
-                self.state = state;
-                match action {
-                    Action::Render => {
-                        let window = self
-                            .window
-                            .as_ref()
-                            .expect("the window exists before user events");
-                        window.request_redraw(); // redraw SITE 1
-                        self.attempt_render(event_loop);
-                    }
-                    Action::ExitFail => {
-                        self.failed = true;
-                        event_loop.exit();
-                    }
-                    Action::Skip => {
-                        // Idle: zero frames until the next event.
-                    }
-                    _ => {}
-                }
-            }
-            AppEvent::ChildExit(status) => {
-                self.child_exit = Some(status);
-                if debug_enabled() {
-                    eprintln!("debug: child exit status {status:?}");
-                }
-                let (state, action) = on_event(self.state.clone(), RenderEvent::ChildExited);
-                self.state = state;
-                if action == Action::Close {
-                    // N12b `--hold`: skip the exit; the window keeps its
-                    // final frame (pulse-gated rendering — the pump has
-                    // exited, so nothing re-renders). Unhold goes through
-                    // the existing CloseRequested/Destroyed/Quit arms;
-                    // the exit code is already captured in `self.child_exit`.
-                    if self.hold {
-                        if debug_enabled() {
-                            eprintln!("debug: hold active; window stays open");
-                        }
-                    } else {
-                        event_loop.exit();
-                    }
-                }
-            }
-            AppEvent::Modes(modes) => {
-                // N10b: the engine's live `TermMode` changed; update the
-                // mode source for `encode`. Mode changes do not dirty the
-                // screen, so no `request_redraw`.
-                self.modes = modes;
-            }
-            AppEvent::KittyModes(flags) => {
-                // N21b: the engine's live kitty keyboard flags changed;
-                // update the flag source for `encode_kitty`. Flag
-                // changes do not dirty the screen, so no
-                // `request_redraw`.
-                self.kitty_flags = flags;
-            }
-            AppEvent::Copied(text) => {
-                // N14b: the selected text was copied. N15: write it to the
-                // native clipboard (arboard-backed); the debug line stays
-                // for diagnostics.
-                if debug_enabled() {
-                    eprintln!("debug: copied {} byte(s): {:?}", text.len(), text);
-                }
-                if let Some(cb) = &self.clipboard
-                    && let Err(err) = cb.set_text(text.as_str())
-                {
-                    eprintln!("nora: {err}");
-                }
+            } else {
+                event_loop.exit();
             }
         }
     }
@@ -879,9 +1140,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
                 if (rows, cols) != self.last_grid {
                     self.last_grid = (rows, cols);
-                    let _ = self
-                        .pump_commands
-                        .send(PumpMsg::Resize(rows as usize, cols as usize));
+                    if let Some(tab) = self.active_tab_id() {
+                        let _ = self.pump_commands.send(PumpMsg::Resize {
+                            tab,
+                            rows: rows as usize,
+                            cols: cols as usize,
+                        });
+                    }
                 }
 
                 // (e) Coalesce the redraw.
@@ -927,9 +1192,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 let (rows, cols) = clamp_grid(rows, cols, self.last_grid.0, self.last_grid.1);
                 if (rows, cols) != self.last_grid {
                     self.last_grid = (rows, cols);
-                    let _ = self
-                        .pump_commands
-                        .send(PumpMsg::Resize(rows as usize, cols as usize));
+                    if let Some(tab) = self.active_tab_id() {
+                        let _ = self.pump_commands.send(PumpMsg::Resize {
+                            tab,
+                            rows: rows as usize,
+                            cols: cols as usize,
+                        });
+                    }
                 }
                 if debug_enabled() {
                     eprintln!("debug: scale factor changed, grid {rows}x{cols}");
@@ -971,7 +1240,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             // Ctrl+Shift+C: copy the selection; the pump
                             // emits `AppEvent::Copied`, which writes the
                             // native clipboard.
-                            let _ = self.pump_commands.send(PumpMsg::Copy);
+                            if let Some(tab) = self.active_tab_id() {
+                                let _ = self.pump_commands.send(PumpMsg::Copy { tab });
+                            }
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyV) => {
@@ -987,8 +1258,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             match text {
                                 Some(text) => {
                                     let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
-                                    let _ =
-                                        self.pump_commands.send(PumpMsg::Paste { text, bracketed });
+                                    if let Some(tab) = self.active_tab_id() {
+                                        let _ = self.pump_commands.send(PumpMsg::Paste {
+                                            tab,
+                                            text,
+                                            bracketed,
+                                        });
+                                    }
                                 }
                                 None => {
                                     if debug_enabled() {
@@ -1094,6 +1370,35 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     );
                     return;
                 }
+                // N23b: tab shortcuts. Local UI actions (not PTY
+                // escapes), checked before `encode` and returning
+                // early, mirroring the N15/N19b/N20b idiom. Keyed on
+                // the physical key + Ctrl (layout-independent).
+                if self.mods.control_key() && !event.repeat {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyT) => {
+                            // Ctrl+T: new tab.
+                            self.on_tab_command(nora::workspace::TabCommand::New);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyW) => {
+                            // Ctrl+W: close the active tab.
+                            self.on_tab_command(nora::workspace::TabCommand::Close);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Tab) if self.mods.shift_key() => {
+                            // Ctrl+Shift+Tab: previous tab.
+                            self.on_tab_command(nora::workspace::TabCommand::Prev);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Tab) => {
+                            // Ctrl+Tab: next tab.
+                            self.on_tab_command(nora::workspace::TabCommand::Next);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // N21b: kitty keyboard protocol — when the application
                 // has negotiated the protocol (the engine's live flags
                 // are non-NONE), the key is encoded in the kitty byte
@@ -1108,7 +1413,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     event.repeat,
                     self.kitty_flags,
                 ) {
-                    let _ = self.pump_commands.send(PumpMsg::Input(bytes));
+                    if let Some(tab) = self.active_tab_id() {
+                        let _ = self.pump_commands.send(PumpMsg::Input { tab, bytes });
+                    }
                     return;
                 }
                 if let Some(action) = encode(
@@ -1121,7 +1428,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 ) {
                     match action {
                         InputAction::Send(bytes) => {
-                            let _ = self.pump_commands.send(PumpMsg::Input(bytes));
+                            if let Some(tab) = self.active_tab_id() {
+                                let _ = self.pump_commands.send(PumpMsg::Input { tab, bytes });
+                            }
                         }
                         InputAction::Quit => {
                             // Local quit (Ctrl+Q): the session drops on
@@ -1173,10 +1482,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * 3,
                     MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
                 };
-                if lines != 0 {
-                    let _ = self
-                        .pump_commands
-                        .send(PumpMsg::Scroll(Scroll::Delta(lines)));
+                if lines != 0
+                    && let Some(tab) = self.active_tab_id()
+                {
+                    let _ = self.pump_commands.send(PumpMsg::Scroll {
+                        tab,
+                        scroll: Scroll::Delta(lines),
+                    });
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1189,10 +1501,15 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 self.cursor = (x, y);
                 if let Some((start_row, start_col)) = self.selection
                     && let Some((end_row, end_col)) = self.grid_cell_at(window, x, y)
+                    && let Some(tab) = self.active_tab_id()
                 {
-                    let _ = self
-                        .pump_commands
-                        .send(PumpMsg::Select(start_row, start_col, end_row, end_col));
+                    let _ = self.pump_commands.send(PumpMsg::Select {
+                        tab,
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                    });
                 }
                 // N16b: report the motion to the terminal (gated by the
                 // engine's mouse mode inside `send_mouse_event`; `X10`
@@ -1228,9 +1545,15 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         ElementState::Pressed => {
                             if let Some(cell) = self.grid_cell_at(window, x, y) {
                                 self.selection = Some(cell);
-                                let _ = self
-                                    .pump_commands
-                                    .send(PumpMsg::Select(cell.0, cell.1, cell.0, cell.1));
+                                if let Some(tab) = self.active_tab_id() {
+                                    let _ = self.pump_commands.send(PumpMsg::Select {
+                                        tab,
+                                        start_row: cell.0,
+                                        start_col: cell.1,
+                                        end_row: cell.0,
+                                        end_col: cell.1,
+                                    });
+                                }
                             }
                         }
                         ElementState::Released => {
@@ -1281,9 +1604,12 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     // exactly once and deactivates.
                     if let Some(committed) = self.ime.commit() {
                         eprintln!("IME: commit = {:?}", committed);
-                        let _ = self
-                            .pump_commands
-                            .send(PumpMsg::Input(committed.into_bytes()));
+                        if let Some(tab) = self.active_tab_id() {
+                            let _ = self.pump_commands.send(PumpMsg::Input {
+                                tab,
+                                bytes: committed.into_bytes(),
+                            });
+                        }
                     }
                 }
                 winit::event::Ime::Disabled => {
@@ -1299,8 +1625,12 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // `AppEvent::Modes` tick, so it reports nothing.
                 if let Some(seq) =
                     encode_focus_event(self.modes.contains(TermMode::FOCUS_IN_OUT), focused)
+                    && let Some(tab) = self.active_tab_id()
                 {
-                    let _ = self.pump_commands.send(PumpMsg::Input(seq.into_bytes()));
+                    let _ = self.pump_commands.send(PumpMsg::Input {
+                        tab,
+                        bytes: seq.into_bytes(),
+                    });
                 }
             }
             _ => {}

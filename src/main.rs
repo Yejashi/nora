@@ -304,6 +304,8 @@ fn run_windowed(
     } else {
         (rows, cols)
     };
+    // N23b: the pump spawns new-tab sessions from the same launch spec.
+    let spec_for_pump = spec.clone();
     let session = match PtySession::spawn(spec, rows as usize, cols as usize, DEFAULT_CAP) {
         Ok(session) => session,
         Err(err) => {
@@ -328,8 +330,19 @@ fn run_windowed(
     // The pump thread gets its own Arcs; the window loop keeps these.
     let pump_slot = slot.clone();
     let pump_stop = stop.clone();
+    // N23b: the pump owns one session per tab; the window's first tab is
+    // `TabId(0)`, matching the workspace's first `add_tab()`.
+    let first_tab = nora::workspace::TabId(0);
     let pump = std::thread::spawn(move || {
-        nora::session::pump::pump_thread(session, pump_slot, proxy, pump_commands_rx, pump_stop)
+        nora::session::pump::pump_thread(
+            first_tab,
+            session,
+            pump_slot,
+            spec_for_pump,
+            proxy,
+            pump_commands_rx,
+            pump_stop,
+        )
     });
     let code = app::run_windowed(
         event_loop,
