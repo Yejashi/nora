@@ -342,3 +342,35 @@ fn config_flag() {
         out.stderr
     );
 }
+
+/// `nora --reload --config <valid> -- COMMAND` re-reads the config before
+/// launch (reporting the new epoch) and still runs the session headless,
+/// propagating the child's exit status.
+#[test]
+fn reload_flag() {
+    let path = write_config("valid.toml", "[terminal]\nhistory = 2000\n");
+    let helper = helper_bin();
+    let mut cmd = Command::new(nora_bin());
+    cmd.arg("--reload")
+        .arg("--config")
+        .arg(&path)
+        .arg("--")
+        .arg(&helper)
+        .arg("status")
+        .arg("7")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY");
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(7),
+        "the child's exit status must still propagate with --reload; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("config reloaded (epoch 1)"),
+        "--reload must report the reloaded epoch; stderr={:?}",
+        out.stderr
+    );
+}

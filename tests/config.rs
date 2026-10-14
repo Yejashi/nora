@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nora::config::{
-    ConfigError, FontConfig, KeysConfig, NoraConfig, TerminalConfig, ThemeConfig, load_config,
-    load_config_with_candidates, parse_config,
+    ConfigChange, ConfigError, ConfigState, FontConfig, KeysConfig, NoraConfig, TerminalConfig,
+    ThemeConfig, classify_change, load_config, load_config_with_candidates, parse_config,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -283,4 +283,130 @@ fn xdg_discovery() {
             std::env::remove_var("XDG_CONFIG_HOME");
         },
     }
+}
+
+// --- N19a: transactional reload and change classification ------------------
+
+/// `ConfigState::new` wraps a loaded config at epoch 0.
+#[test]
+fn config_state_new() {
+    let loaded = load_config_with_candidates(None, &[]).expect("defaults should load");
+    let state = ConfigState::new(loaded);
+    assert_eq!(state.epoch, 0);
+    assert!(state.path.is_none());
+    assert_eq!(state.current.terminal.history, 1000);
+}
+
+/// A reload from a still-valid path succeeds, increments the epoch, and
+/// preserves the source path.
+#[test]
+fn config_state_reload_success() {
+    let tmp = TempDir::new();
+    let path = write_config(&tmp.0, "config.toml", "[terminal]\nhistory = 2000\n");
+    let loaded = load_config(Some(path.to_str().unwrap())).expect("explicit path should load");
+    let state = ConfigState::new(loaded);
+    assert_eq!(state.epoch, 0);
+    assert_eq!(state.current.terminal.history, 2000);
+
+    let reloaded = state.reload().expect("reload should succeed");
+    assert_eq!(reloaded.epoch, 1);
+    assert_eq!(reloaded.current.terminal.history, 2000);
+    assert_eq!(reloaded.path.as_deref(), Some(path.as_path()));
+}
+
+/// A reload that fails validation is transactional: the error surfaces and
+/// the original state is left untouched (epoch and config unchanged).
+#[test]
+fn config_state_reload_failure() {
+    let tmp = TempDir::new();
+    let path = write_config(&tmp.0, "config.toml", "[terminal]\nhistory = 2000\n");
+    let loaded = load_config(Some(path.to_str().unwrap())).expect("explicit path should load");
+    let state = ConfigState::new(loaded);
+    assert_eq!(state.current.terminal.history, 2000);
+    assert_eq!(state.epoch, 0);
+
+    // Corrupt the file on disk; the reload must fail and keep the old state.
+    std::fs::write(&path, "[terminal]\nhistory = 999999999\n").expect("rewrite config");
+    let err = state
+        .reload()
+        .expect_err("invalid config should fail the reload");
+    assert!(
+        matches!(err, ConfigError::Validation { .. }),
+        "expected a Validation error, got: {err:?}"
+    );
+    assert_eq!(
+        state.current.terminal.history, 2000,
+        "old config must be preserved"
+    );
+    assert_eq!(state.epoch, 0, "epoch must not advance on failure");
+}
+
+/// Color and key-binding changes are classified as `Immediate`.
+#[test]
+fn classify_change_immediate() {
+    let old = NoraConfig::default();
+    let mut new = NoraConfig::default();
+    new.theme.background = "#101418".to_string();
+    new.theme.foreground = "#c5c8c6".to_string();
+    new.theme.cursor = "#00ff00".to_string();
+    new.theme.colors.push("#ff0000".to_string());
+    let mut bindings = HashMap::new();
+    bindings.insert("Ctrl+Shift+C".to_string(), "copy".to_string());
+    new.keys.bindings = bindings;
+
+    let changes = classify_change(&old, &new);
+    assert!(
+        changes
+            .iter()
+            .all(|(_, c)| matches!(c, ConfigChange::Immediate)),
+        "all theme/keys changes should be Immediate, got: {changes:?}"
+    );
+    let fields: Vec<&str> = changes.iter().map(|(field, _)| *field).collect();
+    assert!(fields.contains(&"theme.background"));
+    assert!(fields.contains(&"theme.foreground"));
+    assert!(fields.contains(&"theme.cursor"));
+    assert!(fields.contains(&"theme.colors"));
+    assert!(fields.contains(&"keys.bindings"));
+}
+
+/// Font changes are classified as `Staged`.
+#[test]
+fn classify_change_staged() {
+    let old = NoraConfig::default();
+    let mut new = NoraConfig::default();
+    new.font.family = "DejaVu Sans Mono".to_string();
+    new.font.size = 14.0;
+
+    let changes = classify_change(&old, &new);
+    assert!(
+        changes
+            .iter()
+            .all(|(_, c)| matches!(c, ConfigChange::Staged)),
+        "font changes should be Staged, got: {changes:?}"
+    );
+    let fields: Vec<&str> = changes.iter().map(|(field, _)| *field).collect();
+    assert!(fields.contains(&"font.family"));
+    assert!(fields.contains(&"font.size"));
+}
+
+/// Scrollback history is a new-session launch setting.
+#[test]
+fn classify_change_new_session() {
+    let old = NoraConfig::default();
+    let mut new = NoraConfig::default();
+    new.terminal.history = 5000;
+
+    let changes = classify_change(&old, &new);
+    assert_eq!(changes.len(), 1, "only history changed; got: {changes:?}");
+    assert_eq!(changes[0].0, "terminal.history");
+    assert!(matches!(changes[0].1, ConfigChange::NewSession));
+}
+
+/// Identical configs produce no changes.
+#[test]
+fn classify_change_no_change() {
+    let old = NoraConfig::default();
+    let new = NoraConfig::default();
+    let changes = classify_change(&old, &new);
+    assert!(changes.is_empty(), "no changes expected; got: {changes:?}");
 }

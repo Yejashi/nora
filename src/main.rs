@@ -12,6 +12,9 @@
 //! Config (N18b): `--config PATH` selects an explicit config file and
 //! `--check-config` validates the loaded config and exits (no display or
 //! GPU needed). Precedence: CLI flags > config file > built-in defaults.
+//! Reload (N19a): `--reload` re-reads the config from disk, classifies the
+//! changes and swaps in the new state transactionally; a failed reload keeps
+//! the last valid config.
 
 mod app;
 
@@ -35,6 +38,8 @@ Options:\n\
       --config PATH            Use an explicit config file\n\
       --check-config           Validate the config and exit (no display\n\
                                or GPU needed)\n\
+      --reload                 Re-read the config from disk before launch;\n\
+                               a failed reload keeps the last valid config\n\
       --working-directory PATH Start the command in PATH\n\
       --hold                  Keep the window open after the child\n\
                              exits (windowed; headless ignores it)\n\
@@ -48,6 +53,7 @@ fn main() -> ExitCode {
     let mut hold = false;
     let mut config: Option<String> = None;
     let mut check_config = false;
+    let mut reload = false;
     let mut working_directory: Option<PathBuf> = None;
     let mut command: Vec<String> = Vec::new();
     let mut after_separator = false;
@@ -79,6 +85,7 @@ fn main() -> ExitCode {
                 config = Some(path);
             }
             "--check-config" => check_config = true,
+            "--reload" => reload = true,
             "--working-directory" => {
                 let Some(path) = iter.next() else {
                     eprintln!("{NAME} {VERSION}: --working-directory requires a path");
@@ -135,6 +142,32 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // N19a: an explicit `--reload` re-reads the config from disk and swaps in
+    // the new state transactionally. A failed reload (I/O, parse or
+    // validation) keeps the last valid config. Headless-safe: this runs
+    // before any display/GPU work, so it is exercised in CI too.
+    let config_state = nora::config::ConfigState::new(loaded_config);
+    let config_state = if reload {
+        match config_state.reload() {
+            Ok(new_state) => {
+                let changes =
+                    nora::config::classify_change(&config_state.current, &new_state.current);
+                for (field, change_type) in &changes {
+                    eprintln!("config reload: {field} = {change_type:?}");
+                }
+                eprintln!("config reloaded (epoch {})", new_state.epoch);
+                new_state
+            }
+            Err(err) => {
+                eprintln!("config reload failed: {err}");
+                eprintln!("keeping last valid config");
+                config_state
+            }
+        }
+    } else {
+        config_state
+    };
+
     if smoke {
         // N01 windowed smoke cycle; never the launch path.
         return app::run(true);
@@ -164,7 +197,7 @@ fn main() -> ExitCode {
     // N18b precedence: the CLI `--working-directory` (already in
     // `spec.cwd`) overrides any config value; the config overrides the
     // built-in defaults.
-    run_windowed(spec, explicit, hold, &loaded_config.config)
+    run_windowed(spec, explicit, hold, &config_state.current)
 }
 
 /// Headless launch (N05b). 24×80 is the documented headless placeholder

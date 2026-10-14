@@ -11,6 +11,8 @@
 //! - [`load_config`] / [`load_config_with_candidates`] returning a
 //!   [`LoadedConfig`] (config + the path it came from, if any).
 //! - [`ConfigError`] for I/O, parse and validation failures.
+//! - [`ConfigState`] / [`classify_change`] for transactional reload and
+//!   change classification (N19a).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -393,4 +395,110 @@ pub fn parse_config(toml_text: &str) -> Result<NoraConfig, ConfigError> {
     }
 
     Ok(config)
+}
+
+/// The state of the configuration, supporting transactional reload (N19a).
+///
+/// `current` is the active configuration, `path` is where it was loaded from
+/// (if any), and `epoch` increments on every successful reload so callers can
+/// tell which config version is active.
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    /// The currently active configuration.
+    pub current: NoraConfig,
+    /// The path the config was loaded from (if any).
+    pub path: Option<PathBuf>,
+    /// The epoch of the current config (increments on each reload).
+    pub epoch: u64,
+}
+
+impl ConfigState {
+    /// Create a new [`ConfigState`] from a loaded config (epoch 0).
+    pub fn new(loaded: LoadedConfig) -> Self {
+        Self {
+            current: loaded.config,
+            path: loaded.path,
+            epoch: 0,
+        }
+    }
+
+    /// Attempt to reload the config from disk, transactionally.
+    ///
+    /// On success the returned [`ConfigState`] carries the new config and an
+    /// incremented [`epoch`](ConfigState::epoch); the old state is left
+    /// untouched. On failure (I/O, parse or validation) the error is returned
+    /// and the caller keeps the last valid state.
+    ///
+    /// The reload re-reads from the same source the current state came from:
+    /// the explicit path when there is one, otherwise XDG discovery (which
+    /// falls back to the built-in defaults with `path: None`).
+    pub fn reload(&self) -> Result<ConfigState, ConfigError> {
+        let loaded = match &self.path {
+            Some(path) => load_from_path(path.clone()),
+            None => load_config(None),
+        }?;
+
+        Ok(ConfigState {
+            current: loaded.config,
+            path: loaded.path,
+            epoch: self.epoch + 1,
+        })
+    }
+}
+
+/// The type of a config change, by how it is applied (N19a).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigChange {
+    /// Immediate UI change (colors, keys) — applies without a restart.
+    Immediate,
+    /// Staged font/geometry change — applies on the next frame.
+    Staged,
+    /// New-session launch setting — applies to new sessions only.
+    NewSession,
+}
+
+/// Classify the differences between two configs, one entry per changed field.
+///
+/// The result follows a fixed field order (terminal, font, theme, keys), so
+/// callers get a deterministic list. An empty result means the configs are
+/// identical.
+pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str, ConfigChange)> {
+    let mut changes = Vec::new();
+
+    // Terminal settings.
+    if old.terminal.history != new.terminal.history {
+        changes.push(("terminal.history", ConfigChange::NewSession));
+    }
+    if old.terminal.mouse != new.terminal.mouse {
+        changes.push(("terminal.mouse", ConfigChange::Immediate));
+    }
+
+    // Font settings.
+    if old.font.family != new.font.family {
+        changes.push(("font.family", ConfigChange::Staged));
+    }
+    if old.font.size != new.font.size {
+        changes.push(("font.size", ConfigChange::Staged));
+    }
+
+    // Theme settings.
+    if old.theme.background != new.theme.background {
+        changes.push(("theme.background", ConfigChange::Immediate));
+    }
+    if old.theme.foreground != new.theme.foreground {
+        changes.push(("theme.foreground", ConfigChange::Immediate));
+    }
+    if old.theme.cursor != new.theme.cursor {
+        changes.push(("theme.cursor", ConfigChange::Immediate));
+    }
+    if old.theme.colors != new.theme.colors {
+        changes.push(("theme.colors", ConfigChange::Immediate));
+    }
+
+    // Key bindings.
+    if old.keys.bindings != new.keys.bindings {
+        changes.push(("keys.bindings", ConfigChange::Immediate));
+    }
+
+    changes
 }

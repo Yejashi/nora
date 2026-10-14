@@ -190,8 +190,24 @@ Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless
 | --- | --- |
 | `--config <path>` | Use an explicit config file; a missing, unreadable or invalid file exits 1 |
 | `--check-config` | Validate the loaded config and exit — headless, no display or GPU: `config OK: <path or defaults>` on stdout with exit 0, one validation error per line on stderr with exit 1 |
+| `--reload` | Re-read the config from disk before launch and swap in the new state transactionally (N19a); a failed reload keeps the last valid config |
 | `--working-directory <path>` | Working directory for the child process (CLI value; the config schema has no `working_directory` field yet) |
 
 **Precedence:** CLI flags > config file > built-in defaults. `--working-directory` is the first CLI override (it lands in the launch spec's `cwd`, which outranks any future config value). Config values are accepted at launch and logged (`debug: config loaded: …`); scrollback history, font size and theme colors are consumed as the app grows support for them.
 
-Headless CLI fixtures in `tests/cli.rs`: `check_config_valid`, `check_config_invalid`, `check_config_defaults`, `config_flag`.
+Headless CLI fixtures in `tests/cli.rs`: `check_config_valid`, `check_config_invalid`, `check_config_defaults`, `config_flag`, `reload_flag`.
+
+### Reload (N19a)
+
+`src/config.rs` (`nora::config`) adds a transactional reload on top of the N18 loading:
+
+- **`ConfigState`** wraps the active [`NoraConfig`] with the source `path` and a monotonically increasing `epoch` (0 at first load, incremented on each successful reload). `ConfigState::reload()` re-reads from the same source the current state came from (the explicit path, otherwise XDG discovery) and returns a *new* state; the caller swaps it in only on success.
+- **Transactional.** A reload that fails I/O, parsing or validation returns the error and leaves the current state untouched — the last valid config is kept. There is no partial application.
+- **Change classification.** `classify_change(old, new)` diffs two configs and labels each changed field:
+  - `Immediate` — colors (`theme.*`) and key bindings (`keys.bindings`); apply without a restart.
+  - `Staged` — font (`font.family`, `font.size`); apply on the next frame.
+  - `NewSession` — launch settings (`terminal.history`); apply to new sessions only.
+
+**Trigger.** `nora --reload` re-reads the config before launch and logs each classified change plus `config reloaded (epoch N)` on stderr; a failed reload logs the error and `keeping last valid config` and continues with the last valid state. `--reload` is headless-safe (it runs before any display/GPU work). A runtime keybinding is a later slice; the config schema and the headless session pump are unchanged.
+
+Headless fixtures: `tests/config.rs` (`config_state_new`, `config_state_reload_success`, `config_state_reload_failure`, `classify_change_immediate`, `classify_change_staged`, `classify_change_new_session`, `classify_change_no_change`) and `tests/cli.rs` (`reload_flag`).
