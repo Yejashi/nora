@@ -73,6 +73,22 @@ Wrap bracketed data only when the current application mode requests it. A long p
 
 Encode mouse coordinates using current pane/grid geometry and requested mode, with correct release/motion/modifier semantics. Local selection has an explicit override modifier (proposed Shift) when the application requests mouse reporting. Scroll goes to history in normal local mode and to the application when its modes require it. Focus notifications apply to the active session consistently when pane/OS focus changes.
 
+### Mouse reporting (N16a)
+
+Pure encoding in `src/input/mouse.rs` (`encode_mouse_event`), headless fixtures in `tests/mouse_input.rs`. All reporting modes emit the SGR-style format `CSI < b ; x y M` (press/motion/wheel) / `CSI < b ; x y m` (release); button codes are 0/1/2 left/middle/right, motion 32 + held button (35 with no button held), wheel 64/65/66/67 up/down/left/right; modifiers add shift +4, ctrl +8, alt +64.
+
+| Area | v0.1 behavior | Modes | Status / proof |
+| --- | --- | --- | --- |
+| Button press/release | `CSI < b ; x y M` / `CSI < b ; x y m`, b = 0/1/2 | X10, Normal, CellMotion, AllMotion | pass — table rows in `tests/mouse_input.rs` |
+| Motion | b = 32 + held button (35 with no button) | X10: none; Normal: button held only; CellMotion/AllMotion: always | pass — table rows |
+| Wheel | b = 64/65/66/67 (up/down/left/right) | every reporting mode | pass — table rows |
+| Modifiers | shift +4, ctrl +8, alt +64 on the button code | all modes | pass — table rows |
+| Coordinates | `col+1`/`row+1` (1-based); on-grid-edge clamps to the last cell; beyond the grid edge or coordinate >= 256 returns no report | all modes | pass — table rows |
+| Mode derivation | engine `TermMode`: `MOUSE_DRAG` -> AllMotion, `MOUSE_MOTION` -> Normal, `MOUSE_REPORT_CLICK` -> X10, none -> None (most specific flag wins) | — | pass — table rows |
+| SGR format (1006) / UTF-8 (1005) | same bytes as the rows above (N16a format is SGR-style for every mode); flag wiring is N16b | — | **deferred** — N16b |
+| Focus reporting | `CSI I` focus in / `CSI O` focus out; no report when `FOCUS_IN_OUT` is off | — | pass — table rows |
+| Window wiring (winit events, Shift selection override, wheel routing) | — | — | **deferred** — N16b |
+
 Selection uses engine-supported coordinates and wrapped-line information. Copy joins soft wraps without injecting newlines, preserves real newlines, and handles wide spacers/combining marks. During history trimming or reflow, use the engine's selection remapping or invalidate visibly; do not retain stale raw row indices.
 
 ## Native clipboard and IME

@@ -6,6 +6,9 @@
 //! `ElementState::Pressed`, non-synthetic `KeyboardInput` events and calls
 //! [`encode`] with the latest `ModifiersState`.
 
+pub mod focus;
+pub mod mouse;
+
 use alacritty_terminal::term::TermMode;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
