@@ -118,6 +118,13 @@ pub enum AppEvent {
     },
     /// The pane's application rang the bell.
     Bell { pane: PaneKey },
+    /// The pane's search position: match `current` (1-based; 0 = none)
+    /// of `total`.
+    SearchStatus {
+        pane: PaneKey,
+        current: usize,
+        total: usize,
+    },
     /// The background font loader finished the full font system (sent by
     /// the window's own loader thread, not the pump).
     FontsReady,
@@ -216,6 +223,13 @@ pub enum PumpMsg {
     PreviousPrompt { pane: PaneKey },
     /// Select the pane's previous command output (OSC 133).
     SelectPreviousCommand { pane: PaneKey },
+    /// Search the pane's scrollback and screen for `query` and show the
+    /// newest match (empty query: clear).
+    SearchQuery { pane: PaneKey, query: String },
+    /// Show the next (older with `backwards`) match of the current query.
+    SearchStep { pane: PaneKey, backwards: bool },
+    /// End the search: clear its highlight and return to the bottom.
+    SearchEnd { pane: PaneKey },
     /// The window's cell size in pixels changed (zoom, scale factor):
     /// reported to every child and used for new panes.
     CellSize { width: u16, height: u16 },
@@ -296,6 +310,29 @@ pub fn advance_paste_block(paste_block: &mut Option<(usize, usize)>, drained: us
 /// dead (N09b, extended for N17b paste tracking). Advances
 /// `paste_block` as bytes drain, so an in-flight paste's block stays
 /// aligned with `pending_input`. Returns the total bytes fed this call.
+/// Show `hit` (scroll + selection) and report the search position.
+fn show_search(
+    pane: PaneKey,
+    pane_pump: &mut PanePump,
+    hits: &[crate::engine::SearchHit],
+    hit: Option<crate::engine::SearchHit>,
+    events: &winit::event_loop::EventLoopProxy<AppEvent>,
+) {
+    match hit {
+        Some(hit) => pane_pump.session.engine().show_search_hit(hit),
+        None => pane_pump.session.engine().clear_selection(),
+    }
+    pane_pump.force_snapshot = true;
+    let current = hit
+        .and_then(|h| hits.iter().position(|x| *x == h))
+        .map_or(0, |i| i + 1);
+    let _ = events.send_event(AppEvent::SearchStatus {
+        pane,
+        current,
+        total: hits.len(),
+    });
+}
+
 /// Close a session on its own short-lived thread (it may wait for the
 /// child, see [`PtySession::close`]). `None` if the thread could not be
 /// spawned, in which case the session is closed inline.
@@ -365,6 +402,8 @@ struct PanePump {
     force_snapshot: bool,
     /// The last published title.
     last_title: Option<String>,
+    /// The active search: its query and the match currently shown.
+    search: Option<(String, Option<crate::engine::SearchHit>)>,
     /// Pending input bytes for this pane (N09b/N17b).
     pending_input: Vec<u8>,
     /// The in-flight paste block within `pending_input`, as a half-open
@@ -390,6 +429,7 @@ impl PanePump {
             session,
             force_snapshot: false,
             last_title: None,
+            search: None,
             pending_input: Vec::new(),
             paste_block: None,
             last_modes: None,
@@ -613,6 +653,44 @@ pub fn pump_thread(
                 PumpMsg::SelectPreviousCommand { pane } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
                         let _ = pane_pump.session.engine().select_previous_command();
+                        pane_pump.force_snapshot = true;
+                    }
+                }
+                PumpMsg::SearchQuery { pane, query } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        let hits = pane_pump.session.engine().search_text(&query);
+                        // Start from the newest match, as a reader scrolling
+                        // up from the prompt would.
+                        let shown = hits.last().copied();
+                        show_search(pane, pane_pump, &hits, shown, &events);
+                        pane_pump.search = Some((query, shown));
+                    }
+                }
+                PumpMsg::SearchStep { pane, backwards } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane)
+                        && let Some((query, current)) = pane_pump.search.clone()
+                    {
+                        let hits = pane_pump.session.engine().search_text(&query);
+                        let key = |h: &crate::engine::SearchHit| (h.line, h.start);
+                        let next = match current {
+                            Some(cur) if backwards => hits
+                                .iter()
+                                .rev()
+                                .find(|h| key(h) < key(&cur))
+                                .or(hits.last()),
+                            Some(cur) => hits.iter().find(|h| key(h) > key(&cur)).or(hits.first()),
+                            None => hits.last(),
+                        }
+                        .copied();
+                        show_search(pane, pane_pump, &hits, next, &events);
+                        pane_pump.search = Some((query, next));
+                    }
+                }
+                PumpMsg::SearchEnd { pane } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.search = None;
+                        pane_pump.session.engine().clear_selection();
+                        pane_pump.session.engine().scroll(Scroll::Bottom);
                         pane_pump.force_snapshot = true;
                     }
                 }

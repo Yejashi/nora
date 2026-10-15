@@ -94,12 +94,19 @@ pub fn cursor_visible(snap: &Snapshot) -> bool {
 /// shape is a single `Partial` span exactly at the cursor cell
 /// (`line == cursor row`, `left == right == cursor col`) — what the engine
 /// reports when only the cursor moved in place — or an empty `Partial`
-/// with no cursor. Anything wider, on another row, `Full`, or a span with
-/// no cursor to account for it is real damage.
+/// (nothing damaged, whatever the cursor). Anything wider, on another row,
+/// `Full`, or a span with no cursor to account for it is real damage.
 pub fn is_noop_damage(damage: &Damage, cursor: Option<(usize, usize)>) -> bool {
     let Damage::Partial(lines) = damage else {
         return false;
     };
+    // Nothing damaged is a no-op whatever the cursor. (While the view is
+    // scrolled back the cursor is off screen and alacritty reports an empty
+    // list; treating that as damage built a snapshot and a frame on every
+    // pump wake, an endless redraw loop.)
+    if lines.is_empty() {
+        return true;
+    }
     match cursor {
         None => lines.is_empty(),
         Some((line, col)) => {

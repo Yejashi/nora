@@ -416,25 +416,29 @@ scenario_paneexit() {
     pass paneexit
 }
 
-# Search: the bar shows the query, and nothing typed into search (text,
-# Space, arrows, Tab) reaches the shell.
+# Search: the bar shows the query and position, matches in the scrollback
+# are found and scrolled into view (marked with the selection color), and
+# nothing typed into search (text, Space, arrows, Tab) reaches the shell.
 scenario_search() {
     local dir="$OUT/search"; mkdir -p "$dir"
     launch search bash --norc --noprofile || { fail search "no window"; return; }
-    xdotool type --delay 15 "echo alpha beta alpha"; xdotool key Return
-    sleep 0.3
+    xdotool type --delay 15 "echo NEEDLE-OLD; seq 1 200"; xdotool key Return
+    sleep 1
+    shot "$dir/before.png"
     xdotool key ctrl+shift+f
-    xdotool type --delay 15 "zzz"
-    xdotool key space Up Down Left Tab
+    xdotool type --delay 15 "needle-old"
+    xdotool key space BackSpace Up Down Left Tab
     shot "$dir/bar.png"
     xdotool key Escape
     xdotool type --delay 15 "echo CLEAN > $dir/out.txt"; xdotool key Return
     wait_file "$dir/out.txt" || { finish; fail search "command after search did not run"; return; }
     finish
-    local bar
+    local bar sel
     bar=$(count_color "$dir/bar.png" '#3A2E10')
-    echo "  search bar px: $bar, command output: $(cat "$dir/out.txt")"
+    sel=$(count_color "$dir/bar.png" '#335577')
+    echo "  search bar px: $bar, match highlight px: $sel, command output: $(cat "$dir/out.txt")"
     [ "$bar" -gt 1000 ] || { fail search "no search bar drawn"; return; }
+    [ "$sel" -gt 100 ] || { fail search "scrollback match not shown"; return; }
     [ "$(cat "$dir/out.txt")" = "CLEAN" ] || { fail search "search keys leaked to the shell"; return; }
     pass search
 }
@@ -526,6 +530,25 @@ scenario_hyperlink() {
     pass hyperlink
 }
 
+# Idle: a window that is idle (also while scrolled back in history) draws
+# no frames; a redraw loop here once drew hundreds per second.
+scenario_idle() {
+    local dir="$OUT/idle"; mkdir -p "$dir"
+    NORA_TRACE_FRAMES=1 launch idle bash --norc --noprofile || { fail idle "no window"; return; }
+    xdotool type --delay 15 "seq 1 300"; xdotool key Return
+    sleep 1
+    xdotool key shift+Prior
+    sleep 1
+    local before after
+    before=$(grep -c '^frame:' "$OUT/idle/nora.log")
+    sleep 3
+    after=$(grep -c '^frame:' "$OUT/idle/nora.log")
+    finish
+    echo "  frames during 3 s idle while scrolled back: $((after - before))"
+    [ $((after - before)) -le 2 ] || { fail idle "redraw loop: $((after - before)) frames while idle"; return; }
+    pass idle
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -585,7 +608,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config reports hyperlink vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config reports hyperlink idle vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

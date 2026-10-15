@@ -1119,6 +1119,15 @@ impl WinApp {
         self.resize_all_panes();
     }
 
+    /// Close the search bar and end the pane's search (its highlight is
+    /// cleared and the view returns to the bottom).
+    fn close_search(&mut self) {
+        self.search.close();
+        if let Some(pane) = self.active_pane_key() {
+            let _ = self.pump_commands.send(PumpMsg::SearchEnd { pane });
+        }
+    }
+
     /// Re-read the configuration and apply it. Colors, bindings, the wheel
     /// multiplier, the selection color and the cursor shape apply at once;
     /// a font change reloads the fonts and resizes every pane; scrollback
@@ -1222,7 +1231,13 @@ impl WinApp {
                 };
                 return self.focus_pane_direction(dir);
             }
-            UiAction::ToggleSearch => self.search.toggle(),
+            UiAction::ToggleSearch => {
+                if self.search.visible {
+                    self.close_search();
+                } else {
+                    self.search.toggle();
+                }
+            }
             UiAction::ReloadConfig => self.reload_config(),
             UiAction::PreviousPrompt | UiAction::SelectPreviousCommand => {
                 if let Some(pane) = self.active_pane_key() {
@@ -1495,6 +1510,19 @@ impl WinApp {
             }
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged => {}
+            AppEvent::SearchStatus {
+                pane,
+                current,
+                total,
+            } => {
+                if self.active_pane_key() == Some(pane) && self.search.visible {
+                    self.search.state.current = current.saturating_sub(1);
+                    self.search.state.total = total;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
             AppEvent::Title { pane, title } => {
                 match title {
                     Some(title) => self.pane_titles.insert(pane, title),
@@ -1709,9 +1737,10 @@ impl WinApp {
                     None => self.palette.background(),
                 };
                 let frame_bg = [frame_bg.r, frame_bg.g, frame_bg.b];
-                // Search and selection belong to the active pane; their
-                // cells are offset to its origin.
-                let mut search_cells: Vec<(u32, u32)> = Vec::new();
+                // The selection belongs to the active pane; its cells are
+                // offset to its origin. (Search matches are marked with the
+                // selection by the pump, so no separate search cells.)
+                let search_cells: Vec<(u32, u32)> = Vec::new();
                 let mut selection_cells: Vec<(u32, u32)> = Vec::new();
                 let mut line1 = String::new();
                 if let Some(&(_, x, y, _, _, Some(ref snap))) = active_entry {
@@ -1723,17 +1752,6 @@ impl WinApp {
                                 .collect()
                         })
                         .collect();
-                    if self.search.visible && !self.search.state.query.is_empty() {
-                        self.search.research(&self.last_visible);
-                    }
-                    if let Some(m) = self.search.current_match()
-                        && m.row < snap.rows
-                    {
-                        let start = m.col.min(snap.cols);
-                        let end = (start + self.search.state.query.chars().count()).min(snap.cols);
-                        search_cells
-                            .extend((start..end).map(|col| (y + m.row as u32, x + col as u32)));
-                    }
                     for (i, selected) in snap.selected.iter().enumerate() {
                         if *selected {
                             let (row, col) = (i / snap.cols, i % snap.cols);
@@ -1827,7 +1845,7 @@ impl WinApp {
                     let status = if state.query.is_empty() {
                         String::new()
                     } else if state.total == 0 {
-                        "  no matches on screen".to_string()
+                        "  no matches".to_string()
                     } else {
                         format!("  {}/{}", state.current + 1, state.total)
                     };
@@ -2282,42 +2300,49 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         return;
                     }
                 }
-                // While the search bar is open it owns text input.
+                // While the search bar is open it owns text input. The pump
+                // searches the pane's scrollback and screen and marks the
+                // match with the selection.
                 if self.search.visible {
-                    match &event.logical_key {
+                    let pane = self.active_pane_key();
+                    let query_changed = match &event.logical_key {
                         Key::Character(text) => {
-                            self.search.input(text, &self.last_visible);
-                            window.request_redraw();
-                            return;
-                        }
-                        Key::Named(NamedKey::Enter) => {
-                            if self.mods.shift_key() {
-                                self.search.prev();
-                            } else {
-                                self.search.next();
-                            }
-                            window.request_redraw();
-                            return;
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            self.search.backspace(&self.last_visible);
-                            window.request_redraw();
-                            return;
-                        }
-                        Key::Named(NamedKey::Escape) => {
-                            self.search.close();
-                            window.request_redraw();
-                            return;
+                            self.search.state.query.push_str(text);
+                            true
                         }
                         Key::Named(NamedKey::Space) => {
-                            self.search.input(" ", &self.last_visible);
-                            window.request_redraw();
-                            return;
+                            self.search.state.query.push(' ');
+                            true
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.search.state.query.pop();
+                            true
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some(pane) = pane {
+                                let backwards = !self.mods.shift_key();
+                                let _ = self
+                                    .pump_commands
+                                    .send(PumpMsg::SearchStep { pane, backwards });
+                            }
+                            false
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.close_search();
+                            false
                         }
                         // Every other key is swallowed while searching: it
                         // must not reach the application.
-                        _ => return,
+                        _ => false,
+                    };
+                    if query_changed && let Some(pane) = pane {
+                        let query = self.search.state.query.clone();
+                        let _ = self
+                            .pump_commands
+                            .send(PumpMsg::SearchQuery { pane, query });
                     }
+                    window.request_redraw();
+                    return;
                 }
                 if let Some(action) = encode(
                     &event.logical_key,
@@ -2554,6 +2579,20 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     if let Some(committed) = committed.filter(|c| !c.is_empty()) {
                         if debug_enabled() {
                             eprintln!("IME: commit = {committed:?}");
+                        }
+                        // While searching, committed text is search input
+                        // (on Wayland text-input every letter arrives this
+                        // way); it must not reach the shell.
+                        if self.search.visible {
+                            self.search.state.query.push_str(&committed);
+                            if let Some(pane) = self.active_pane_key() {
+                                let query = self.search.state.query.clone();
+                                let _ = self
+                                    .pump_commands
+                                    .send(PumpMsg::SearchQuery { pane, query });
+                            }
+                            window.request_redraw();
+                            return;
                         }
                         if let Some(pane) = self.active_pane_key() {
                             let _ = self.pump_commands.send(PumpMsg::Input {

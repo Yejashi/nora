@@ -179,7 +179,7 @@ server available, the launch falls back to the headless session pump.
 | Close pane (tab, window) | Ctrl+Shift+W |
 | Reload config | Ctrl+Shift+F5 |
 | Previous prompt / select last output | Ctrl+Shift+Z / Ctrl+Shift+G (shell integration) |
-| Search (visible screen) | Ctrl+Shift+F; Enter / Shift+Enter next / previous, Escape closes |
+| Search (scrollback and screen) | Ctrl+Shift+F; Enter older match, Shift+Enter newer, Escape closes |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
 

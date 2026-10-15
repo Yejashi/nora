@@ -11,6 +11,15 @@ use alacritty_terminal::grid::Scroll;
 
 use nora::engine::{Damage, Engine, opener_argv};
 
+/// The platform opener `opener_argv` uses.
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else if cfg!(windows) {
+    "explorer"
+} else {
+    "xdg-open"
+};
+
 /// Feed `count` lines of `line\n` to the engine in one chunk. Each
 /// newline past the viewport bottom pushes one line into scrollback
 /// history (up to the engine's scrollback cap).
@@ -414,39 +423,33 @@ fn select_previous_command_across_scroll() {
 // N35d: hyperlink activation opener resolution (pure function)
 // ---------------------------------------------------------------------------
 
-/// `opener_argv` for an `https` URI returns `["xdg-open", <uri>]`.
+/// `opener_argv` for an `https` URI returns `[OPENER, <uri>]`.
 #[test]
 fn opener_argv_http() {
     assert_eq!(
         opener_argv("https://example.com"),
-        Some(vec![
-            "xdg-open".to_string(),
-            "https://example.com".to_string()
-        ])
+        Some(vec![OPENER.to_string(), "https://example.com".to_string()])
     );
 }
 
-/// `opener_argv` for a `mailto` URI returns `["xdg-open", <uri>]`.
+/// `opener_argv` for a `mailto` URI returns `[OPENER, <uri>]`.
 #[test]
 fn opener_argv_mailto() {
     assert_eq!(
         opener_argv("mailto:user@example.com"),
         Some(vec![
-            "xdg-open".to_string(),
+            OPENER.to_string(),
             "mailto:user@example.com".to_string()
         ])
     );
 }
 
-/// `opener_argv` for a `file` URI returns `["xdg-open", <uri>]`.
+/// `opener_argv` for a `file` URI returns `[OPENER, <uri>]`.
 #[test]
 fn opener_argv_file() {
     assert_eq!(
         opener_argv("file:///home/user"),
-        Some(vec![
-            "xdg-open".to_string(),
-            "file:///home/user".to_string()
-        ])
+        Some(vec![OPENER.to_string(), "file:///home/user".to_string()])
     );
 }
 
@@ -473,10 +476,7 @@ fn opener_argv_no_scheme() {
 fn opener_argv_whitespace_trimmed() {
     assert_eq!(
         opener_argv("  https://example.com  "),
-        Some(vec![
-            "xdg-open".to_string(),
-            "https://example.com".to_string()
-        ])
+        Some(vec![OPENER.to_string(), "https://example.com".to_string()])
     );
 }
 
@@ -554,10 +554,7 @@ fn engine_hyperlink_drain_and_activate() {
     let opener = engine.activate_hyperlink(0, 0);
     assert_eq!(
         opener,
-        Some(vec![
-            "xdg-open".to_string(),
-            "https://example.com".to_string()
-        ])
+        Some(vec![OPENER.to_string(), "https://example.com".to_string()])
     );
 
     // The hyperlink was consumed by activation.
@@ -586,4 +583,57 @@ fn engine_hyperlink_activate_disallowed_scheme() {
     assert_eq!(engine.activate_hyperlink(0, 0), None);
     // The hyperlink was consumed despite the disallowed scheme.
     assert!(engine.drain_hyperlinks().is_empty());
+}
+
+/// Scrollback search: matches in the history are found (negative grid
+/// lines), shown by scrolling, and marked with the selection; case is
+/// ignored for an all-lowercase query only.
+#[test]
+fn search_finds_matches_in_scrollback_and_scrolls_to_them() {
+    let mut engine = nora::engine::Engine::with_history(5, 30, 200);
+    let mut stream = Vec::new();
+    for i in 0..60 {
+        if i == 7 {
+            stream.extend_from_slice(b"the NEEDLE is here\r\n");
+        } else {
+            stream.extend_from_slice(format!("filler line {i}\r\n").as_bytes());
+        }
+    }
+    engine.feed(&stream);
+    let hits = engine.search_text("needle");
+    assert_eq!(hits.len(), 1, "case-insensitive for a lowercase query");
+    let hit = hits[0];
+    assert!(hit.line < 0, "the match is in the scrollback: {hit:?}");
+    assert_eq!((hit.start, hit.end), (4, 9));
+    assert!(
+        engine.search_text("Needle").is_empty(),
+        "uppercase makes it exact"
+    );
+    assert_eq!(engine.display_offset(), 0);
+    engine.show_search_hit(hit);
+    assert!(engine.display_offset() > 0, "scrolled to the match");
+    let snap = engine.snapshot();
+    let selected: usize = snap.selected.iter().filter(|s| **s).count();
+    assert_eq!(selected, 6, "the six cells of NEEDLE are selected");
+}
+
+/// Regression: while the view is scrolled back, an idle terminal reports no
+/// damage (it used to count as damage on every probe, so the pump built a
+/// snapshot and the window drew a frame on every wake: a redraw loop).
+#[test]
+fn idle_terminal_scrolled_back_reports_no_damage() {
+    let mut engine = Engine::with_history(5, 20, 100);
+    let mut s = Vec::new();
+    for i in 0..30 {
+        s.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    engine.feed(&s);
+    engine.scroll(alacritty_terminal::grid::Scroll::PageUp);
+    let _ = engine.snapshot();
+    assert!(engine.display_offset() > 0);
+    let (damage, cursor) = engine.probe();
+    assert!(
+        nora::render::term::is_noop_damage(&damage, cursor),
+        "idle while scrolled back must be a no-op: {damage:?} {cursor:?}"
+    );
 }

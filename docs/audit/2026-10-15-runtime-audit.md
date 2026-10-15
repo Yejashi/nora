@@ -65,7 +65,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | M2.1 found | A split lost the previous pane's snapshot slot (it stopped updating) | M2.1 |
 | M2.1 found | Tab bar row and tab open/close did not resize other tabs' panes | M2.1 |
 | I-F6 | A child exiting in one half of a split closed the whole window (stale tab layout); a dead pane otherwise stayed frozen | M2.2 (exited pane closes; window closes with the last pane of the last tab; `--hold` keeps panes) |
-| I-F10 | Search bar never drawn; Space/arrows leaked to the shell while searching | M2.3 (bar with query and n/m; all keys captured). Open: search covers the visible screen only, not scrollback |
+| I-F10 | Search bar never drawn; Space/arrows leaked to the shell while searching | M2.3 (bar with query and n/m; all keys captured) |
 | IME (lower) | Preedit never drawn; IME cursor area never set (candidate window misplaced) | M2.4 implemented: preedit drawn underlined at the cursor, cursor area reported every frame. **Unverified with a real input method** (Xvfb has none); needs a manual check under fcitx5/ibus |
 | M3 found | Startup 1.16 s: all installed fonts scanned twice per launch (nora's style lookup and cosmic-text's `new_with_fonts`) | M3 (fontconfig lookups; background fallback system; first frame ~180 ms) |
 | M3 found | Pump snapshotted under the terminal lock on every wake while the window held an undrawn snapshot | M3 (backpressure; 56 MiB/s windowed) |
@@ -74,6 +74,8 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | P10 | Child inherited the parent terminal's identity (VTE_VERSION, TMUX, ...); no TERM_PROGRAM; TERMINFO_DIRS ignored | M1.8 |
 | P11 | OSC 10/11/12 replies hardcoded white/black; pixel sizes nominal 8x16 | M1.8 (palette replies; real cell pixels, updated on zoom/scale) |
 | I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
+| M3 regression | Redraw loop while scrolled back: empty damage with an off-screen cursor counted as damage, and the post-frame pump wake (M3) turned it into a frame per wake (1703 frames in a short idle run) | fixed (17 frames; e2e `idle` guards it) |
+| I-F10 (rest) | Search covered the visible screen only | fixed: pump searches scrollback + screen, scrolls to and selects the match; IME-committed text goes to the search query |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

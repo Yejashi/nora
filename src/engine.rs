@@ -554,6 +554,18 @@ pub fn opener_argv(uri: &str) -> Option<Vec<String>> {
     Some(vec![opener.to_string(), uri.to_string()])
 }
 
+/// Most matches [`Engine::search_text`] returns.
+pub const MAX_SEARCH_HITS: usize = 10_000;
+
+/// One search match: grid `line` (0 = top screen row, negative = in the
+/// scrollback) and its first and last column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchHit {
+    pub line: i32,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl Engine {
     /// Create a headless engine with a `rows` × `cols` viewport and no
     /// scrollback.
@@ -1133,6 +1145,81 @@ impl Engine {
         grid.total_lines().saturating_sub(grid.screen_lines())
     }
 
+    /// Every occurrence of `query` in the scrollback and the screen, top
+    /// to bottom (at most [`MAX_SEARCH_HITS`]). Matching is per line;
+    /// it ignores case unless the query has an uppercase letter.
+    pub fn search_text(&self, query: &str) -> Vec<SearchHit> {
+        use alacritty_terminal::index::{Column, Line};
+        let mut hits = Vec::new();
+        if query.is_empty() {
+            return hits;
+        }
+        let fold = !query.chars().any(char::is_uppercase);
+        let norm = |c: char| {
+            if fold {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c
+            }
+        };
+        let needle: Vec<char> = query.chars().map(norm).collect();
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.total_lines().saturating_sub(grid.screen_lines()) as i32;
+        let cols = grid.columns();
+        for line in -history..grid.screen_lines() as i32 {
+            let row = &grid[Line(line)];
+            // Characters with their columns, skipping wide-char spacers.
+            let chars: Vec<(char, usize)> = (0..cols)
+                .filter_map(|c| {
+                    let cell = &row[Column(c)];
+                    (!cell.flags.contains(Flags::WIDE_CHAR_SPACER)).then(|| (norm(cell.c), c))
+                })
+                .collect();
+            if chars.len() < needle.len() {
+                continue;
+            }
+            for start in 0..=chars.len() - needle.len() {
+                if chars[start..start + needle.len()]
+                    .iter()
+                    .zip(&needle)
+                    .all(|((c, _), n)| c == n)
+                {
+                    hits.push(SearchHit {
+                        line,
+                        start: chars[start].1,
+                        end: chars[start + needle.len() - 1].1,
+                    });
+                    if hits.len() >= MAX_SEARCH_HITS {
+                        return hits;
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// Scroll `hit` into view (to the bottom row when it is off screen) and
+    /// select it, so the selection highlight marks the match.
+    pub fn show_search_hit(&self, hit: SearchHit) {
+        let rows = self.rows as i32;
+        let visible = |offset: usize| {
+            let row = hit.line + offset as i32;
+            (0..rows).contains(&row).then_some(row as usize)
+        };
+        let row = match visible(self.display_offset()) {
+            Some(row) => row,
+            None => {
+                self.scroll_to_line(hit.line);
+                match visible(self.display_offset()) {
+                    Some(row) => row,
+                    None => return,
+                }
+            }
+        };
+        self.select((row, hit.start), (row, hit.end));
+    }
+
     /// Set the selection to the range `start..=end` in viewport
     /// `(row, col)` coordinates (N14b). The range is linear row-major;
     /// `start` and `end` may be given in either order.
@@ -1328,9 +1415,15 @@ impl Engine {
             ),
         };
 
-        let content = term.renderable_content();
-        let cursor = point_to_viewport(content.display_offset, content.cursor.point)
-            .map(|p| (p.line, p.column.0));
+        // The cursor in screen coordinates, the same space alacritty
+        // records cursor damage in, whatever the display offset. (The
+        // viewport-mapped cursor is None while scrolled back, which made
+        // every probe count the cursor line as real damage: a snapshot per
+        // pump wake and a redraw loop while the view was scrolled.)
+        let point = term.grid().cursor.point;
+        let cursor = usize::try_from(point.line.0)
+            .ok()
+            .map(|line| (line, point.column.0));
 
         (damage, cursor)
     }
