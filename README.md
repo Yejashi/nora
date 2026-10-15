@@ -1,61 +1,190 @@
 # nora
 
-A fast, efficient, maintainable desktop terminal for Linux, written in Rust,
+A fast, efficient, maintainable Linux desktop terminal written in Rust,
 with native Wayland and X11 support.
 
-## v0.1 Release Notes
+## Status
 
-All 30 feature cards (N00-N30) are complete: terminal engine, PTY sessions,
-windowed and headless rendering, tabs/splits, search, selection, clipboard,
-configuration, benchmarks and release packaging. See
-[docs/13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) for the v0.1
-acceptance assessment (compatibility, performance, resources, known
-limitations).
+- **v0.1 is complete and accepted** (2026-10-14). See
+  [docs/13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) for the acceptance
+  assessment: application matrix, P01–P10 performance workloads, resource
+  limits and known limitations.
+- **Post-v0.1 extensions (N32–N36) are complete**: kitty-style terminal
+  graphics, shell integration (OSC 133/7/8), prompt navigation,
+  previous-command selection, working-directory tracking, hyperlink
+  activation, and the accessibility feasibility ADR (ADR-012).
+- The N00–N36 roadmap is closed. The next post-v0.1 increment is N37
+  (accessible terminal-text exposure), scoped in
+  [docs/tasks/N37-accessible-text.md](docs/tasks/N37-accessible-text.md).
 
-Research snapshot: 10 October 2026. This is an implementation plan, not a working terminal or a benchmark result.
+## Features
 
-**Goal:** build `nora`, a fast, efficient, maintainable desktop terminal in Rust, with no Python dependency in its application, build scripts, or project-owned development tools. Start on Linux with native Wayland and X11. Deliver a reliable daily-use terminal before expanding toward kitty-style features.
+**Terminal core (v0.1)**
 
-**Recommended foundation:** `alacritty_terminal` for terminal semantics and PTY integration; `winit` for windows and input; `wgpu` for graphics; `cosmic-text` for font discovery, fallback and rasterization. Evaluate `glyphon` behind a rendering adapter, but do not mistake paragraph layout for terminal cell layout. Resolve dependency compatibility and bounded I/O in small, executable spikes.
+- Live PTY sessions with reliable child lifecycle, exit-status propagation
+  and bounded output queues
+- Tabs and splits with live configuration reload
+- Scrollback (default 1,000 lines, configurable to 1,000,000), selection and
+  scrollback search
+- Native clipboard (OSC 52 reads disabled; writes opt-in) and bracketed paste
+- Kitty keyboard protocol, IME, mouse reporting and focus events
+- UTF-8 with per-character font fallback (CJK wide text, box drawing)
+- GPU rendering (wgpu) with damage tracking and a pulse-gated render loop —
+  no continuous redraw while idle
+- Bounded resource use, audited in `docs/12-resource-limits.md`
+- `TERM=nora` terminfo identity (a strict subset of `xterm-256color`)
 
-This recommendation is an engineering judgment based on the linked primary sources. It does not establish that Rust or nora will outperform kitty. Kitty already places performance-sensitive work in C.
+**Terminal graphics (N32–N34)** — kitty-style protocol over the APC hook:
 
-## Put this pack in an empty repository
+- RGB (`f=24`) and RGBA (`f=32`) uploads, chunked uploads (`m=1`), query,
+  placement, delete, scroll and clipping
+- Budgets: 32 MiB per image, 128 MiB total, 1,024 image/placement IDs
+- PNG (`f=100`) is documented as a later slice
 
-Extract the archive directly into the repository root. It supplies `AGENTS.md`, this file, the initial prompt, documentation, task cards and status templates. It deliberately supplies no speculative Cargo workspace or uncompiled application code. The agent creates those incrementally.
+**Shell integration (N35)** — opt-in via `shell/nora-bash.sh`:
 
-Before implementation, configure the repository's intended Git remote and working branch, and make sure the agent's environment can authenticate to push. The agent must inspect the existing Git state and preserve any user changes. It must not invent a remote, change Git identity, or embed credentials.
+- OSC 133 prompt markers (A/B/C/D)
+- Jump to previous prompt and previous-command selection
+- Working-directory tracking (OSC 7)
+- Hyperlinks (OSC 8) with click activation via `xdg-open`
 
-## Start the agent
+## Requirements
 
-Use the complete message in [INITIAL_AGENT_PROMPT.md](INITIAL_AGENT_PROMPT.md). The agent should first read [AGENTS.md](AGENTS.md), [the workflow](docs/08-agent-workflow.md), [the status file](docs/status/PROGRESS.md), and the next task card. It should then implement one small increment, validate it, commit it, and push it before taking the next task.
+- Linux x86_64 with a native Wayland or X11 session
+- Rust 1.95 (pinned by `rust-toolchain.toml`)
+- A Vulkan-capable GPU (CI uses lavapipe; a software GPU validates the
+  rendering path but is not hardware performance evidence)
 
-On the Tellico cluster, run it as a single agent from the repository root: `opencode-tellico 0 --solo --steps 100000`, at the default medium thinking (`--steps` lifts the 200-step turn limit so an unattended session does not stop and wait); use `/think-xhigh` for an individual hard design or debugging question rather than a whole session. The default orchestrate lead cannot run `cargo` or commit, and the roadmap is sequential, so solo is the fit.
+## Building
 
-**A completed feature always gets a commit and push.** An authentication or remote failure is a reported blocker, not permission to claim completion or continue piling up unpushed features. Do not force-push.
+```sh
+cargo build --release
+```
 
-## Reading map
+Windowing backend configurations (winit):
 
-| Document | Purpose | Read when |
-| --- | --- | --- |
-| [01-research.md](docs/01-research.md) | Evidence, alternatives, recommended approach | Planning or challenging the foundation |
-| [02-product.md](docs/02-product.md) | What nora ships and what it defers | Before feature work |
-| [03-architecture.md](docs/03-architecture.md) | Module ownership, concurrency, snapshots, resource limits | Before core or session changes |
-| [04-performance.md](docs/04-performance.md) | Metrics, provisional goals and benchmark design | Instrumentation or optimization |
-| [05-rendering.md](docs/05-rendering.md) | Fixed-cell fonts, caching, damage and GPU lifecycle | Rendering changes |
-| [06-compatibility.md](docs/06-compatibility.md) | Protocol contract and input behavior | Terminal, input or clipboard changes |
-| [07-build-release.md](docs/07-build-release.md) | Dependencies, build, CI and packaging | Bootstrap or release work |
-| [08-agent-workflow.md](docs/08-agent-workflow.md) | Small-context workflow and commit/push requirements | Every session |
-| [09-validation.md](docs/09-validation.md) | Correctness and integration tests | Every feature's test selection |
-| [10-roadmap.md](docs/10-roadmap.md) | Ordered feature cards and release gates | Selecting work |
-| [11-risks.md](docs/11-risks.md) | Failure modes and decision triggers | A spike fails or scope changes |
-| [12-sources.md](docs/12-sources.md) | Primary-source links and evidence boundaries | Verifying upstream claims |
-| [13-extensions.md](docs/13-extensions.md) | Graphics, shell integration and later features | After the v0.1 release gate |
-| [status/PROGRESS.md](docs/status/PROGRESS.md) | Durable implementation state | Every session |
-| [status/HANDOFF_TEMPLATE.md](docs/status/HANDOFF_TEMPLATE.md) | Short recovery checkpoint | Ending or resetting context |
+| Configuration | Command |
+| --- | --- |
+| Wayland + X11 (default) | `cargo build --release` |
+| X11 only | `cargo build --release --no-default-features --features x11` |
+| Wayland only | `cargo build --release --no-default-features --features wayland` |
 
-## Success means
+## Installing
 
-Nora runs real shells and TUIs correctly; remains interactive while another pane produces output; has useful tabs, splits, search, selection and configuration; uses bounded resources; and has reproducible measurements on actual Linux hardware. Builds and tests are reproducible from Git. Limitations are documented honestly, and no feature is marked shipped merely because a window opens.
+```sh
+./scripts/install.sh
+```
 
-The task cards are deliberately narrower than milestones. If a card still exceeds a manageable context slice, split it into separately useful, tested increments, with a commit and push for each.
+No root required. Installs `~/.local/bin/nora`, the compiled `nora`
+terminfo entry, the desktop entry and icon, and copies
+`resources/nora.example.toml` to `~/.config/nora/config.toml` when no config
+exists (an existing config is never touched). `./scripts/uninstall.sh`
+removes the installed artifacts and preserves your config.
+
+To install only the terminfo entry on another host (for SSH remote use):
+
+```sh
+tic -x terminfo/nora.terminfo
+```
+
+## Usage
+
+```
+usage: nora [OPTIONS] [-- COMMAND ARG...]
+
+Options:
+  -h, --help                   Print this help message
+  -V, --version                Print nora's name and version
+      --smoke                  Run one automated window smoke cycle and exit
+      --config PATH            Use an explicit config file
+      --check-config           Validate the config and exit (no display
+                               or GPU needed)
+      --reload                 Re-read the config from disk before launch;
+                               a failed reload keeps the last valid config
+      --working-directory PATH Start the command in PATH
+      --hold                   Keep the window open after the child
+                               exits (windowed; headless ignores it)
+      --                       Remainder is the command argv (no shell
+                               interpolation)
+```
+
+With no command, the default shell (`$SHELL`, else `/bin/sh`) is launched.
+The process exit status reflects the launched command. With no display
+server available, the launch falls back to the headless session pump.
+
+### Configuration
+
+Config lives at `~/.config/nora/config.toml` (or
+`$XDG_CONFIG_HOME/nora/config.toml`). Every key is optional; omitted values
+use nora's built-in defaults. See `resources/nora.example.toml` for a
+commented example. Precedence: CLI flags > config file > built-in defaults.
+
+Validate a config without launching:
+
+```sh
+nora --config ~/.config/nora/config.toml --check-config
+```
+
+### Shell integration
+
+Source `shell/nora-bash.sh` from your `.bashrc` to enable OSC 133 prompt
+markers. This unlocks prompt navigation (jump to previous prompt),
+previous-command selection, working-directory tracking and hyperlinks.
+The hook coexists with other `PROMPT_COMMAND`/DEBUG-trap shell
+integrations (e.g. starship).
+
+## Development
+
+Check set:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release
+```
+
+Repository layout:
+
+| Path | Purpose |
+| --- | --- |
+| `src/` | Library: engine, session, input, render, config, protocol filters |
+| `src/app/` | Windowed application: CLI, window, workspace, render loop |
+| `src/bin/` | `nora_child` test helper, `nora_bench` benchmark tool |
+| `tests/` | Integration tests (one target per feature area) |
+| `vendor/alacritty_terminal/` | Vendored terminal engine (path dependency) |
+| `shell/` | Shell integration script |
+| `terminfo/` | `nora` terminfo entry source |
+| `resources/` | Desktop entry, icon, example config |
+| `scripts/` | Clean build, install, uninstall |
+| `docs/` | Product, architecture, compatibility, task cards, ADRs, status |
+
+### Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [AGENTS.md](AGENTS.md) | Rules for agents implementing nora |
+| [01-research.md](docs/01-research.md) | Evidence, alternatives, recommended approach |
+| [02-product.md](docs/02-product.md) | What nora ships and what it defers |
+| [03-architecture.md](docs/03-architecture.md) | Module ownership, concurrency, snapshots, resource limits |
+| [04-performance.md](docs/04-performance.md) | Metrics, goals and benchmark design |
+| [05-rendering.md](docs/05-rendering.md) | Fixed-cell fonts, caching, damage and GPU lifecycle |
+| [06-compatibility.md](docs/06-compatibility.md) | Protocol contract and input behavior |
+| [07-build-release.md](docs/07-build-release.md) | Dependencies, build, CI and packaging |
+| [08-agent-workflow.md](docs/08-agent-workflow.md) | Small-context workflow and commit/push requirements |
+| [09-validation.md](docs/09-validation.md) | Correctness and integration tests |
+| [10-roadmap.md](docs/10-roadmap.md) | Ordered feature cards and release gates |
+| [11-risks.md](docs/11-risks.md) | Failure modes and decision triggers |
+| [12-resource-limits.md](docs/12-resource-limits.md) | Measured resource-limit evidence |
+| [12-sources.md](docs/12-sources.md) | Primary-source links and evidence boundaries |
+| [13-extensions.md](docs/13-extensions.md) | Graphics, shell integration and later features |
+| [13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) | v0.1 acceptance assessment |
+| [status/PROGRESS.md](docs/status/PROGRESS.md) | Durable implementation state |
+| [status/HANDOFF_TEMPLATE.md](docs/status/HANDOFF_TEMPLATE.md) | Short recovery checkpoint |
+
+Work proceeds in small increments against the task cards in `docs/tasks/`;
+`docs/status/PROGRESS.md` is the resume index.
+
+## License
+
+MIT (per the `Cargo.toml` manifest).
