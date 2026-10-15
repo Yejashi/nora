@@ -49,7 +49,7 @@ launch() {
     local name=$1; shift
     local home="$OUT/$name/home"
     mkdir -p "$home"
-    HOME="$home" XDG_CONFIG_HOME="$home/.config" PS1='$ ' \
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" PS1='$ ' NORA_DEBUG=1 \
         "$NORA_BIN" -- "$@" >"$OUT/$name/nora.log" 2>&1 &
     NORA_PID=$!
     WIN=""
@@ -59,9 +59,15 @@ launch() {
         sleep 0.1
     done
     [ -n "$WIN" ] || return 1
-    sleep 1
+    # Ready when the first frame with terminal content is presented (a
+    # software GPU compiles its pipelines on first use, which can take
+    # seconds on a CI runner).
+    for _ in $(seq 1 200); do
+        grep -q "debug: frame rendered" "$OUT/$name/nora.log" 2>/dev/null && break
+        sleep 0.1
+    done
     xdotool windowfocus --sync "$WIN" 2>/dev/null
-    sleep 0.3
+    sleep 0.5
 }
 
 # finish: stop nora if it is still running.
@@ -154,7 +160,34 @@ scenario_resize() {
     pass resize
 }
 
-ALL=(render tty resize)
+# Keys: shell control characters reach the application byte-exact, UI
+# chords leak nothing, and xterm encodings are used for modified keys.
+scenario_keys() {
+    local dir="$OUT/keys"; mkdir -p "$dir"
+    launch keys bash --norc --noprofile || { fail keys "no window"; return; }
+    xdotool type --delay 15 "stty raw -echo; head -c 17 | od -An -tx1 > $dir/bytes.txt; stty sane"
+    xdotool key Return
+    sleep 0.5
+    # Two UI chords first (search toggled open and closed): no bytes.
+    xdotool key ctrl+shift+f ctrl+shift+f
+    xdotool key ctrl+w ctrl+t ctrl+x ctrl+f ctrl+d shift+Tab alt+BackSpace \
+        ctrl+backslash ctrl+Left
+    wait_file "$dir/bytes.txt" || { finish; fail keys "child received too few bytes"; return; }
+    local got want
+    got=$(tr -s ' \n' ' ' < "$dir/bytes.txt" | sed 's/^ //; s/ $//')
+    want="17 14 18 06 04 1b 5b 5a 1b 7f 1c 1b 5b 31 3b 35 44"
+    echo "  bytes: $got"
+    # Ctrl+Shift+W on the only pane closes the window and nora exits.
+    xdotool key ctrl+shift+w
+    local exited=no
+    for _ in $(seq 1 30); do kill -0 "$NORA_PID" 2>/dev/null || { exited=yes; break; }; sleep 0.1; done
+    finish
+    [ "$got" = "$want" ] || { fail keys "expected [$want]"; return; }
+    [ "$exited" = yes ] || { fail keys "closing the last pane left nora running"; return; }
+    pass keys
+}
+
+ALL=(render tty resize keys)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
