@@ -216,15 +216,21 @@ fn main() -> ExitCode {
     run_windowed(spec, explicit, hold, &config_state.current)
 }
 
+/// Headless wait granularity: how often parser replies are forwarded
+/// while the child runs.
+const HEADLESS_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Headless launch (N05b). 24×80 is the documented headless placeholder
 /// until the UI cards. `config` (N18b) is the loaded configuration; the
 /// values are accepted and logged now, and consumed where the headless
 /// path supports them.
 fn run_session(spec: LaunchSpec, explicit: bool, config: &nora::config::NoraConfig) -> ExitCode {
-    eprintln!(
-        "debug: config loaded: history={}, font.size={}",
-        config.terminal.history, config.font.size
-    );
+    if std::env::var_os("NORA_DEBUG").is_some() {
+        eprintln!(
+            "debug: config loaded: history={}, font.size={}",
+            config.terminal.history, config.font.size
+        );
+    }
     let mut session = match PtySession::spawn(spec, 24, 80, DEFAULT_CAP) {
         Ok(session) => session,
         Err(err) => {
@@ -239,6 +245,14 @@ fn run_session(spec: LaunchSpec, explicit: bool, config: &nora::config::NoraConf
             return ExitCode::from(1);
         }
     };
+    // Wait for the child for as long as it runs (no drain timeout here:
+    // that bound is for an explicit close), forwarding parser replies to
+    // it so a child that queries the terminal (DA, DSR, size) never hangs.
+    while !session.wait_drain(HEADLESS_TICK) {
+        if session.flush(usize::MAX).is_err() {
+            break;
+        }
+    }
     let status = session.join();
     // Surface the last title set by the child, if any (N06b), on stderr
     // so it never mixes with terminal output.

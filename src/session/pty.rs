@@ -25,7 +25,6 @@
 
 use std::borrow::Cow;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +32,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, EventLoopSender, Msg};
 use alacritty_terminal::tty::{self, Options, Shell};
 
@@ -325,32 +324,12 @@ impl PtySession {
         };
         let pty = tty::new(&options, size, id.0).map_err(PtyError::Spawn)?;
 
-        // The pinned `tty::new` sets only IUTF8 on the master
-        // (alacritty_terminal-0.26.0/src/tty/unix.rs:207-210); the slave's
-        // line discipline stays canonical+echo. Raw is the emulator
-        // baseline — children set their own termios like real clients
-        // (N06a decision 8). Best-effort: a termios probe failure must
-        // not fail session start.
-        let fd = pty.file().as_raw_fd();
-        // SAFETY: `libc::termios` is a plain `#[repr(C)]` struct of
-        // integer fields; zero bytes is a valid bit pattern for every
-        // field. `tcgetattr` overwrites the struct before any field is
-        // read, and `tcsetattr` runs only after it succeeded. The fd is
-        // the session's own PTY master, open for I/O.
-        let _raw = unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut termios) == 0 {
-                termios.c_iflag = libc::IUTF8;
-                termios.c_oflag = 0;
-                termios.c_lflag = 0;
-                termios.c_cflag |= libc::CS8 | libc::CLOCAL | libc::CREAD;
-                termios.c_cc[libc::VMIN] = 1;
-                termios.c_cc[libc::VTIME] = 0;
-                libc::tcsetattr(fd, libc::TCSANOW, &termios) == 0
-            } else {
-                false
-            }
-        };
+        // The slave keeps the kernel's cooked line discipline (ICANON,
+        // ECHO, ISIG, ICRNL, OPOST|ONLCR); the pinned `tty::new` adds only
+        // IUTF8, exactly like upstream alacritty. Applications that need
+        // raw input (shells' line editors, full-screen programs) switch
+        // the mode themselves. Forcing raw here broke echo, Ctrl+C and
+        // newline translation for every ordinary command (audit P2).
 
         // `drain_on_exit: true`: on child exit the pinned loop can process
         // the exit token before reading master bytes that arrived in the
@@ -422,25 +401,21 @@ impl PtySession {
         })
     }
 
-    /// Resize this session's window: update the shared size and apply
-    /// the same dimensions to the engine grid (they must move together
-    /// — `resolve_record` in `src/session/mod.rs` resolves future size
-    /// replies against `size`, and the pinned `Term::resize` marks the
-    /// terminal fully damaged, so the next [`Engine::snapshot`]
-    /// reports `Damage::Full`), then enqueue a fresh
-    /// `TextAreaSizeRequest` through the shared recorder — the same
-    /// event path as the child's CSI 14t query reply (N06): the next
-    /// `process_events` resolves it against this session's own
-    /// updated `WindowSize` (nominal cell geometry, as at spawn) and
-    /// credits the reply through the ledger as usual (no new reply
-    /// kind).
+    /// Resize this session's window: update the shared size, apply the
+    /// same dimensions to the engine grid (the pinned `Term::resize` marks
+    /// the terminal fully damaged, so the next [`Engine::snapshot`]
+    /// reports `Damage::Full`), and send `Msg::Resize` to the PTY loop,
+    /// which sets the master's window size (`TIOCSWINSZ`) so the child
+    /// receives `SIGWINCH`. `resolve_record` answers later CSI 14 t
+    /// queries against the updated `size`. Nothing is written to the
+    /// child's input: an unsolicited size report would arrive as typed
+    /// bytes (audit P1).
     ///
     /// N11a zero retention (lib-level invariant): a zero on either axis
     /// is retained per axis against the last valid value before
     /// anything is applied — if the retained pair equals the current
-    /// geometry, the resize is a no-op (no engine resize, no
-    /// `TextAreaSizeRequest`, no event emitted); the engine must never
-    /// see a zero.
+    /// geometry, the resize is a no-op; the engine and the PTY never see
+    /// a zero.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = if rows == 0 { self.size.num_lines } else { rows };
         let cols = if cols == 0 { self.size.num_cols } else { cols };
@@ -454,15 +429,10 @@ impl PtySession {
             cell_height: NOMINAL_CELL_HEIGHT,
         };
         self.engine().resize(rows as usize, cols as usize);
-        self.engine
-            .recorder()
-            .send_event(Event::TextAreaSizeRequest(Arc::new(
-                |window_size: WindowSize| {
-                    let height = window_size.num_lines * window_size.cell_height;
-                    let width = window_size.num_cols * window_size.cell_width;
-                    format!("\x1b[4;{height};{width}t")
-                },
-            )));
+        // Tell the child: the loop applies TIOCSWINSZ on the master, and
+        // the kernel delivers SIGWINCH to the foreground process group.
+        // A send failure means the loop already ended (child gone).
+        let _ = self.sender.send(Msg::Resize(self.size));
     }
 
     /// This session's generation identity.

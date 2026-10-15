@@ -30,6 +30,9 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | X1 | IME commit text discarded (typing lost on Wayland text-input) | `4756819` |
 | X2 | Vertex buffers lacked COPY_DST (panic on first selection) | `4756819` |
 | X3 | No cursor, no cell backgrounds drawn | `4756819` |
+| P1 | Resize never reached the child; resize injected `CSI 4;h;w t` as input | M1.2 (this commit series) |
+| P2 | Child started on a raw tty (no echo, ISIG, ONLCR, ICRNL) | M1.2 |
+| P7 | Headless run killed the child after 5 s; replies not forwarded while waiting | M1.2 |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

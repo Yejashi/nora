@@ -529,10 +529,12 @@ pub fn run_windowed(
     hold: bool,
     config: &nora::config::NoraConfig,
 ) -> std::process::ExitCode {
-    eprintln!(
-        "debug: config loaded: history={}, font.size={}",
-        config.terminal.history, config.font.size
-    );
+    if debug_enabled() {
+        eprintln!(
+            "debug: config loaded: history={}, font.size={}",
+            config.terminal.history, config.font.size
+        );
+    }
     // N23b/N24b: the workspace owns all tabs; the window's first tab is
     // `TabId(0)` with a single-pane layout, matching the pump's first
     // session (`PaneKey::first()`). Its slot is the shared `slot` Arc, so

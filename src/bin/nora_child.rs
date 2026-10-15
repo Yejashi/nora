@@ -37,6 +37,11 @@ use std::io::{self, BufRead, Read, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Like a full-screen application, the helper switches its own tty to
+    // raw mode: tests send escape sequences and control bytes and expect
+    // them byte-exact. The emulator leaves the line discipline cooked
+    // (audit P2); applications choose raw themselves.
+    make_stdin_raw();
     let mut out = io::stdout().lock();
     match args.first().map(String::as_str) {
         None => echo(&mut out),
@@ -68,6 +73,7 @@ fn main() {
             flood(&mut out, total);
         }
         Some("ws") => winsize(&mut out),
+        Some("winch") => winch(&mut out),
         Some("dying") => {
             ready(&mut out);
             // Let READY reach the screen through the loop's normal master
@@ -219,6 +225,60 @@ fn flood(out: &mut impl Write, _total: &str) {
 }
 
 /// Print the terminal winsize actually in effect on stdin.
+/// Set by the SIGWINCH handler installed in [`winch`].
+static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_winch(_signal: libc::c_int) {
+    // Async-signal-safe: a single atomic store.
+    WINCH.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Put stdin into raw mode when it is a terminal (`cfmakeraw`).
+fn make_stdin_raw() {
+    // SAFETY: `termios` is a plain C struct; zeroed is a valid input that
+    // `tcgetattr` overwrites before any read, and `tcsetattr` only runs
+    // after it succeeded. fd 0 is this process's stdin.
+    unsafe {
+        if libc::isatty(0) == 1 {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut termios) == 0 {
+                libc::cfmakeraw(&mut termios);
+                libc::tcsetattr(0, libc::TCSANOW, &termios);
+            }
+        }
+    }
+}
+
+/// `READY`, then wait up to 5 s for SIGWINCH; print `WINCH` with the
+/// kernel's window size and the number of bytes pending on stdin
+/// (`PENDING:0` proves nothing was injected as input on resize), exit 0.
+fn winch(out: &mut impl Write) {
+    // SAFETY: installs an async-signal-safe handler (one atomic store).
+    unsafe {
+        libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
+    }
+    ready(out);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !WINCH.load(std::sync::atomic::Ordering::SeqCst) {
+        if std::time::Instant::now() > deadline {
+            let _ = writeln!(out, "NOWINCH");
+            let _ = out.flush();
+            std::process::exit(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Let any (wrongly) injected bytes arrive before counting them.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut pending: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one c_int; `pending` outlives the call.
+    unsafe { libc::ioctl(0, libc::FIONREAD as libc::c_ulong, &mut pending) };
+    let _ = write!(out, "WINCH ");
+    winsize(out);
+    let _ = writeln!(out, "PENDING:{pending}");
+    let _ = out.flush();
+    std::process::exit(0);
+}
+
 fn winsize(out: &mut impl Write) {
     // SAFETY: `libc::winsize` is a plain struct of four `u16` fields with
     // no invariants; zeroed is a valid input, and TIOCGWINSZ only writes

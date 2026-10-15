@@ -219,7 +219,7 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
       - name: scripts/e2e-x11.sh
-        run: scripts/e2e-x11.sh render
+        run: scripts/e2e-x11.sh
       - name: Upload e2e artifacts
         if: failure()
         uses: actions/upload-artifact@v4

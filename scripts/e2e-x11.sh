@@ -128,7 +128,28 @@ scenario_tty() {
     pass tty
 }
 
-ALL=(render tty)
+# Resize: a window resize reaches the child (TIOCSWINSZ + SIGWINCH) and
+# nothing is injected into its input.
+scenario_resize() {
+    local dir="$OUT/resize"; mkdir -p "$dir"
+    launch resize bash --norc --noprofile || { fail resize "no window"; return; }
+    xdotool type --delay 15 "trap 'echo winch >> $dir/winch.txt' WINCH; stty size > $dir/before.txt"
+    xdotool key Return
+    wait_file "$dir/before.txt" || { finish; fail resize "no initial size"; return; }
+    xdotool windowsize --sync "$WIN" 500 300 2>/dev/null
+    sleep 1
+    xdotool type --delay 15 "stty size > $dir/after.txt"
+    xdotool key Return
+    wait_file "$dir/after.txt" || { finish; fail resize "no size after resize"; return; }
+    finish
+    echo "  size: $(cat "$dir/before.txt") -> $(cat "$dir/after.txt")"
+    [ "$(cat "$dir/before.txt")" != "$(cat "$dir/after.txt")" ] \
+        || { fail resize "child size unchanged"; return; }
+    [ -s "$dir/winch.txt" ] || { fail resize "child got no SIGWINCH"; return; }
+    pass resize
+}
+
+ALL=(render tty resize)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

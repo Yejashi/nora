@@ -326,6 +326,9 @@ fn config_flag() {
         .arg(&helper)
         .arg("status")
         .arg("7")
+        // The config-loaded line is diagnostic output, shown only with
+        // NORA_DEBUG so it never clutters the user's terminal.
+        .env("NORA_DEBUG", "1")
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY");
     let out = run_bounded(&mut cmd);
