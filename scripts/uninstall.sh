@@ -7,6 +7,8 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nora"
 
 echo "==> removing binary"
 rm -f "$PREFIX/bin/nora"
+rm -f "$PREFIX/libexec/nora/nora"
+rmdir "$PREFIX/libexec/nora" 2>/dev/null || true
 
 echo "==> removing terminfo"
 rm -f "$HOME/.terminfo/n/nora"
