@@ -391,6 +391,31 @@ scenario_panes() {
     pass panes
 }
 
+# Pane exit: a shell exiting in one half of a split closes that pane (the
+# window stays and the other pane takes the full width); exiting the last
+# pane closes nora.
+scenario_paneexit() {
+    local dir="$OUT/paneexit"; mkdir -p "$dir"
+    launch paneexit bash --norc --noprofile || { fail paneexit "no window"; return; }
+    xdotool type --delay 15 "stty size > $dir/full.txt"; xdotool key Return
+    wait_file "$dir/full.txt" || { finish; fail paneexit "no initial size"; return; }
+    xdotool key ctrl+shift+Return
+    sleep 1.5
+    xdotool type --delay 15 "exit"; xdotool key Return
+    sleep 1.5
+    kill -0 "$NORA_PID" 2>/dev/null || { fail paneexit "nora exited with a pane left"; return; }
+    xdotool type --delay 15 "stty size > $dir/after.txt"; xdotool key Return
+    wait_file "$dir/after.txt" || { finish; fail paneexit "remaining pane got no input"; return; }
+    xdotool type --delay 15 "exit"; xdotool key Return
+    local exited=no
+    for _ in $(seq 1 40); do kill -0 "$NORA_PID" 2>/dev/null || { exited=yes; break; }; sleep 0.1; done
+    finish
+    echo "  full: $(cat "$dir/full.txt"), after pane exit: $(cat "$dir/after.txt")"
+    [ "$(cat "$dir/after.txt")" = "$(cat "$dir/full.txt")" ] || { fail paneexit "remaining pane not resized to full"; return; }
+    [ "$exited" = yes ] || { fail paneexit "nora did not exit with its last pane"; return; }
+    pass paneexit
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -450,7 +475,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

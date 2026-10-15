@@ -1100,6 +1100,44 @@ impl WinApp {
         }
     }
 
+    /// Live panes across all tabs.
+    fn total_panes(&self) -> usize {
+        let active = self.active_tab_id();
+        self.layout.pane_count()
+            + self
+                .tab_layouts
+                .iter()
+                .filter(|(tab, _)| Some(**tab) != active)
+                .map(|(_, layout)| layout.pane_count())
+                .sum::<usize>()
+    }
+
+    /// Close one pane of any tab; a tab whose last pane closes is closed.
+    fn close_pane(&mut self, pane: PaneKey) {
+        if Some(pane.tab) == self.active_tab_id() {
+            if self.layout.pane_count() <= 1 {
+                self.on_tab_command(nora::workspace::TabCommand::Close);
+                return;
+            }
+            if self.active_pane_key() == Some(pane) {
+                self.close_active_pane();
+                return;
+            }
+            self.layout.close_pane(pane.pane);
+        } else if let Some(layout) = self.tab_layouts.get_mut(&pane.tab) {
+            layout.close_pane(pane.pane);
+            if layout.pane_count() == 0 {
+                self.tab_layouts.remove(&pane.tab);
+                self.workspace.close_tab(pane.tab);
+            }
+        } else {
+            return;
+        }
+        let _ = self.pump_commands.send(PumpMsg::ClosePane { pane });
+        self.drop_pane_state(pane);
+        self.resize_all_panes();
+    }
+
     /// Make `target` (a pane of the active tab) the active pane.
     fn focus_pane(&mut self, target: PaneId) {
         let Some(tab) = self.active_tab_id() else {
@@ -1699,18 +1737,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         // N24b: exit the window when the last pane's child exits (and not
         // holding); the pane is still in its layout at this point.
-        let last_pane_exit = match &event {
-            AppEvent::ChildExit { pane, .. } => {
-                self.pane_is_live(pane)
-                    && self.workspace.tab_count() <= 1
-                    && self
-                        .tab_layouts
-                        .get(&pane.tab)
-                        .map_or(self.layout.panes().len(), |l| l.panes().len())
-                        <= 1
-            }
-            _ => false,
+        // The window closes only when the last pane of the last tab
+        // exits. (This read the active tab's stale `tab_layouts` copy, so a
+        // child exiting in one half of a split closed the window, audit F6.)
+        let exited_pane = match &event {
+            AppEvent::ChildExit { pane, .. } if self.pane_is_live(pane) => Some(*pane),
+            _ => None,
         };
+        let last_pane_exit = exited_pane.is_some() && self.total_panes() <= 1;
         // N24b: extract the exit status before routing (the event is moved
         // into `on_pane_event`).
         let child_exit_status = match &event {
@@ -1732,6 +1766,15 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             } else {
                 event_loop.exit();
+            }
+        } else if let Some(pane) = exited_pane
+            && !self.hold
+        {
+            // Another pane remains: close the one whose child exited, as
+            // tmux and kitty do (with --hold it stays, showing its output).
+            self.close_pane(pane);
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
             }
         }
     }
