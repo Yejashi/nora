@@ -1,7 +1,22 @@
 # nora
 
+[![CI](https://github.com/Yejashi/nora/actions/workflows/ci.yml/badge.svg)](https://github.com/Yejashi/nora/actions/workflows/ci.yml)
+
 A fast, efficient, maintainable Linux desktop terminal written in Rust,
 with native Wayland and X11 support.
+
+## Quick start
+
+```sh
+git clone https://github.com/Yejashi/nora.git
+cd nora
+./scripts/install.sh   # release build + per-user install, no root
+nora                   # launches your $SHELL in a new window
+```
+
+`nora --smoke` opens a window, renders one frame, resizes, minimizes and
+exits; it is the fastest way to check that the display and GPU path work
+on a machine. `nora -- htop` runs a specific command instead of the shell.
 
 ## Status
 
@@ -51,9 +66,27 @@ with native Wayland and X11 support.
 ## Requirements
 
 - Linux x86_64 with a native Wayland or X11 session
-- Rust 1.95 (pinned by `rust-toolchain.toml`)
-- A Vulkan-capable GPU (CI uses lavapipe; a software GPU validates the
-  rendering path but is not hardware performance evidence)
+- Rust 1.95 or newer (`rust-version` in `Cargo.toml`). `rust-toolchain.toml`
+  pins 1.99.0 for rustup users and CI; a distribution toolchain at or above
+  1.95 builds the same tree.
+- A Vulkan loader and driver. Any GPU with a Vulkan driver works; CI and
+  GPU-less machines use Mesa's lavapipe software driver, which validates the
+  rendering path but is not hardware performance evidence.
+- Fonts: nora prefers **Noto Sans Mono** and falls back to any monospace
+  font fontconfig knows. Noto Sans CJK and Noto Serif Ethiopic are optional
+  script fallbacks (without them, wide and Ethiopic text renders as missing
+  glyphs). The GPU and text tests assert Noto metrics, so install Noto to
+  run the full test suite:
+
+  | Distribution | Packages |
+  | --- | --- |
+  | Debian / Ubuntu | `fonts-noto-core fonts-noto-cjk libvulkan1 mesa-vulkan-drivers` |
+  | Arch | `noto-fonts noto-fonts-cjk vulkan-icd-loader` + your GPU's Vulkan driver |
+  | Fedora | `google-noto-sans-mono-fonts google-noto-sans-cjk-fonts vulkan-loader` |
+  | NixOS | `noto-fonts noto-fonts-cjk-sans`; see the NixOS note under Installing |
+
+  `NORA_TEST_FONT_MONO`, `NORA_TEST_FONT_CJK` and `NORA_TEST_FONT_ETHIOPIC`
+  override the font files explicitly (app and tests).
 
 ## Building
 
@@ -85,6 +118,22 @@ To install only the terminfo entry on another host (for SSH remote use):
 
 ```sh
 tic -x terminfo/nora.terminfo
+```
+
+### NixOS
+
+NixOS has no global library path, and nora loads the Vulkan loader,
+libwayland, libxkbcommon and the X11 client libraries at runtime. On a
+NixOS host `scripts/install.sh` detects this (`/etc/NIXOS`), installs the
+binary under `~/.local/libexec/nora/` and writes a small launcher to
+`~/.local/bin/nora` that sets `LD_LIBRARY_PATH` from the nixpkgs store
+(fetched with `nix build`, cached outputs only). Everything else is the
+same. To run the GPU tests or the uninstalled binary from `target/`,
+export the same library path, for example:
+
+```sh
+export LD_LIBRARY_PATH=$(sed -n 's/^export LD_LIBRARY_PATH="\([^$]*\).*/\1/p' ~/.local/bin/nora)
+cargo test --workspace
 ```
 
 ## Usage
@@ -135,14 +184,21 @@ integrations (e.g. starship).
 
 ## Development
 
-Check set:
+Check set (what CI runs; see `.github/workflows/ci.yml`):
 
 ```sh
 cargo fmt --all --check
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --release
 ```
+
+CI additionally builds the X11-only and Wayland-only configurations and
+runs `nora --smoke` under Xvfb and under Weston's headless backend with
+the lavapipe software GPU. Tests that need a GPU adapter fail with
+`a GPU adapter must be available` when no Vulkan driver is loadable; the
+PTY tests have 10 s deadlines and can flake on a heavily loaded machine
+(they pass when re-run alone).
 
 Repository layout:
 
