@@ -354,3 +354,13 @@ The window carries a zoom level (1.0 = 100%), stored on the app and scaled into 
 - **Staged font/geometry changes:** a reload that changes `font.family` or `font.size` is classified `Staged` (N19a) and logged as `applying staged font change: <field>`; the change takes effect on the next frame. Font re-initialization is a later slice, so the staged change is logged, not yet applied to the loaded font.
 
 Headless fixtures: `tests/config.rs` (`zoom_initial`, `zoom_in`, `zoom_out`, `zoom_reset`, `zoom_max`, `zoom_min`) cover the pure zoom arithmetic in `nora::config`.
+
+## Mouse reporting (2026-10-15, M1.4)
+
+| Behaviour | Contract | Evidence |
+| --- | --- | --- |
+| Modes | 1000 press/release/wheel; 1002 adds motion with a held button; 1003 adds all motion (once per cell); 9 press only | `tests/mouse_input.rs` |
+| Encodings | 1006 SGR `CSI < b;x;y M/m` (no coordinate limit); 1005 UTF-8 (to 2015); default `CSI M` bytes (to 223, else no report) | `tests/mouse_input.rs`, e2e `mouse` |
+| Button codes | 0-2, wheel 64-67, Back/Forward 128/129, motion +32, Shift +4, Alt +8, Ctrl +16; legacy release = 3 | `tests/mouse_input.rs` |
+| Local selection | Starts on drag; a click clears it; off while the app reports the mouse unless Shift is held | manual |
+| Alternate scroll | DECSET 1007 in the alternate screen: wheel sends cursor keys (DECCKM-aware) | manual |

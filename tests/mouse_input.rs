@@ -23,9 +23,9 @@
 use alacritty_terminal::term::TermMode;
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
-    MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number, encode_mouse_event,
-    logical_to_cell, mouse_modifiers, physical_to_cell, should_report, track_button,
-    wheel_directions,
+    MouseEncoding, MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number,
+    encode_mouse_event, logical_to_cell, mouse_modifiers, physical_to_cell, should_report,
+    track_button, wheel_directions,
 };
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
@@ -46,199 +46,142 @@ fn event(kind: MouseKind, button: Option<u8>, col: u16, row: u16) -> MouseEvent 
     }
 }
 
-/// The expected report for button code `b` at 1-based cell (x, y).
-fn rep(b: u16, x: u16, y: u16, terminator: char) -> String {
-    format!("\x1b[<{};{} {}{}", b, x, y, terminator)
+fn sgr(mode: MouseMode, e: &MouseEvent) -> Option<String> {
+    encode_mouse_event(mode, MouseEncoding::Sgr, e, COLS, ROWS)
+        .map(|b| String::from_utf8(b).expect("SGR reports are ASCII"))
 }
 
-/// The expected report for the given modifiers on a left button press at
-/// (col, row) — used by the modifier rows.
-fn mod_press(shift: bool, ctrl: bool, alt: bool) -> MouseEvent {
-    MouseEvent {
-        kind: MouseKind::Press,
-        button: Some(0),
-        col: 0,
-        row: 0,
-        modifiers: MouseModifiers { shift, ctrl, alt },
-    }
+fn legacy(mode: MouseMode, e: &MouseEvent) -> Option<Vec<u8>> {
+    encode_mouse_event(mode, MouseEncoding::Default, e, COLS, ROWS)
 }
 
-// ---------------------------------------------------------------- X10 ---
-
+/// SGR (1006): `CSI < b ; x ; y M`, release `m` with the button kept,
+/// 1-based coordinates (xterm ctlseqs, "SGR (1006)").
 #[test]
-fn x10_press_release_left_middle_right() {
-    for (button, code) in [(Some(0), 0), (Some(1), 1), (Some(2), 2)] {
+fn sgr_press_release_left_middle_right() {
+    for (button, code) in [(0u8, 0u16), (1, 1), (2, 2)] {
         assert_eq!(
-            encode_mouse_event(
-                MouseMode::X10,
-                &event(MouseKind::Press, button, 0, 0),
-                COLS,
-                ROWS
-            ),
-            Some(rep(code, 1, 1, 'M'))
-        );
-        assert_eq!(
-            encode_mouse_event(
-                MouseMode::X10,
-                &event(MouseKind::Release, button, 10, 5),
-                COLS,
-                ROWS
-            ),
-            Some(rep(code, 11, 6, 'm'))
-        );
-        // Last valid cell.
-        assert_eq!(
-            encode_mouse_event(
-                MouseMode::X10,
-                &event(MouseKind::Press, button, COLS - 1, ROWS - 1),
-                COLS,
-                ROWS
-            ),
-            Some(rep(code, COLS, ROWS, 'M'))
-        );
-    }
-}
-
-#[test]
-fn x10_reports_no_motion() {
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Motion, Some(0), 3, 4),
-            COLS,
-            ROWS
-        ),
-        None
-    );
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Motion, None, 3, 4),
-            COLS,
-            ROWS
-        ),
-        None
-    );
-}
-
-#[test]
-fn x10_reports_wheel() {
-    for (kind, code) in [
-        (MouseKind::WheelUp, 64),
-        (MouseKind::WheelDown, 65),
-        (MouseKind::WheelLeft, 66),
-        (MouseKind::WheelRight, 67),
-    ] {
-        assert_eq!(
-            encode_mouse_event(MouseMode::X10, &event(kind, None, 0, 0), COLS, ROWS),
-            Some(rep(code, 1, 1, 'M'))
-        );
-    }
-}
-
-// -------------------------------------------------------------- Normal ---
-
-#[test]
-fn normal_press_release_and_motion() {
-    // Press/release are identical to X10.
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::Normal,
-            &event(MouseKind::Press, Some(0), 0, 0),
-            COLS,
-            ROWS
-        ),
-        Some(rep(0, 1, 1, 'M'))
-    );
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::Normal,
-            &event(MouseKind::Release, Some(2), 1, 1),
-            COLS,
-            ROWS
-        ),
-        Some(rep(2, 2, 2, 'm'))
-    );
-    // Motion while a button is held: 32 + button.
-    for (button, code) in [(Some(0), 32), (Some(1), 33), (Some(2), 34)] {
-        assert_eq!(
-            encode_mouse_event(
+            sgr(
                 MouseMode::Normal,
-                &event(MouseKind::Motion, button, 7, 8),
-                COLS,
-                ROWS
+                &event(MouseKind::Press, Some(button), 4, 9)
             ),
-            Some(rep(code, 8, 9, 'M'))
+            Some(format!("\x1b[<{code};5;10M"))
+        );
+        assert_eq!(
+            sgr(
+                MouseMode::Normal,
+                &event(MouseKind::Release, Some(button), 4, 9)
+            ),
+            Some(format!("\x1b[<{code};5;10m"))
         );
     }
 }
 
+/// Legacy (default) encoding: `CSI M Cb Cx Cy`, each value + 32; every
+/// release reports button 3.
 #[test]
-fn normal_reports_no_motion_without_button() {
+fn legacy_press_and_release() {
     assert_eq!(
-        encode_mouse_event(
-            MouseMode::Normal,
-            &event(MouseKind::Motion, None, 3, 4),
-            COLS,
-            ROWS
-        ),
+        legacy(MouseMode::Normal, &event(MouseKind::Press, Some(0), 0, 0)),
+        Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+    );
+    assert_eq!(
+        legacy(MouseMode::Normal, &event(MouseKind::Release, Some(2), 9, 4)),
+        Some(vec![0x1b, b'[', b'M', 32 + 3, 32 + 10, 32 + 5])
+    );
+}
+
+/// Legacy coordinates stop at 223 (one byte); SGR has no limit; UTF-8
+/// (1005) extends to 2015.
+#[test]
+fn encodings_and_their_coordinate_limits() {
+    let wide = 1000;
+    let e = event(MouseKind::Press, Some(0), 300, 0);
+    assert_eq!(
+        encode_mouse_event(MouseMode::Normal, MouseEncoding::Default, &e, wide, ROWS),
+        None,
+        "column 301 is not representable in one byte"
+    );
+    assert_eq!(
+        encode_mouse_event(MouseMode::Normal, MouseEncoding::Sgr, &e, wide, ROWS),
+        Some(b"\x1b[<0;301;1M".to_vec())
+    );
+    let utf8 = encode_mouse_event(MouseMode::Normal, MouseEncoding::Utf8, &e, wide, ROWS)
+        .expect("column 301 fits the UTF-8 encoding");
+    let text = String::from_utf8(utf8).expect("UTF-8 encoding is valid UTF-8");
+    let values: Vec<u32> = text.chars().skip(3).map(u32::from).collect();
+    assert_eq!(values, vec![32, 301 + 32, 1 + 32]);
+}
+
+#[test]
+fn encoding_follows_the_term_modes() {
+    assert_eq!(
+        MouseEncoding::from_term_mode(TermMode::empty()),
+        MouseEncoding::Default
+    );
+    assert_eq!(
+        MouseEncoding::from_term_mode(TermMode::UTF8_MOUSE),
+        MouseEncoding::Utf8
+    );
+    assert_eq!(
+        MouseEncoding::from_term_mode(TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE),
+        MouseEncoding::Sgr
+    );
+}
+
+/// 1000 (Normal): press, release, wheel; never motion.
+#[test]
+fn normal_mode_reports_clicks_and_wheel_but_no_motion() {
+    assert!(sgr(MouseMode::Normal, &event(MouseKind::WheelUp, None, 0, 0)).is_some());
+    assert_eq!(
+        sgr(MouseMode::Normal, &event(MouseKind::Motion, Some(0), 1, 1)),
+        None
+    );
+    assert_eq!(
+        sgr(MouseMode::Normal, &event(MouseKind::Motion, None, 1, 1)),
         None
     );
 }
 
-// -------------------------------------------------------- CellMotion ---
-
+/// 1002 (button-event): motion only while a button is held; motion adds
+/// 32 to the button code.
 #[test]
-fn cellmotion_reports_motion_without_button() {
-    // No button held: 32 + 3 = 35.
+fn cellmotion_reports_drag_only() {
     assert_eq!(
-        encode_mouse_event(
+        sgr(
             MouseMode::CellMotion,
-            &event(MouseKind::Motion, None, 3, 4),
-            COLS,
-            ROWS
+            &event(MouseKind::Motion, Some(0), 2, 3)
         ),
-        Some(rep(35, 4, 5, 'M'))
+        Some("\x1b[<32;3;4M".to_string())
     );
-    // With a button held, the held button number is kept.
     assert_eq!(
-        encode_mouse_event(
-            MouseMode::CellMotion,
-            &event(MouseKind::Motion, Some(1), 3, 4),
-            COLS,
-            ROWS
-        ),
-        Some(rep(33, 4, 5, 'M'))
+        sgr(MouseMode::CellMotion, &event(MouseKind::Motion, None, 2, 3)),
+        None
     );
 }
 
-// ---------------------------------------------------------- AllMotion ---
-
+/// 1003 (any-event): all motion; no button held reports button 3 + 32.
 #[test]
-fn allmotion_reports_wheel_and_motion() {
-    for (kind, code) in [
-        (MouseKind::WheelUp, 64),
-        (MouseKind::WheelDown, 65),
-        (MouseKind::WheelLeft, 66),
-        (MouseKind::WheelRight, 67),
-    ] {
-        assert_eq!(
-            encode_mouse_event(MouseMode::AllMotion, &event(kind, None, 2, 3), COLS, ROWS),
-            Some(rep(code, 3, 4, 'M'))
-        );
-    }
+fn allmotion_reports_hover() {
     assert_eq!(
-        encode_mouse_event(
-            MouseMode::AllMotion,
-            &event(MouseKind::Motion, None, 2, 3),
-            COLS,
-            ROWS
-        ),
-        Some(rep(35, 3, 4, 'M'))
+        sgr(MouseMode::AllMotion, &event(MouseKind::Motion, None, 2, 3)),
+        Some("\x1b[<35;3;4M".to_string())
     );
 }
 
-// ---------------------------------------------------------- MouseMode ---
+/// X10 (9): presses only.
+#[test]
+fn x10_reports_presses_only() {
+    assert!(sgr(MouseMode::X10, &event(MouseKind::Press, Some(0), 0, 0)).is_some());
+    assert_eq!(
+        sgr(MouseMode::X10, &event(MouseKind::Release, Some(0), 0, 0)),
+        None
+    );
+    assert_eq!(
+        sgr(MouseMode::X10, &event(MouseKind::WheelUp, None, 0, 0)),
+        None
+    );
+}
 
 #[test]
 fn none_mode_reports_nothing() {
@@ -246,15 +189,14 @@ fn none_mode_reports_nothing() {
         MouseKind::Press,
         MouseKind::Release,
         MouseKind::Motion,
-        MouseKind::WheelUp,
+        MouseKind::WheelDown,
     ] {
-        assert_eq!(
-            encode_mouse_event(MouseMode::None, &event(kind, Some(0), 0, 0), COLS, ROWS),
-            None
-        );
+        assert_eq!(sgr(MouseMode::None, &event(kind, Some(0), 0, 0)), None);
     }
 }
 
+/// DECSET 1000/1002/1003 map to Normal/CellMotion/AllMotion; the most
+/// inclusive set mode wins.
 #[test]
 fn from_term_mode_maps_engine_flags() {
     assert_eq!(
@@ -262,211 +204,103 @@ fn from_term_mode_maps_engine_flags() {
         MouseMode::None
     );
     assert_eq!(
-        MouseMode::from_term_mode(TermMode::SHOW_CURSOR),
-        MouseMode::None
-    );
-    assert_eq!(
         MouseMode::from_term_mode(TermMode::MOUSE_REPORT_CLICK),
-        MouseMode::X10
-    );
-    assert_eq!(
-        MouseMode::from_term_mode(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION),
         MouseMode::Normal
     );
     assert_eq!(
-        MouseMode::from_term_mode(
-            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG
-        ),
-        MouseMode::AllMotion
-    );
-    // The most specific flag wins, with or without the lower bits set.
-    assert_eq!(
         MouseMode::from_term_mode(TermMode::MOUSE_DRAG),
+        MouseMode::CellMotion
+    );
+    assert_eq!(
+        MouseMode::from_term_mode(TermMode::MOUSE_MOTION),
         MouseMode::AllMotion
     );
-    // SGR_MOUSE / UTF8_MOUSE are format switches: no bytes change in N16a.
     assert_eq!(
-        MouseMode::from_term_mode(TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK),
-        MouseMode::X10
-    );
-    // Focus reporting is not a mouse mode.
-    assert_eq!(
-        MouseMode::from_term_mode(TermMode::FOCUS_IN_OUT),
-        MouseMode::None
+        MouseMode::from_term_mode(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG),
+        MouseMode::CellMotion
     );
 }
 
-// ---------------------------------------------------------- Modifiers ---
+/// Wheel buttons 64-67; extra buttons 8/9 report 128/129.
+#[test]
+fn wheel_and_extra_button_codes() {
+    let codes = [
+        (MouseKind::WheelUp, 64),
+        (MouseKind::WheelDown, 65),
+        (MouseKind::WheelLeft, 66),
+        (MouseKind::WheelRight, 67),
+    ];
+    for (kind, code) in codes {
+        assert_eq!(
+            sgr(MouseMode::Normal, &event(kind, None, 0, 0)),
+            Some(format!("\x1b[<{code};1;1M"))
+        );
+    }
+    assert_eq!(
+        sgr(MouseMode::Normal, &event(MouseKind::Press, Some(8), 0, 0)),
+        Some("\x1b[<128;1;1M".to_string())
+    );
+    assert_eq!(
+        sgr(MouseMode::Normal, &event(MouseKind::Press, Some(9), 0, 0)),
+        Some("\x1b[<129;1;1M".to_string())
+    );
+}
 
+/// Modifier bits: Shift +4, Meta/Alt +8, Ctrl +16 (xterm ctlseqs).
 #[test]
 fn modifiers_add_to_the_button_code() {
-    // Left press (base 0) with each modifier alone.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &mod_press(true, false, false), COLS, ROWS),
-        Some(rep(4, 1, 1, 'M'))
-    );
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &mod_press(false, true, false), COLS, ROWS),
-        Some(rep(8, 1, 1, 'M'))
-    );
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &mod_press(false, false, true), COLS, ROWS),
-        Some(rep(64, 1, 1, 'M'))
-    );
-    // All three together: 0 + 4 + 8 + 64 = 76.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &mod_press(true, true, true), COLS, ROWS),
-        Some(rep(76, 1, 1, 'M'))
-    );
-    // Modifiers apply to releases and motion too.
-    let release = MouseEvent {
-        kind: MouseKind::Release,
-        button: Some(0),
-        col: 0,
-        row: 0,
-        modifiers: MouseModifiers {
-            shift: true,
-            ctrl: true,
-            alt: false,
-        },
+    let with = |shift, alt, ctrl| MouseEvent {
+        modifiers: MouseModifiers { shift, ctrl, alt },
+        ..event(MouseKind::Press, Some(0), 0, 0)
     };
-    assert_eq!(
-        encode_mouse_event(MouseMode::Normal, &release, COLS, ROWS),
-        Some(rep(12, 1, 1, 'm'))
-    );
-    let motion = MouseEvent {
-        kind: MouseKind::Motion,
-        button: Some(0),
-        col: 0,
-        row: 0,
-        modifiers: MouseModifiers {
-            shift: false,
-            ctrl: false,
-            alt: true,
-        },
-    };
-    assert_eq!(
-        encode_mouse_event(MouseMode::Normal, &motion, COLS, ROWS),
-        Some(rep(32 + 64, 1, 1, 'M'))
-    );
+    for (e, code) in [
+        (with(true, false, false), 4),
+        (with(false, true, false), 8),
+        (with(false, false, true), 16),
+        (with(true, true, true), 28),
+    ] {
+        assert_eq!(
+            sgr(MouseMode::Normal, &e),
+            Some(format!("\x1b[<{code};1;1M"))
+        );
+    }
 }
 
-// -------------------------------------------------------------- Bounds ---
-
+/// Positions outside the grid and empty grids report nothing.
 #[test]
-fn bounds_columns() {
-    let press = |col: u16| event(MouseKind::Press, Some(0), col, 0);
-    // First cell.
+fn out_of_grid_and_empty_grid_report_nothing() {
     assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(0), COLS, ROWS),
-        Some(rep(0, 1, 1, 'M'))
-    );
-    // Last valid cell.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(COLS - 1), COLS, ROWS),
-        Some(rep(0, COLS, 1, 'M'))
-    );
-    // Exactly on the grid edge: clamped to the last valid cell.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(COLS), COLS, ROWS),
-        Some(rep(0, COLS, 1, 'M'))
-    );
-    // Beyond the grid edge: outside the grid entirely.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(COLS + 100), COLS, ROWS),
+        sgr(
+            MouseMode::Normal,
+            &event(MouseKind::Press, Some(0), COLS, 0)
+        ),
         None
     );
-}
-
-#[test]
-fn bounds_rows() {
-    let press = |row: u16| event(MouseKind::Press, Some(0), 0, row);
     assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(0), COLS, ROWS),
-        Some(rep(0, 1, 1, 'M'))
-    );
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(ROWS - 1), COLS, ROWS),
-        Some(rep(0, 1, ROWS, 'M'))
-    );
-    // Exactly on the grid edge: clamped to the last valid cell.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(ROWS), COLS, ROWS),
-        Some(rep(0, 1, ROWS, 'M'))
-    );
-    // Beyond the grid edge: outside the grid entirely.
-    assert_eq!(
-        encode_mouse_event(MouseMode::X10, &press(ROWS + 100), COLS, ROWS),
-        None
-    );
-}
-
-#[test]
-fn bounds_protocol_cap() {
-    // A coordinate of 256 or more cannot be carried, even on a wide grid.
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Press, Some(0), 300, 0),
-            400,
-            ROWS
+        sgr(
+            MouseMode::Normal,
+            &event(MouseKind::Press, Some(0), 0, ROWS)
         ),
         None
     );
     assert_eq!(
         encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Press, Some(0), 0, 300),
-            COLS,
-            400
-        ),
-        None
-    );
-    // 255 (0-based) is still accepted: it clamps to the last cell of a
-    // 255-wide grid and encodes as 256 on a wider one.
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Press, Some(0), 255, 0),
-            255,
-            ROWS
-        ),
-        Some(rep(0, 255, 1, 'M'))
-    );
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Press, Some(0), 255, 0),
-            400,
-            ROWS
-        ),
-        Some(rep(0, 256, 1, 'M'))
-    );
-}
-
-#[test]
-fn zero_sized_grid_reports_nothing() {
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
+            MouseMode::Normal,
+            MouseEncoding::Sgr,
             &event(MouseKind::Press, Some(0), 0, 0),
             0,
-            ROWS
-        ),
-        None
-    );
-    assert_eq!(
-        encode_mouse_event(
-            MouseMode::X10,
-            &event(MouseKind::Press, Some(0), 0, 0),
-            COLS,
             0
         ),
         None
     );
+    assert_eq!(
+        sgr(
+            MouseMode::Normal,
+            &event(MouseKind::Press, Some(0), COLS - 1, ROWS - 1)
+        ),
+        Some(format!("\x1b[<0;{COLS};{ROWS}M"))
+    );
 }
-
-// ---------------------------------------------------------------- Focus ---
 
 #[test]
 fn focus_reports_when_enabled() {
@@ -579,8 +413,8 @@ fn button_number_maps_winit_buttons() {
     assert_eq!(button_number(MouseButton::Left), 0);
     assert_eq!(button_number(MouseButton::Middle), 1);
     assert_eq!(button_number(MouseButton::Right), 2);
-    assert_eq!(button_number(MouseButton::Back), 4);
-    assert_eq!(button_number(MouseButton::Forward), 5);
+    assert_eq!(button_number(MouseButton::Back), 8);
+    assert_eq!(button_number(MouseButton::Forward), 9);
     assert_eq!(button_number(MouseButton::Other(7)), 7);
 }
 

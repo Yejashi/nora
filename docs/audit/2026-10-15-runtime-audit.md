@@ -6,6 +6,8 @@ PTY/engine/concurrency, configuration), a RustSec audit of `Cargo.lock`,
 and end-to-end runs of the release binary in a real X11 window (Xvfb,
 lavapipe) driven with xdotool and checked by screenshot.
 
+**CI.** First fully green run: `44cfa9d` (run 38799086818), including the end-to-end window job.
+
 **Headline.** The v0.1 acceptance in `docs/13-v0.1-acceptance.md` was
 established through library-level tests and a smoke cycle that draws an
 empty frame. The interactive window path was not exercised, and it had
@@ -40,6 +42,9 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-F14, F15 | Legacy encodings: modifiers, Shift+Tab, Alt prefixes, Ctrl C0 set, keypad DECKPAM | M1.3 |
 | I-F17 (keys) | Shift+PageUp/PageDown/Home/End did not scroll | M1.3 |
 | P-lost | Fast-exiting child's final output dropped under lock contention (vendored `pty_read`) | `18901e8` |
+| I-F4, F12 | Mouse: SGR format, 1002/1003 swapped, 1000 lost releases, no legacy/UTF-8 encodings, wrong modifier bits, Back/Forward codes | M1.4 |
+| I-F16 | Click selection while the app reports the mouse; one-cell highlight stuck | M1.4 |
+| I-F17 (wheel) | No alternate scroll in the alternate screen | M1.4 |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

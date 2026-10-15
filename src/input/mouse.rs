@@ -4,7 +4,8 @@
 //! the terminal's mouse report, with no terminal state involved, so it is
 //! headless-testable. The window layer (N16b) converts winit mouse events
 //! into [`MouseEvent`], derives [`MouseMode`] from the engine's `TermMode`
-//! via [`MouseMode::from_term_mode`] and calls [`encode_mouse_event`] with
+//! via [`MouseMode::from_term_mode`], the encoding via
+//! [`MouseEncoding::from_term_mode`], and calls [`encode_mouse_event`] with
 //! the current grid size.
 //!
 //! N16b adds the pure window-side decisions the wiring makes per event:
@@ -18,69 +19,78 @@ use alacritty_terminal::term::TermMode;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::keyboard::ModifiersState;
 
-/// The terminal's effective mouse reporting mode (N16a).
+/// The application's mouse tracking mode (xterm DECSET 1000/1002/1003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseMode {
-    /// No mouse reporting: every event encodes to `None`.
+    /// No reporting: the mouse drives local selection and scrollback.
     None,
-    /// Button press/release only, no motion (xterm `1000`).
+    /// X10 compatibility (DECSET 9): presses only. alacritty_terminal does
+    /// not track mode 9 separately, so [`MouseMode::from_term_mode`] never
+    /// yields it; it is kept for completeness of the encoder.
     X10,
-    /// Press/release plus motion while a button is held (xterm `1002`).
+    /// Normal tracking (1000): press, release and wheel.
     Normal,
-    /// Motion always reported, even without a button held (xterm `1003`).
+    /// Button-event tracking (1002): Normal plus motion while a button is
+    /// held.
     CellMotion,
-    /// Like [`MouseMode::CellMotion`], plus wheel events (xterm `1003`).
+    /// Any-event tracking (1003): Normal plus all motion.
     AllMotion,
 }
 
 impl MouseMode {
-    /// Derive the effective mouse reporting mode from the terminal's mode
-    /// flags (the engine's `TermMode`, `Engine::modes()`).
-    ///
-    /// `MOUSE_DRAG` (1003) maps to [`MouseMode::AllMotion`],
-    /// `MOUSE_MOTION` (1002) to [`MouseMode::Normal`],
-    /// `MOUSE_REPORT_CLICK` (1000) to [`MouseMode::X10`], and no mouse flag
-    /// to [`MouseMode::None`]. The checks run from the most specific flag
-    /// down, so a parser that sets the lower bits alongside a higher one
-    /// still resolves to the highest requested mode.
-    ///
-    /// `SGR_MOUSE` (1006) and `UTF8_MOUSE` (1005) are encoding/format
-    /// switches, not reporting modes: the N16a format is the SGR-style
-    /// `CSI < b ; x y M` for every mode, so they change no bytes here
-    /// (wiring is N16b).
+    /// The effective mode from the engine's flags; the most inclusive set
+    /// mode wins (an application may set several).
     pub fn from_term_mode(modes: TermMode) -> Self {
-        if modes.contains(TermMode::MOUSE_DRAG) {
+        if modes.contains(TermMode::MOUSE_MOTION) {
             Self::AllMotion
-        } else if modes.contains(TermMode::MOUSE_MOTION) {
-            Self::Normal
+        } else if modes.contains(TermMode::MOUSE_DRAG) {
+            Self::CellMotion
         } else if modes.contains(TermMode::MOUSE_REPORT_CLICK) {
-            Self::X10
+            Self::Normal
         } else {
             Self::None
         }
     }
 }
 
-/// What kind of mouse event it is (N16a).
+/// The report encoding the application selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEncoding {
+    /// `CSI M Cb Cx Cy`, each value + 32 in one byte (coordinates up to
+    /// 223).
+    Default,
+    /// DECSET 1005: as Default, values UTF-8 encoded (coordinates up to
+    /// 2015).
+    Utf8,
+    /// DECSET 1006: `CSI < b ; x ; y M` / `m` for release, no limit.
+    Sgr,
+}
+
+impl MouseEncoding {
+    pub fn from_term_mode(modes: TermMode) -> Self {
+        if modes.contains(TermMode::SGR_MOUSE) {
+            Self::Sgr
+        } else if modes.contains(TermMode::UTF8_MOUSE) {
+            Self::Utf8
+        } else {
+            Self::Default
+        }
+    }
+}
+
+/// What happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseKind {
-    /// A button press (left/middle/right; `button` carries the number).
     Press,
-    /// A button release (same button as the press).
     Release,
-    /// Cursor motion; `button` carries the held button, if any.
     Motion,
-    /// Wheel scroll up (button code 64).
     WheelUp,
-    /// Wheel scroll down (button code 65).
     WheelDown,
-    /// Wheel scroll left (button code 66).
     WheelLeft,
-    /// Wheel scroll right (button code 67).
     WheelRight,
 }
 
-/// Modifier state at the time of a mouse event (N16a).
+/// Modifiers that take part in a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MouseModifiers {
     pub shift: bool,
@@ -88,135 +98,126 @@ pub struct MouseModifiers {
     pub alt: bool,
 }
 
-/// One mouse event in grid coordinates (N16a).
-///
-/// Wheel events must use the `Wheel*` [`MouseKind`]s; `button` is then
-/// informational. For `Press`/`Release`/`Motion`, `button` is the held
-/// button number (0=left, 1=middle, 2=right), or `None` for motion with
-/// no button held.
+/// One mouse event in grid cells (0-based).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseEvent {
     pub kind: MouseKind,
+    /// xterm button number (0 left, 1 middle, 2 right, 8+ extra); for
+    /// motion, the held button or `None`.
     pub button: Option<u8>,
-    /// 0-based column.
     pub col: u16,
-    /// 0-based row.
     pub row: u16,
     pub modifiers: MouseModifiers,
 }
 
-/// Encode a mouse event into the appropriate escape sequence (N16a).
-///
-/// Returns `None` if `mode` does not report this event kind, or if the
-/// event is outside the grid entirely (see the coordinate bounds below).
-///
-/// Format (all modes): `CSI < b ; x y M` for press/motion/wheel,
-/// `CSI < b ; x y m` for release, where:
-///
-/// - `b` = button code: press/release use the button number (0/1/2);
-///   motion uses the held button number, or 3 when no button is held,
-///   with the motion bit set (32/33/34/35); wheel uses 64/65/66/67
-///   (up/down/left/right); plus modifiers: shift +4, ctrl +8, alt +64;
-/// - `x` = `col + 1`, `y` = `row + 1` (1-based), clamped to the last
-///   valid cell when the event sits exactly on the grid edge
-///   (`col == cols` / `row == rows`);
-/// - an event beyond the grid edge (`col > cols` / `row > rows`) or with
-///   a coordinate the protocol cannot carry (`>= 256`) returns `None`.
-///
-/// Motion gating: `X10` reports no motion; `Normal` reports motion only
-/// while a button is held; `CellMotion`/`AllMotion` always report
-/// motion. Press/release and wheel are button events and are reported
-/// by every reporting mode.
+/// Whether `mode` reports `event` at all.
+fn reports(mode: MouseMode, event: &MouseEvent) -> bool {
+    match (mode, event.kind) {
+        (MouseMode::None, _) => false,
+        (MouseMode::X10, kind) => kind == MouseKind::Press,
+        (MouseMode::Normal, MouseKind::Motion) => false,
+        (MouseMode::CellMotion, MouseKind::Motion) => event.button.is_some(),
+        _ => true,
+    }
+}
+
+/// Encode one mouse report, or `None` when the mode does not report the
+/// event, the grid is empty, the position is outside it, or the encoding
+/// cannot represent the position.
 pub fn encode_mouse_event(
     mode: MouseMode,
+    encoding: MouseEncoding,
     event: &MouseEvent,
     cols: u16,
     rows: u16,
-) -> Option<String> {
-    // Mode gating: which event kinds does this mode report?
-    let reports = match (mode, event.kind) {
-        (MouseMode::None, _) => false,
-        (MouseMode::X10, MouseKind::Motion) => false,
-        (MouseMode::Normal, MouseKind::Motion) => event.button.is_some(),
-        _ => true,
-    };
-    if !reports {
+) -> Option<Vec<u8>> {
+    if !reports(mode, event) || cols == 0 || rows == 0 || event.col >= cols || event.row >= rows {
         return None;
     }
-
-    // Coordinate bounds: a zero-sized grid has no valid cell; an event
-    // beyond the grid edge or past the protocol's 255-cell limit is
-    // outside the grid entirely; an event on the grid edge clamps to
-    // the last valid cell.
-    if cols == 0
-        || rows == 0
-        || event.col > cols
-        || event.row > rows
-        || event.col >= 256
-        || event.row >= 256
-    {
-        return None;
+    let x = u32::from(event.col) + 1;
+    let y = u32::from(event.row) + 1;
+    match encoding {
+        MouseEncoding::Sgr => {
+            let terminator = if event.kind == MouseKind::Release {
+                'm'
+            } else {
+                'M'
+            };
+            let code = button_code(event, false);
+            Some(format!("\x1b[<{code};{x};{y}{terminator}").into_bytes())
+        }
+        MouseEncoding::Default => {
+            let value = |v: u32| u8::try_from(v + 32).ok();
+            let code = button_code(event, true);
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                value(u32::from(code))?,
+                value(x)?,
+                value(y)?,
+            ])
+        }
+        MouseEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [u32::from(button_code(event, true)), x, y] {
+                let v = v + 32;
+                if v > 2047 {
+                    return None;
+                }
+                let c = char::from_u32(v)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
     }
-    let x = (event.col + 1).min(cols);
-    let y = (event.row + 1).min(rows);
-
-    let b = button_code(event);
-    let terminator = match event.kind {
-        MouseKind::Release => 'm',
-        _ => 'M',
-    };
-    Some(format!("\x1b[<{};{} {}{}", b, x, y, terminator))
 }
 
-/// The `b` field for a mouse report: the button base code with the
-/// motion bit (32) and modifiers (shift +4, ctrl +8, alt +64) added.
-///
-/// Button base codes pinned from the xterm ctlseqs mouse rows [S18]:
-/// 0/1/2 = left/middle/right, 3 = no button, 64/65/66/67 = wheel
-/// up/down/left/right; bit 32 marks motion (32+0 held left, 32+3 no
-/// button).
-fn button_code(event: &MouseEvent) -> u16 {
-    let base: u16 = match event.kind {
-        MouseKind::Press | MouseKind::Release | MouseKind::Motion => {
-            event.button.unwrap_or(3) as u16
+/// The xterm button code: button (0-2, wheel 64-67, extra buttons 128+),
+/// +32 for motion, +4 Shift, +8 Alt (meta), +16 Ctrl. The legacy
+/// encodings report every release as button 3; SGR keeps the button.
+fn button_code(event: &MouseEvent, legacy: bool) -> u16 {
+    let button = |b: u8| -> u16 {
+        match b {
+            0..=2 => u16::from(b),
+            n => 128 + u16::from(n.saturating_sub(8)),
         }
+    };
+    let base: u16 = match event.kind {
+        MouseKind::Release if legacy => 3,
+        MouseKind::Press | MouseKind::Release => button(event.button.unwrap_or(0)),
+        MouseKind::Motion => event.button.map_or(3, button) + 32,
         MouseKind::WheelUp => 64,
         MouseKind::WheelDown => 65,
         MouseKind::WheelLeft => 66,
         MouseKind::WheelRight => 67,
     };
-    let mut code = match event.kind {
-        MouseKind::Motion => base + 32,
-        _ => base,
-    };
+    let mut code = base;
     if event.modifiers.shift {
         code += 4;
     }
-    if event.modifiers.ctrl {
+    if event.modifiers.alt {
         code += 8;
     }
-    if event.modifiers.alt {
-        code += 64;
+    if event.modifiers.ctrl {
+        code += 16;
     }
     code
 }
 
-// ================================================================= N16b ===
-//
-// Pure window-side decisions the N16b wiring makes per event. Each is
-// headless-testable: plain fields, no winit `Window`, no PTY, no clocks.
-
-/// The button number a winit [`MouseButton`] maps to for the protocol:
-/// 0 = left, 1 = middle, 2 = right, then the xterm extra-button codes
-/// 4 = back, 5 = forward, and `Other(n)` carries its own number.
+/// The xterm button number a winit [`MouseButton`] maps to: 0 left,
+/// 1 middle, 2 right, 8 back, 9 forward (reported as codes 128 and 129);
+/// `Other(n)` carries its own number.
 pub fn button_number(button: MouseButton) -> u8 {
     match button {
         MouseButton::Left => 0,
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
-        MouseButton::Back => 4,
-        MouseButton::Forward => 5,
-        MouseButton::Other(n) => n as u8,
+        // xterm buttons 8 and 9 (codes 128 and 129); 4-7 are the wheel.
+        MouseButton::Back => 8,
+        MouseButton::Forward => 9,
+        MouseButton::Other(n) => u8::try_from(n).unwrap_or(u8::MAX),
     }
 }
 

@@ -187,7 +187,39 @@ scenario_keys() {
     pass keys
 }
 
-ALL=(render tty resize keys)
+# Mouse: with SGR click reporting enabled (1000 + 1006), a click on a
+# known cell arrives as exact press/release reports.
+scenario_mouse() {
+    local dir="$OUT/mouse"; mkdir -p "$dir"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+stty raw -echo
+printf '\033[?1000h\033[?1006h'
+head -c 18 > "$dir/bytes.raw"
+printf '\033[?1006l\033[?1000l'
+stty sane
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch mouse "$dir/child.sh" || { fail mouse "no window"; return; }
+    local cell cw ch
+    cell=$(sed -n 's/^fonts: cell \([0-9]*\)x\([0-9]*\).*/\1 \2/p' "$OUT/mouse/nora.log" | head -1)
+    read -r cw ch <<<"$cell"
+    [ -n "$cw" ] || { finish; fail mouse "no cell size in log"; return; }
+    # Centre of column 5, row 3 (1-based).
+    xdotool mousemove --window "$WIN" $((cw * 4 + cw / 2)) $((ch * 2 + ch / 2)) click 1
+    wait_file "$dir/bytes.raw" || { finish; fail mouse "no report"; return; }
+    sleep 0.3
+    finish
+    local got
+    got=$(od -An -c "$dir/bytes.raw" | tr -s ' \n' ' ' | sed 's/^ //; s/ $//')
+    echo "  report: $got"
+    [ "$(cat "$dir/bytes.raw")" = "$(printf '\033[<0;5;3M\033[<0;5;3m')" ] \
+        || { fail mouse "expected ESC[<0;5;3M ESC[<0;5;3m"; return; }
+    pass mouse
+}
+
+ALL=(render tty resize keys mouse)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

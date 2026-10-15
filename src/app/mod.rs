@@ -33,8 +33,9 @@ use nora::engine::{KittyKeyboardFlags, Snapshot};
 use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
-    MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event, logical_to_cell,
-    mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions,
+    MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event,
+    logical_to_cell, mouse_modifiers, physical_to_cell, should_report, track_button,
+    wheel_directions,
 };
 use nora::input::{BindingTable, InputAction, encode};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
@@ -413,6 +414,8 @@ struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
     /// Local UI key bindings.
     bindings: Bindings,
+    /// The last cell a motion report was sent for (one report per cell).
+    last_motion_cell: Option<(u16, u16)>,
     /// Base color table (built-in xterm palette + `[theme]`); each
     /// snapshot's runtime OSC overrides are overlaid on it before drawing.
     palette: Palette,
@@ -593,6 +596,7 @@ pub fn run_windowed(
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_theme(&config.theme),
         bindings: Bindings::default(),
+        last_motion_cell: None,
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -1197,13 +1201,11 @@ impl WinApp {
             return;
         };
         let (cols, rows) = window_grid(window, fonts);
-        if let Some(seq) = encode_mouse_event(mode, event, cols, rows)
+        let encoding = MouseEncoding::from_term_mode(self.modes);
+        if let Some(bytes) = encode_mouse_event(mode, encoding, event, cols, rows)
             && let Some(pane) = self.active_pane_key()
         {
-            let _ = self.pump_commands.send(PumpMsg::Input {
-                pane,
-                bytes: seq.into_bytes(),
-            });
+            let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
         }
     }
 
@@ -1778,6 +1780,26 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * 3,
                     MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
                 };
+                // Alternate scroll (DECSET 1007): the alternate screen has
+                // no scrollback, so the wheel becomes cursor keys for the
+                // full-screen application (less, man, vim).
+                if self.modes.contains(TermMode::ALT_SCREEN)
+                    && self.modes.contains(TermMode::ALTERNATE_SCROLL)
+                {
+                    if lines != 0
+                        && let Some(pane) = self.active_pane_key()
+                    {
+                        let key = if lines > 0 { b'A' } else { b'B' };
+                        let one: &[u8] = if self.modes.contains(TermMode::APP_CURSOR) {
+                            &[0x1b, b'O', key]
+                        } else {
+                            &[0x1b, b'[', key]
+                        };
+                        let bytes = one.repeat(lines.unsigned_abs() as usize);
+                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                    }
+                    return;
+                }
                 if lines != 0
                     && let Some(pane) = self.active_pane_key()
                 {
@@ -1796,7 +1818,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 let (x, y) = (position.x / scale, position.y / scale);
                 self.cursor = (x, y);
                 if let Some((start_row, start_col)) = self.selection
+                    && self.pressed_buttons.contains(&0)
                     && let Some((end_row, end_col)) = self.grid_cell_at(&window, x, y)
+                    && (end_row, end_col) != (start_row, start_col)
                     && let Some(pane) = self.active_pane_key()
                 {
                     let _ = self.pump_commands.send(PumpMsg::Select {
@@ -1819,7 +1843,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         fonts.cell_w,
                         fonts.cell_h(),
                     )
+                    // Motion is reported once per cell, not per pixel.
+                    && self.last_motion_cell != Some((col, row))
                 {
+                    self.last_motion_cell = Some((col, row));
                     self.send_mouse_event(
                         &MouseEvent {
                             kind: MouseKind::Motion,
@@ -1833,28 +1860,23 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             }
             WindowEvent::MouseInput { button, state, .. } => {
-                // N14b: primary-button drag selects. `MouseInput` carries
-                // no position, so use the last tracked cursor.
-                if button == MouseButton::Left {
+                // Local selection: a left press clears the old selection and
+                // anchors a new one that starts on drag (`MouseInput` has no
+                // position, so the last tracked cursor is used). When the
+                // application reports the mouse, the click is its own; Shift
+                // overrides, as in xterm.
+                let reporting =
+                    should_report(MouseMode::from_term_mode(self.modes), self.mods.shift_key());
+                if button == MouseButton::Left && !reporting {
                     let (x, y) = self.cursor;
                     match state {
                         ElementState::Pressed => {
-                            if let Some(cell) = self.grid_cell_at(&window, x, y) {
-                                self.selection = Some(cell);
-                                if let Some(pane) = self.active_pane_key() {
-                                    let _ = self.pump_commands.send(PumpMsg::Select {
-                                        pane,
-                                        start_row: cell.0,
-                                        start_col: cell.1,
-                                        end_row: cell.0,
-                                        end_col: cell.1,
-                                    });
-                                }
+                            if let Some(pane) = self.active_pane_key() {
+                                let _ = self.pump_commands.send(PumpMsg::ClearSelection { pane });
                             }
+                            self.selection = self.grid_cell_at(&window, x, y);
                         }
                         ElementState::Released => {
-                            // Finalize: the engine keeps the last
-                            // selection; drop the drag state.
                             self.selection = None;
                         }
                     }
