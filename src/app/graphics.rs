@@ -891,6 +891,12 @@ impl Graphics {
     /// On a frame without a texture the (possibly empty) encoder is still
     /// finished and submitted, and dropping the frame releases the failed
     /// acquire before the caller reconfigures the surface.
+    /// Drop every shaped cell: required when the font system is replaced
+    /// (font ids change).
+    pub fn clear_glyph_cache(&mut self) {
+        self.glyph_cache = GlyphCache::new();
+    }
+
     pub fn present(&mut self, frame: Frame) {
         let cmd = frame.encoder.finish();
         self.queue.submit([cmd]);

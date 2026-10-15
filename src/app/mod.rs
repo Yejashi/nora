@@ -409,6 +409,10 @@ struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
     /// Local UI key bindings.
     bindings: Bindings,
+    /// Wakes this window from other threads (the font loader).
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    /// The full font system being built in the background.
+    full_fonts: Option<Arc<Mutex<Option<glyphon::FontSystem>>>>,
     /// Each pane's title (OSC 0/2); the window shows the active pane's.
     pane_titles: std::collections::HashMap<PaneKey, String>,
     /// The last cell a motion report was sent for (one report per cell).
@@ -422,6 +426,8 @@ struct WinApp {
     /// a presented frame arrived (key-to-present measurement).
     trace_key_at: Option<std::time::Instant>,
     trace_latency: bool,
+    /// `NORA_TRACE_FRAMES`: log a per-phase timing line for every frame.
+    trace_frames: bool,
     /// Base color table (built-in xterm palette + `[theme]`); each
     /// snapshot's runtime OSC overrides are overlaid on it before drawing.
     palette: Palette,
@@ -605,10 +611,13 @@ pub fn run_windowed(
         bindings: Bindings::default(),
         last_motion_cell: None,
         pane_titles: std::collections::HashMap::new(),
+        proxy: event_loop.create_proxy(),
+        full_fonts: None,
         pane_last: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
         trace_latency: std::env::var_os("NORA_TRACE_LATENCY").is_some(),
+        trace_frames: std::env::var_os("NORA_TRACE_FRAMES").is_some(),
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -1298,6 +1307,8 @@ impl WinApp {
                 // to it via the active pane.
                 let _ = pane;
             }
+            // Handled in `user_event` before routing.
+            AppEvent::FontsReady => {}
             AppEvent::Title { pane, title } => {
                 match title {
                     Some(title) => self.pane_titles.insert(pane, title),
@@ -1421,6 +1432,7 @@ impl WinApp {
         let Some(active) = self.active_pane_key() else {
             return;
         };
+        let t_start = std::time::Instant::now();
         let slot = self
             .pane_slots
             .get(&active)
@@ -1465,6 +1477,10 @@ impl WinApp {
                 });
             panes.push((key, x, y + bar, w, h, snap));
         }
+        if fresh_any {
+            // A slot was emptied: the pump may build the next snapshot.
+            let _ = self.pump_commands.send(PumpMsg::Wake);
+        }
         if !fresh_any && !retained {
             // Coalesced pulse: the earlier pulse already presented
             // the latest content.
@@ -1478,11 +1494,13 @@ impl WinApp {
             }
             return;
         }
+        let t_gathered = std::time::Instant::now();
         let graphics = self
             .graphics
             .as_mut()
             .expect("graphics are created at startup");
         let mut frame = graphics.acquire();
+        let t_acquired = std::time::Instant::now();
         let (state, action) = on_event(
             self.state.clone(),
             RenderEvent::SurfaceStatus(frame.status.clone()),
@@ -1642,6 +1660,7 @@ impl WinApp {
                         .collect();
                     scene.add_separators(&tiles, u32::from(bar), layout.cell_w, layout.cell_h);
                 }
+                let t_built = std::time::Instant::now();
                 if let Err(message) = graphics.draw_frame(
                     &mut frame,
                     fonts,
@@ -1655,7 +1674,29 @@ impl WinApp {
                     eprintln!("nora: frame draw failed: {message}");
                 }
                 let suboptimal = frame.status == SurfaceStatus::Suboptimal;
+                let t_drawn = std::time::Instant::now();
                 graphics.present(frame);
+                if self.frames == 0 {
+                    nora::trace::stage("first frame presented");
+                }
+                if self.trace_frames {
+                    let ms = |a: std::time::Instant, b: std::time::Instant| {
+                        (b - a).as_secs_f64() * 1000.0
+                    };
+                    let done = std::time::Instant::now();
+                    eprintln!(
+                        "frame: total {:.3} gather {:.3} acquire {:.3} scene {:.3} encode {:.3} present {:.3} ms cells {} grid {}x{}",
+                        ms(t_start, done),
+                        ms(t_start, t_gathered),
+                        ms(t_gathered, t_acquired),
+                        ms(t_acquired, t_built),
+                        ms(t_built, t_drawn),
+                        ms(t_drawn, done),
+                        scene.cells.len(),
+                        grid_cols,
+                        grid_rows
+                    );
+                }
                 if let Some(at) = self.trace_key_at.take() {
                     eprintln!(
                         "latency: key-to-present {:.3} ms",
@@ -1734,6 +1775,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
         // sent to the PTY exactly once).
         window.set_ime_allowed(true);
 
+        nora::trace::stage("event loop running (PTY spawned)");
         let mut graphics = match pollster::block_on(Graphics::new(event_loop, &window, {
             let device_lost = self.device_lost.clone();
             move |reason, message| {
@@ -1750,6 +1792,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
         };
 
+        nora::trace::stage("GPU device and surface ready");
         let mut fonts = match self.fonts.take() {
             Some(fonts) => fonts,
             None => glyphs::Fonts::load(&nora::config::FontConfig::default()),
@@ -1776,11 +1819,35 @@ impl ApplicationHandler<AppEvent> for WinApp {
         );
         println!("fonts: cell {}x{}", fonts.cell_w, fonts.cell_h());
 
+        // Fallback fonts for glyphs the configured faces lack are loaded
+        // off the startup path and swapped in when ready.
+        let proxy = self.proxy.clone();
+        self.full_fonts = Some(fonts.spawn_full_system(move || {
+            let _ = proxy.send_event(AppEvent::FontsReady);
+        }));
         self.graphics = Some(graphics);
         self.fonts = Some(fonts);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        if let AppEvent::FontsReady = event {
+            let full = self
+                .full_fonts
+                .take()
+                .and_then(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).take());
+            if let (Some(fs), Some(fonts)) = (full, self.fonts.as_mut()) {
+                fonts.install_full_system(fs);
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.clear_glyph_cache();
+                }
+                nora::trace::stage("system fallback fonts installed");
+                self.resize_all_panes();
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            return;
+        }
         // N24b: exit the window when the last pane's child exits (and not
         // holding); the pane is still in its layout at this point.
         // The window closes only when the last pane of the last tab

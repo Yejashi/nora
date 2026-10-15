@@ -170,7 +170,17 @@ impl GraphicsFilter {
     /// [`GraphicsEvent`]s extracted from this chunk.
     pub fn process<'a>(&mut self, bytes: &'a [u8]) -> (&'a [u8], Vec<GraphicsEvent>) {
         let mut events = Vec::new();
-        for &byte in bytes {
+        let mut i = 0;
+        while i < bytes.len() {
+            // Fast path: skip plain text to the next ESC.
+            if self.state == FilterState::Pass {
+                match bytes[i..].iter().position(|&b| b == 0x1B) {
+                    Some(run) => i += run,
+                    None => break,
+                }
+            }
+            let byte = bytes[i];
+            i += 1;
             match self.state {
                 FilterState::Pass => {
                     if byte == 0x1B {

@@ -527,9 +527,25 @@ impl PromptMarkerFilter {
     /// is the index in `forwarded` at which the marker was detected (i.e.
     /// the number of forwarded bytes before the marker).
     pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<(usize, ShellEvent)>) {
-        let mut out: Vec<u8> = Vec::new();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
         let mut events: Vec<(usize, ShellEvent)> = Vec::new();
-        for &byte in bytes {
+        let mut i = 0;
+        while i < bytes.len() {
+            // Fast path: plain text up to the next ESC is copied as one run
+            // (it is almost all of a typical stream).
+            if self.state == FilterState::Pass {
+                let run = bytes[i..]
+                    .iter()
+                    .position(|&b| b == 0x1B)
+                    .unwrap_or(bytes.len() - i);
+                out.extend_from_slice(&bytes[i..i + run]);
+                i += run;
+                if i == bytes.len() {
+                    break;
+                }
+            }
+            let byte = bytes[i];
+            i += 1;
             match self.state {
                 FilterState::Pass => {
                     if byte == 0x1B {

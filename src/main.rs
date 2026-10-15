@@ -48,6 +48,7 @@ Options:\n\
 With no command, the default shell ($SHELL, else /bin/sh) is launched.";
 
 fn main() -> ExitCode {
+    nora::trace::start();
     let args: Vec<String> = env::args().skip(1).collect();
     let mut smoke = false;
     let mut hold = false;
@@ -289,7 +290,10 @@ fn run_windowed(
         match winit::event_loop::EventLoop::<nora::session::pump::AppEvent>::with_user_event()
             .build()
         {
-            Ok(event_loop) => event_loop,
+            Ok(event_loop) => {
+                nora::trace::stage("event loop (display connection)");
+                event_loop
+            }
             Err(err) => {
                 eprintln!("{NAME} {VERSION}: no display server ({err}); headless session");
                 return run_session(spec, explicit, config);
@@ -322,7 +326,9 @@ fn run_windowed(
     );
     // Loaded once here (the first PTY needs the grid) and handed to the
     // window loop.
+    nora::trace::stage("window created");
     let mut fonts = app::glyphs::Fonts::load(&config.font);
+    nora::trace::stage("fonts loaded");
     fonts.measure(window.scale_factor(), nora::config::ZOOM_DEFAULT);
     let (cols, rows) = app::window_grid(&window, &fonts);
     let (rows, cols) = if rows == 0 || cols == 0 {
@@ -333,6 +339,7 @@ fn run_windowed(
     };
     // N23b: the pump spawns new-tab sessions from the same launch spec.
     let spec_for_pump = spec.clone();
+    nora::trace::stage("cells measured");
     let session = match PtySession::spawn(spec, rows as usize, cols as usize, DEFAULT_CAP) {
         Ok(session) => session,
         Err(err) => {

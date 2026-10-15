@@ -59,6 +59,67 @@ fn resolve_font(env_var: &str, candidates: &[&str], families: &[&str]) -> Option
     system_font(families)
 }
 
+/// Resolve the first installed family with `fc-match`. `None` when
+/// fc-match is unavailable (callers fall back to scanning); `Some(None)`
+/// when no family is installed. fc-match always answers with some font,
+/// so a named family counts only when the answer is that family;
+/// `monospace` is fontconfig's own alias and is taken as answered.
+fn fontconfig_match(families: &[&str]) -> Option<Option<PathBuf>> {
+    for family in families {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{family}\t%{file}", family])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some((names, file)) = text.split_once('\t') else {
+            continue;
+        };
+        let wanted = family.to_lowercase();
+        let matches = *family == "monospace"
+            || names
+                .split(',')
+                .any(|name| name.trim().to_lowercase() == wanted);
+        if matches && Path::new(file).is_file() {
+            return Some(Some(PathBuf::from(file)));
+        }
+    }
+    Some(None)
+}
+
+/// The bold, italic and bold-italic files of `family` from `fc-list`
+/// (fontconfig weight 200 = bold, slant 100/110 = italic/oblique). `None`
+/// when fc-list is unavailable.
+fn fontconfig_styled_faces(family: &str) -> Option<Vec<PathBuf>> {
+    let out = std::process::Command::new("fc-list")
+        .args(["-f", "%{file}\t%{weight}\t%{slant}\n", family])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut faces: Vec<PathBuf> = Vec::new();
+    for wanted in [(200, 0), (80, 100), (200, 100)] {
+        let hit = text.lines().find_map(|line| {
+            let mut parts = line.split('\t');
+            let file = parts.next()?;
+            let weight: i32 = parts.next()?.trim().parse().ok()?;
+            let slant: i32 = parts.next()?.trim().parse().ok()?;
+            let italic = if slant >= 100 { 100 } else { 0 };
+            ((weight, italic) == wanted).then(|| PathBuf::from(file))
+        });
+        if let Some(path) = hit
+            && !faces.contains(&path)
+        {
+            faces.push(path);
+        }
+    }
+    Some(faces)
+}
+
 /// The system font database (fontconfig directories), scanned once per
 /// process on first use.
 fn system_db() -> &'static fontdb::Database {
@@ -74,6 +135,12 @@ fn system_db() -> &'static fontdb::Database {
 /// to a font file. `"monospace"` is the fontconfig generic alias; any other
 /// entry is an exact family name.
 fn system_font(families: &[&str]) -> Option<PathBuf> {
+    // fontconfig answers from its cache in milliseconds; the fontdb scan
+    // below reads every installed font file (about a second on a
+    // well-stocked system) and is only the fallback without fc-match.
+    if let Some(found) = fontconfig_match(families) {
+        return found;
+    }
     let db = system_db();
     for family in families {
         let family = match *family {
@@ -147,6 +214,11 @@ pub struct Fonts {
     pub mono_path: PathBuf,
     /// Configured size in points.
     size_pt: f32,
+    /// Font files of the startup system (the full system adds the rest).
+    files: Vec<PathBuf>,
+    /// The scale factor and zoom of the last `measure`.
+    scale: f64,
+    zoom: f32,
     /// Current metrics (physical pixels); see [`Fonts::measure`].
     pub metrics: CellMetrics,
     /// Cell width in physical pixels (mirrors `metrics.cell_w`).
@@ -196,22 +268,35 @@ impl Fonts {
             &["Noto Serif Ethiopic", "Noto Sans Ethiopic"],
         );
 
-        let mut fs = FontSystem::new_with_fonts(
-            [Some(mono_path.clone()), cjk_path, ethiopic_path]
-                .into_iter()
-                .flatten()
-                .map(fontdb::Source::File),
-        );
-        let family = family_of(&fs, &mono_path, MONO_FAMILY);
+        // Startup font system: only the resolved faces. cosmic-text's own
+        // constructors also scan every installed font (about half a second
+        // here), so that full system is built in the background instead
+        // (`spawn_full_system`) and swapped in for glyph fallback.
+        let mut files: Vec<PathBuf> = [Some(mono_path.clone()), cjk_path, ethiopic_path]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&mono_path).ok();
+        let probe = FontSystem::new_with_locale_and_db(locale(), db);
+        let family = family_of(&probe, &mono_path, MONO_FAMILY);
         for path in styled_faces(&family) {
-            if path != mono_path {
-                fs.db_mut().load_font_source(fontdb::Source::File(path));
+            if !files.contains(&path) {
+                files.push(path);
             }
         }
-        fs.db_mut().set_monospace_family(family.clone());
+        let mut db = fontdb::Database::new();
+        for path in &files {
+            db.load_font_file(path).ok();
+        }
+        db.set_monospace_family(family.clone());
+        let fs = FontSystem::new_with_locale_and_db(locale(), db);
         let mut fonts = Self {
             fs,
             family,
+            files,
+            scale: 1.0,
+            zoom: 1.0,
             mono_path,
             size_pt: font.size,
             metrics: CellMetrics {
@@ -228,6 +313,8 @@ impl Fonts {
     /// Recompute the cell metrics for a display scale factor and zoom;
     /// returns them. Pure font work: no GPU, no display.
     pub fn measure(&mut self, scale: f64, zoom: f32) -> CellMetrics {
+        self.scale = scale;
+        self.zoom = zoom;
         let px = font_px(self.size_pt, scale, zoom).max(1.0);
         let family = self.family.clone();
         let advance = cluster_advance(&shape_cell(
@@ -266,11 +353,64 @@ impl Fonts {
     pub fn cell_h(&self) -> u32 {
         self.metrics.cell_h
     }
+
+    /// Build the full font system (every installed font, for per-glyph
+    /// fallback) on a background thread. The returned slot is filled when
+    /// it is ready, after which `notify` runs (to wake the window).
+    pub fn spawn_full_system(
+        &self,
+        notify: impl FnOnce() + Send + 'static,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<FontSystem>>> {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let out = slot.clone();
+        let files = self.files.clone();
+        let family = self.family.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nora-fonts".to_string())
+            .spawn(move || {
+                let mut db = fontdb::Database::new();
+                db.load_system_fonts();
+                for path in &files {
+                    db.load_font_file(path).ok();
+                }
+                db.set_monospace_family(family);
+                let fs = FontSystem::new_with_locale_and_db(locale(), db);
+                *out.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fs);
+                notify();
+            });
+        if spawned.is_err() {
+            eprintln!("nora: could not start the font loader; system fallback fonts unavailable");
+        }
+        slot
+    }
+
+    /// Replace the font system with the full one; cell metrics are
+    /// re-measured (unchanged for the same primary face).
+    pub fn install_full_system(&mut self, fs: FontSystem) {
+        self.fs = fs;
+        let (scale, zoom) = (self.scale, self.zoom);
+        self.measure(scale, zoom);
+    }
+}
+
+/// The locale for font fallback ordering, from the POSIX locale variables
+/// (`en_US.UTF-8` becomes `en-US`); `en-US` when unset.
+fn locale() -> String {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|value| !value.is_empty() && value != "C" && value != "POSIX")
+        .and_then(|value| value.split(['.', '@']).next().map(|l| l.replace('_', "-")))
+        .unwrap_or_else(|| "en-US".to_string())
 }
 
 /// Font files for the bold, italic and bold-italic faces of `family`, as
 /// fontconfig knows them (regular excluded).
 fn styled_faces(family: &str) -> Vec<PathBuf> {
+    if let Some(faces) = fontconfig_styled_faces(family) {
+        return faces;
+    }
     let db = system_db();
     let mut out = Vec::new();
     for (weight, style) in [

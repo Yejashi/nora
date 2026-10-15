@@ -39,6 +39,15 @@ pub struct PumpOutcome {
 /// terminated, probe the engine and, only when the damage is not the
 /// pinned no-op shape, fetch a snapshot.
 pub fn pump_tick(session: &mut PtySession) -> PumpOutcome {
+    pump_tick_with(session, true)
+}
+
+/// [`pump_tick`], snapshotting only when `want_snapshot`: the window has
+/// consumed the previous one. Damage accumulates in the terminal until the
+/// next snapshot, so skipping loses nothing; it keeps snapshot work (a
+/// full-grid copy under the terminal lock, which stalls the PTY reader) at
+/// or below the frame rate.
+pub fn pump_tick_with(session: &mut PtySession, want_snapshot: bool) -> PumpOutcome {
     let mut terminated = false;
     let mut status: Option<ExitStatus> = None;
     for event in session.poll_events() {
@@ -54,7 +63,7 @@ pub fn pump_tick(session: &mut PtySession) -> PumpOutcome {
     }
 
     let mut snapshot = None;
-    if !terminated {
+    if !terminated && want_snapshot {
         let (damage, cursor) = session.engine().probe();
         if !is_noop_damage(&damage, cursor) {
             snapshot = Some(session.engine().snapshot());
@@ -109,6 +118,9 @@ pub enum AppEvent {
     },
     /// The pane's application rang the bell.
     Bell { pane: PaneKey },
+    /// The background font loader finished the full font system (sent by
+    /// the window's own loader thread, not the pump).
+    FontsReady,
     /// The session child for the pane exited (exit code, or None if the
     /// loop died without one).
     ChildExit { pane: PaneKey, status: Option<i32> },
@@ -420,7 +432,14 @@ fn tick_pane(
         return true;
     }
 
-    let outcome = pump_tick(&mut pane_pump.session);
+    // Backpressure: while the window still holds an undrawn snapshot of
+    // this pane, do not build another (the window wakes the pump when it
+    // takes one).
+    let slot_free = slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none();
+    let outcome = pump_tick_with(&mut pane_pump.session, slot_free);
 
     if outcome.terminated {
         // N06b: surface the last title set by the child, on stderr, before
@@ -437,7 +456,7 @@ fn tick_pane(
         return true;
     }
 
-    let forced = std::mem::take(&mut pane_pump.force_snapshot);
+    let forced = slot_free && std::mem::take(&mut pane_pump.force_snapshot);
     let snapshot = match outcome.snapshot {
         Some(snapshot) => Some(snapshot),
         None if forced => Some(pane_pump.session.engine().snapshot()),
