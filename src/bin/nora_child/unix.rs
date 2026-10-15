@@ -166,6 +166,9 @@ fn ready(out: &mut impl Write) {
 /// Read stdin until at least `limit` bytes have been received and a
 /// newline byte has been seen, print `STOPPED`, then read until EOF.
 fn stop(out: &mut impl Write, limit: &str) {
+    // READY once stdin is raw (set in main): input sent before that is
+    // subject to the canonical line limit (1 KiB on macOS).
+    ready(out);
     let target = limit.parse::<usize>().unwrap_or(0);
     let mut input = io::stdin().lock();
     let mut buffer = [0u8; 4096];

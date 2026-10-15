@@ -163,3 +163,25 @@ Verified: OSC52 disabled; hyperlink opener allowlist argv-only; no cmd/file trig
 - Recommended order: wire existing keys; Alacritty-shaped colors + built 256 palette; live reload Ctrl+Shift+F5; typed bindings enum; window.padding/dimensions/decorations; cursor.style/blink, hide_when_typing, scrolling.multiplier; includes later.
 ```
 
+
+## Open: independent review of f67ce22^..2370d9d (2026-10-15)
+
+Read-only review of the multi-pane, performance, config, cross-platform,
+search and redraw-loop commits. Not yet fixed; ordered by severity.
+
+| ID | Sev | Finding | Fix direction |
+| --- | --- | --- | --- |
+| RV1 | high | Redraw loop remains for a *partly* scrolled view: `probe()` now returns the cursor in screen coordinates but alacritty's damage iterator reports lines shifted by `display_offset` (viewport coordinates), so the always-damaged cursor line never matches (e.g. `clear`, then wheel up 3 lines) | Return the viewport-mapped cursor (`line + display_offset`, `None` when off screen) and keep the empty-damage no-op (`src/engine.rs` probe, `src/render/term.rs`) |
+| RV2 | high | View changes on an idle pane (search, prompt jump, selection, scroll, config) show up to 500 ms late: commands only set `force_snapshot`, the pump ticks before draining commands and `busy` ignores `force_snapshot` | Tick again after draining commands, or timeout 0 when any pane has a forced snapshot (`src/session/pump.rs`) |
+| RV-OSC7 | high | Pre-existing: `percent_decode` in `src/prompt_marker.rs` slices a `str` at byte offsets; an OSC 7 like `ESC]7;file:///%aé BEL` panics the PTY reader thread (pane dies); a trailing `%XX` is never decoded | Decode on bytes; fix the bound |
+| RV3 | medium | `search_text` scans the whole scrollback under the terminal lock on every keystroke and every Enter (stalls the reader and the pump with a large history) | Copy lines in chunks releasing the lock, or cache hits per query |
+| RV4 | medium | With more than 10 000 hits, "newest match" is the 10 000th oldest | Scan bottom-up or keep the last N |
+| RV5 | medium | A config color change does not repaint idle panes (retained snapshots hold already-overlaid colors; `Configure` forces no snapshot) | Retain raw colors, or force a snapshot of every pane on `Configure` |
+| RV6 | medium | Splitting a 1-row pane, or while minimized, gives a zero-size pane with no session; it shares the previous pane's slot; same for a new tab with no pane area | Always give the new pane a fresh slot; spawn its session when its size becomes non-zero |
+| RV7 | low | A font reload while the background fallback loader runs can drop the fallback fonts | Tag `FontsReady` with a generation |
+| RV8 | low | While searching, Ctrl+Shift+V pastes into the shell; unbound Ctrl/Alt chords append letters to the query | Route paste to the query; ignore Ctrl/Alt chords in search |
+| RV9 | low (suspected) | Search positions go stale when output arrives during a search | Store hits by absolute line, resolve under one lock |
+| RV10 | low | A match ending in a wide char highlights only its left half; a preedit can overlap a wide glyph starting one column earlier | Extend `end` over the spacer; clear the overlapped glyph |
+
+Also noted: a legacy `[keys]` binding with an unknown action now rejects
+the whole config (previously ignored).

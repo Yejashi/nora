@@ -200,7 +200,9 @@ fn output_of_exiting_child_survives_a_busy_terminal_lock() {
 
 #[test]
 fn cwd_is_honored() {
-    let temp = std::env::temp_dir();
+    // Canonical: macOS's temp dir is behind a symlink (/var -> /private/var)
+    // and the child reports the resolved path.
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir resolves");
     let marker = format!("PWD:{}", temp.display());
     let mut session = PtySession::spawn(
         LaunchSpec {
@@ -310,6 +312,8 @@ fn backpressure_with_stop_reading_child() {
         cap,
     )
     .expect("helper spawns over a real PTY");
+    pump(&mut session, |text, _events| text.contains("READY"))
+        .expect("helper ready (stdin raw) within the deadline");
 
     // 32 KiB + newline: ~4x the typical kernel PTY buffer, newline last so
     // canonical mode delivers the full line to the stopped reader.
@@ -1098,10 +1102,12 @@ fn descendant_bounded_drain() {
     // bounded wait and the `Closed` landing above are the contract.
 }
 
-/// Open file-descriptor count for this process (Linux `/proc` view).
+/// Open file-descriptor count for this process (`/proc/self/fd` on Linux,
+/// `/dev/fd` on macOS and the BSDs).
 fn fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd")
-        .expect("/proc/self/fd readable")
+        .or_else(|_| std::fs::read_dir("/dev/fd"))
+        .expect("an fd directory is readable")
         .count()
 }
 
