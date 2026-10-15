@@ -64,6 +64,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.saved_cursor.point.line += from_history;
         self.cursor.point.line += from_history;
 
+        // Account for the lines pulled from history: they shift every
+        // existing line down without a full-screen scroll, so stable line
+        // references (e.g. OSC 133 prompt markers) must add this back.
+        self.total_pulled += from_history as u64;
+
         self.display_offset = self.display_offset.saturating_sub(lines_added);
         self.decrease_scroll_limit(lines_added);
     }

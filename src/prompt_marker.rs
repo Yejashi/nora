@@ -55,13 +55,65 @@ impl PromptMarkerEvent {
 /// queue cap).
 const MAX_MARKER_BYTES: usize = 1024 * 1024;
 
-/// A byte-bounded queue of [`PromptMarkerEvent`]s.
+/// A prompt marker paired with the grid line it was detected on (N35b).
 ///
-/// Evicts the oldest event when the total byte cost exceeds
+/// `line` is the cursor's grid line (an offset from the bottom, as
+/// [`alacritty_terminal::index::Line`]) at the moment the marker was
+/// processed. The engine records it by processing the forwarded bytes in
+/// segments and reading the cursor after each marker's segment.
+///
+/// `scrolled` is the grid's monotonic [`total_scrolled`] counter at the
+/// moment the marker was processed. Because the grid is a ring buffer whose
+/// bottom advances on every full-screen scroll, a marker's line (relative
+/// to the bottom) decreases by one for every line added to the bottom
+/// after it was stored. Storing `scrolled` lets the engine recompute the
+/// marker's current line later as
+/// `line - (total_scrolled_now - scrolled) + (total_pulled_now - pulled)`,
+/// which stays correct across scrolls (and across the scrollback cap,
+/// unlike a raw line count) and across vertical resizes that pull lines
+/// from history into the visible area.
+///
+/// [`total_scrolled`]: alacritty_terminal::grid::Grid::total_scrolled
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerAtLine {
+    /// The grid line the marker was detected on.
+    pub line: i32,
+    /// The grid's `total_scrolled` counter when the marker was detected.
+    pub scrolled: u64,
+    /// The grid's `total_pulled` counter when the marker was detected.
+    pub pulled: u64,
+    /// The marker event.
+    pub event: PromptMarkerEvent,
+}
+
+impl MarkerAtLine {
+    /// The byte cost of this entry (for queue/store bounding).
+    pub fn byte_cost(&self) -> usize {
+        self.event.byte_cost()
+    }
+
+    /// The marker's current grid line, given the grid's `total_scrolled`
+    /// and `total_pulled` counters now.
+    ///
+    /// Returns `None` when the marker has scrolled out of the reachable
+    /// range (the grid line would underflow), so callers can fall back
+    /// cleanly.
+    pub fn current_line(&self, total_scrolled_now: u64, total_pulled_now: u64) -> Option<i32> {
+        let delta_scrolled = total_scrolled_now.saturating_sub(self.scrolled) as i64;
+        let delta_pulled = total_pulled_now.saturating_sub(self.pulled) as i64;
+        (self.line as i64 - delta_scrolled + delta_pulled)
+            .try_into()
+            .ok()
+    }
+}
+
+/// A byte-bounded queue of [`MarkerAtLine`]s.
+///
+/// Evicts the oldest entry when the total byte cost exceeds
 /// [`MAX_MARKER_BYTES`].
 #[derive(Debug, Clone, Default)]
 pub struct MarkerQueue {
-    events: VecDeque<PromptMarkerEvent>,
+    events: VecDeque<MarkerAtLine>,
     total_bytes: usize,
 }
 
@@ -71,11 +123,11 @@ impl MarkerQueue {
         Self::default()
     }
 
-    /// Push an event, evicting the oldest event(s) if the total byte cost
-    /// exceeds [`MAX_MARKER_BYTES`].
-    pub fn push(&mut self, event: PromptMarkerEvent) {
-        self.total_bytes += event.byte_cost();
-        self.events.push_back(event);
+    /// Push an entry, evicting the oldest entry(ies) if the total byte
+    /// cost exceeds [`MAX_MARKER_BYTES`].
+    pub fn push(&mut self, entry: MarkerAtLine) {
+        self.total_bytes += entry.byte_cost();
+        self.events.push_back(entry);
         while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
             if let Some(old) = self.events.pop_front() {
                 self.total_bytes -= old.byte_cost();
@@ -83,10 +135,10 @@ impl MarkerQueue {
         }
     }
 
-    /// Drain the queue, returning all events in order (oldest first).
+    /// Drain the queue, returning all entries in order (oldest first).
     ///
     /// Resets the byte accounting to zero (the queue is empty afterward).
-    pub fn drain(&mut self) -> Vec<PromptMarkerEvent> {
+    pub fn drain(&mut self) -> Vec<MarkerAtLine> {
         self.total_bytes = 0;
         self.events.drain(..).collect()
     }
@@ -118,7 +170,7 @@ pub const MAX_MARKERS: usize = 1024;
 /// [`crate::graphics_image::ImageStore`]).
 #[derive(Debug)]
 pub struct MarkerStore {
-    markers: HashMap<usize, PromptMarkerEvent>,
+    markers: HashMap<usize, MarkerAtLine>,
     total_bytes: usize,
     next_id: usize,
 }
@@ -145,14 +197,14 @@ impl MarkerStore {
     ///
     /// Returns the marker ID on success, or `None` when the
     /// [`MAX_MARKERS`] cap would be exceeded.
-    pub fn insert(&mut self, event: PromptMarkerEvent) -> Option<usize> {
+    pub fn insert(&mut self, entry: MarkerAtLine) -> Option<usize> {
         if self.markers.len() >= MAX_MARKERS {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.total_bytes += event.byte_cost();
-        self.markers.insert(id, event);
+        self.total_bytes += entry.byte_cost();
+        self.markers.insert(id, entry);
         Some(id)
     }
 
@@ -167,15 +219,20 @@ impl MarkerStore {
     }
 
     /// Query a marker by ID.
-    pub fn query(&self, id: usize) -> Option<&PromptMarkerEvent> {
+    pub fn query(&self, id: usize) -> Option<&MarkerAtLine> {
         self.markers.get(&id)
     }
 
+    /// Iterate over all stored markers as `(id, &MarkerAtLine)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &MarkerAtLine)> + '_ {
+        self.markers.iter().map(|(id, entry)| (*id, entry))
+    }
+
     /// Delete a marker by ID, returning it if present.
-    pub fn delete(&mut self, id: usize) -> Option<PromptMarkerEvent> {
-        let event = self.markers.remove(&id)?;
-        self.total_bytes -= event.byte_cost();
-        Some(event)
+    pub fn delete(&mut self, id: usize) -> Option<MarkerAtLine> {
+        let entry = self.markers.remove(&id)?;
+        self.total_bytes -= entry.byte_cost();
+        Some(entry)
     }
 
     /// Remove all markers, returning the number removed.
@@ -230,10 +287,12 @@ impl PromptMarkerFilter {
     /// should reach the parser: all non-OSC bytes, plus any OSC frame that
     /// is not a well-formed OSC 133 marker. Well-formed OSC 133 marker
     /// frames are suppressed (not forwarded) and instead appear in
-    /// `events` as [`PromptMarkerEvent`]s.
-    pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<PromptMarkerEvent>) {
+    /// `events` as `(position, PromptMarkerEvent)` pairs, where `position`
+    /// is the index in `forwarded` at which the marker was detected (i.e.
+    /// the number of forwarded bytes before the marker).
+    pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<(usize, PromptMarkerEvent)>) {
         let mut out: Vec<u8> = Vec::new();
-        let mut events: Vec<PromptMarkerEvent> = Vec::new();
+        let mut events: Vec<(usize, PromptMarkerEvent)> = Vec::new();
         for &byte in bytes {
             match self.state {
                 FilterState::Pass => {
@@ -300,15 +359,17 @@ impl PromptMarkerFilter {
     fn complete_frame(
         &mut self,
         out: &mut Vec<u8>,
-        events: &mut Vec<PromptMarkerEvent>,
+        events: &mut Vec<(usize, PromptMarkerEvent)>,
         terminator: &[u8],
     ) {
         let data = std::mem::take(&mut self.buffer);
         self.state = FilterState::Pass;
         match parse_marker(&data) {
             Some(kind) => {
-                // Well-formed OSC 133 marker: suppress the frame.
-                events.push(PromptMarkerEvent { kind });
+                // Well-formed OSC 133 marker: suppress the frame. Record
+                // the position in the forwarded stream (the number of
+                // forwarded bytes before this marker).
+                events.push((out.len(), PromptMarkerEvent { kind }));
             }
             None => {
                 // Not a marker (or malformed): forward the whole frame

@@ -50,8 +50,30 @@ pub enum Msg {
 /// read from the PTY. It must not block for long and must not allocate
 /// without bound.
 pub trait Filter {
-    /// Process a chunk of bytes. Returns the bytes to feed to the parser.
-    fn process(&mut self, bytes: &[u8]) -> Vec<u8>;
+    /// Process a chunk of bytes.
+    ///
+    /// Returns `(forwarded, marker_positions)`. `forwarded` is the bytes
+    /// to feed to the parser. `marker_positions` are offsets into
+    /// `forwarded` at which the filter detected prompt markers (N35b);
+    /// the event loop processes the forwarded bytes in segments around
+    /// those offsets and calls [`Filter::on_marker`] after each.
+    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>);
+
+    /// Called by the event loop after processing the segment ending at
+    /// `position`, with the cursor's grid line and the grid's monotonic
+    /// `total_scrolled` and `total_pulled` counters at that point.
+    /// Implementors use this to record each marker's grid position (N35b);
+    /// storing both counters lets them recompute the marker's current line
+    /// later, which stays correct across scrolls and across vertical
+    /// resizes that pull lines from history.
+    fn on_marker(
+        &mut self,
+        _position: usize,
+        _cursor_line: i32,
+        _total_scrolled: u64,
+        _total_pulled: u64,
+    ) {
+    }
 }
 
 /// The main event loop.
@@ -181,18 +203,36 @@ where
 
             // Run the byte-level pre-filter (if present) before parsing.
             // The filter observes the bytes (e.g. to extract graphics
-            // APCs) and returns the bytes to feed to the parser.
-            let filtered = self
-                .filter
-                .as_mut()
-                .map(|filter| filter.process(&buf[..unprocessed]));
-            let to_parse: &[u8] = match &filtered {
-                Some(bytes) => &bytes[..],
-                None => &buf[..unprocessed],
+            // APCs) and returns the bytes to feed to the parser plus any
+            // marker positions (N35b).
+            let (to_parse, marker_positions) = match self.filter.as_mut() {
+                Some(filter) => {
+                    let (forwarded, positions) = filter.process(&buf[..unprocessed]);
+                    (forwarded, positions)
+                },
+                None => (buf[..unprocessed].to_vec(), Vec::new()),
             };
 
-            // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, to_parse);
+            // Parse the incoming bytes. When the filter reported marker
+            // positions (N35b), process in segments: markers are grid
+            // no-ops, so the cursor line after each marker's segment is
+            // the marker's own line. Report it to the filter.
+            if marker_positions.is_empty() {
+                state.parser.advance(&mut **terminal, &to_parse);
+            } else {
+                let mut pos = 0;
+                for &mpos in &marker_positions {
+                    state.parser.advance(&mut **terminal, &to_parse[pos..mpos]);
+                    let line = terminal.grid().cursor.point.line.0;
+                    let scrolled = terminal.grid().total_scrolled();
+                    let pulled = terminal.grid().total_pulled();
+                    if let Some(filter) = self.filter.as_mut() {
+                        filter.on_marker(mpos, line, scrolled, pulled);
+                    }
+                    pos = mpos;
+                }
+                state.parser.advance(&mut **terminal, &to_parse[pos..]);
+            }
 
             processed += unprocessed;
             unprocessed = 0;

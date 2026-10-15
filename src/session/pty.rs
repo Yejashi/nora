@@ -59,10 +59,15 @@ struct PtyFilter {
     graphics_queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
     markers: crate::prompt_marker::PromptMarkerFilter,
     marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
+    /// Marker events from the last `process` call, in order (N35b). The
+    /// event loop calls `on_marker` once per reported position, in order,
+    /// so `pending_index` tracks which event the next callback is for.
+    pending_markers: Vec<crate::prompt_marker::PromptMarkerEvent>,
+    pending_index: usize,
 }
 
 impl alacritty_terminal::event_loop::Filter for PtyFilter {
-    fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
         let (forward, events) = self.graphics.process(bytes);
         if !events.is_empty() {
             let mut queue = self
@@ -74,16 +79,33 @@ impl alacritty_terminal::event_loop::Filter for PtyFilter {
             }
         }
         let (forward, events) = self.markers.process(forward);
-        if !events.is_empty() {
+        self.pending_markers = events.iter().map(|(_, e)| e.clone()).collect();
+        self.pending_index = 0;
+        let positions: Vec<usize> = events.iter().map(|(pos, _)| *pos).collect();
+        (forward, positions)
+    }
+
+    fn on_marker(
+        &mut self,
+        _position: usize,
+        cursor_line: i32,
+        total_scrolled: u64,
+        total_pulled: u64,
+    ) {
+        if let Some(event) = self.pending_markers.get(self.pending_index).cloned() {
+            self.pending_index += 1;
+            let entry = crate::prompt_marker::MarkerAtLine {
+                line: cursor_line,
+                scrolled: total_scrolled,
+                pulled: total_pulled,
+                event,
+            };
             let mut queue = self
                 .marker_queue
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            for event in events {
-                queue.push(event);
-            }
+            queue.push(entry);
         }
-        forward
     }
 }
 
@@ -314,6 +336,8 @@ impl PtySession {
             graphics_queue: engine.graphics_handle(),
             markers: crate::prompt_marker::PromptMarkerFilter::new(),
             marker_queue: engine.markers_handle(),
+            pending_markers: Vec::new(),
+            pending_index: 0,
         };
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
             .map(|loop_| loop_.with_filter(Box::new(pty_filter)))

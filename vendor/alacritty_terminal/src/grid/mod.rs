@@ -135,6 +135,24 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Monotonic count of lines added to the bottom of the grid (i.e. the
+    /// total number of full-screen scrolls that pushed content into
+    /// history). Used by consumers that need a stable reference to a line
+    /// that survives scrolls (e.g. OSC 133 prompt markers). This is a
+    /// runtime-only counter and is not part of the serialized terminal
+    /// state.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    total_scrolled: u64,
+
+    /// Monotonic count of lines pulled from history into the visible area
+    /// (the total `from_history` across all `grow_lines` resizes). A
+    /// vertical resize that reveals history moves every existing line down
+    /// by this amount without any full-screen scroll, so consumers tracking
+    /// a stable line reference must add this back (see `total_scrolled`).
+    /// Runtime-only; not part of the serialized terminal state.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    total_pulled: u64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,6 +165,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            total_scrolled: 0,
+            total_pulled: 0,
         }
     }
 
@@ -158,6 +178,23 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
         self.display_offset = min(self.display_offset, history_size);
         self.max_scroll_limit = history_size;
+    }
+
+    /// The total number of lines that have been added to the bottom of the
+    /// grid since it was created (a monotonic counter of full-screen
+    /// scrolls). Consumers can use the difference between two reads to
+    /// determine how far the bottom has advanced, which lets them keep a
+    /// reference to a specific line stable across scrolls.
+    pub fn total_scrolled(&self) -> u64 {
+        self.total_scrolled
+    }
+
+    /// The total number of lines pulled from history into the visible area
+    /// across all vertical resizes (a monotonic counter). Combined with
+    /// [`Grid::total_scrolled`], this lets consumers keep a reference to a
+    /// specific line stable across both scrolls and resizes.
+    pub fn total_pulled(&self) -> u64 {
+        self.total_pulled
     }
 
     pub fn scroll_display(&mut self, scroll: Scroll) {
@@ -270,6 +307,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            // A full-screen scroll pushes `positions` lines into history,
+            // advancing the bottom. Count it so consumers can track a line's
+            // position relative to the bottom across scrolls.
+            self.total_scrolled += positions as u64;
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 

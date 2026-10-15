@@ -8,7 +8,7 @@
 //! store is 1-based, bounded, and byte-accounted.
 
 use nora::prompt_marker::{
-    MarkerKind, MarkerQueue, MarkerStore, PromptMarkerEvent, PromptMarkerFilter,
+    MarkerAtLine, MarkerKind, MarkerQueue, MarkerStore, PromptMarkerEvent, PromptMarkerFilter,
 };
 
 /// Wrap an OSC data string in a full OSC frame: `ESC ] <data> ESC \`.
@@ -25,6 +25,16 @@ fn ev(kind: MarkerKind) -> PromptMarkerEvent {
     PromptMarkerEvent { kind }
 }
 
+/// A marker paired with a grid line (for queue/store tests).
+fn entry(kind: MarkerKind) -> MarkerAtLine {
+    MarkerAtLine {
+        line: 0,
+        scrolled: 0,
+        pulled: 0,
+        event: ev(kind),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Filter: well-formed OSC 133 markers (A/B/C/D)
 // ---------------------------------------------------------------------------
@@ -37,7 +47,7 @@ fn filter_marker_a() {
     let bytes = osc("133 ; A");
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty(), "well-formed marker frame is suppressed");
-    assert_eq!(events, vec![ev(MarkerKind::A)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
 /// Feed `OSC 133 ; B ST`; assert one `B` event and the frame is
@@ -48,7 +58,7 @@ fn filter_marker_b() {
     let bytes = osc("133 ; B");
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::B)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::B))]);
 }
 
 /// Feed `OSC 133 ; C ST`; assert one `C` event and the frame is
@@ -59,7 +69,7 @@ fn filter_marker_c() {
     let bytes = osc("133 ; C");
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::C)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::C))]);
 }
 
 /// Feed `OSC 133 ; D ST`; assert one `D` event and the frame is
@@ -70,7 +80,7 @@ fn filter_marker_d() {
     let bytes = osc("133 ; D");
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::D)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::D))]);
 }
 
 /// Feed a marker with no spaces around the `;` (`133;A`); assert it is
@@ -81,7 +91,7 @@ fn filter_marker_no_spaces() {
     let bytes = osc("133;A");
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::A)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
 /// Feed a marker terminated by the single-byte ST (`0x9C`); assert it is
@@ -94,7 +104,7 @@ fn filter_marker_0x9c_terminator() {
     bytes.push(0x9C); // ST (single-byte form)
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::A)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
 /// Feed a marker terminated by BEL (`0x07`); assert it is detected and
@@ -107,7 +117,7 @@ fn filter_marker_bel_terminator() {
     bytes.push(0x07); // BEL terminator
     let (forward, events) = filter.process(&bytes);
     assert!(forward.is_empty());
-    assert_eq!(events, vec![ev(MarkerKind::A)]);
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
 /// Feed several markers interleaved with ordinary text; assert the markers
@@ -123,7 +133,10 @@ fn filter_markers_interleaved_with_text() {
     bytes.extend_from_slice(b"done");
     let (forward, events) = filter.process(&bytes);
     assert_eq!(forward, b"hello world done".to_vec());
-    assert_eq!(events, vec![ev(MarkerKind::A), ev(MarkerKind::B)]);
+    assert_eq!(
+        events,
+        vec![(6, ev(MarkerKind::A)), (12, ev(MarkerKind::B))]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +261,7 @@ fn filter_chunking_reassembles() {
     assert!(all_forward.is_empty(), "byte-by-byte: frame suppressed");
     assert_eq!(
         all_events,
-        vec![ev(MarkerKind::A)],
+        vec![(0, ev(MarkerKind::A))],
         "byte-by-byte reassembly"
     );
 
@@ -261,7 +274,7 @@ fn filter_chunking_reassembles() {
     all_events.extend(filter.process(second).1);
     assert_eq!(
         all_events,
-        vec![ev(MarkerKind::A)],
+        vec![(0, ev(MarkerKind::A))],
         "irregular-chunk reassembly"
     );
 }
@@ -285,7 +298,7 @@ fn queue_oversize_evicts_oldest() {
             2 => MarkerKind::C,
             _ => MarkerKind::D,
         };
-        queue.push(ev(last_kind));
+        queue.push(entry(last_kind));
     }
     assert!(
         queue.total_bytes() <= 1024 * 1024,
@@ -296,7 +309,7 @@ fn queue_oversize_evicts_oldest() {
     let drained = queue.drain();
     assert!(!drained.is_empty());
     assert_eq!(
-        drained.last().unwrap().kind,
+        drained.last().unwrap().event.kind,
         last_kind,
         "newest event must survive"
     );
@@ -318,15 +331,19 @@ fn queue_drain_empty() {
 #[test]
 fn queue_push_and_drain_order() {
     let mut queue = MarkerQueue::new();
-    queue.push(ev(MarkerKind::A));
-    queue.push(ev(MarkerKind::B));
-    queue.push(ev(MarkerKind::C));
+    queue.push(entry(MarkerKind::A));
+    queue.push(entry(MarkerKind::B));
+    queue.push(entry(MarkerKind::C));
     assert_eq!(queue.len(), 3);
     assert_eq!(queue.total_bytes(), 3);
     let drained = queue.drain();
     assert_eq!(
         drained,
-        vec![ev(MarkerKind::A), ev(MarkerKind::B), ev(MarkerKind::C)]
+        vec![
+            entry(MarkerKind::A),
+            entry(MarkerKind::B),
+            entry(MarkerKind::C)
+        ]
     );
     assert!(queue.is_empty());
     assert_eq!(queue.total_bytes(), 0);
@@ -340,12 +357,12 @@ fn queue_push_and_drain_order() {
 #[test]
 fn store_auto_assign_1_based() {
     let mut store = MarkerStore::new();
-    let id = store.insert(ev(MarkerKind::A)).expect("insert");
+    let id = store.insert(entry(MarkerKind::A)).expect("insert");
     assert_eq!(id, 1, "IDs are 1-based");
     assert_eq!(store.len(), 1);
     let marker = store.query(id).expect("query");
-    assert_eq!(marker.kind, MarkerKind::A);
-    let id2 = store.insert(ev(MarkerKind::B)).expect("insert");
+    assert_eq!(marker.event.kind, MarkerKind::A);
+    let id2 = store.insert(entry(MarkerKind::B)).expect("insert");
     assert_eq!(id2, 2);
     assert!(store.query(2).is_some());
 }
@@ -357,11 +374,11 @@ fn store_bounded_by_max_markers() {
     let mut store = MarkerStore::new();
     let cap = nora::prompt_marker::MAX_MARKERS;
     for _ in 0..cap {
-        assert!(store.insert(ev(MarkerKind::A)).is_some());
+        assert!(store.insert(entry(MarkerKind::A)).is_some());
     }
     assert_eq!(store.len(), cap);
     // One more exceeds the cap.
-    assert!(store.insert(ev(MarkerKind::B)).is_none());
+    assert!(store.insert(entry(MarkerKind::B)).is_none());
     assert_eq!(store.len(), cap);
 }
 
@@ -370,14 +387,14 @@ fn store_bounded_by_max_markers() {
 #[test]
 fn store_byte_accounted() {
     let mut store = MarkerStore::new();
-    store.insert(ev(MarkerKind::A)).expect("insert");
-    store.insert(ev(MarkerKind::B)).expect("insert");
+    store.insert(entry(MarkerKind::A)).expect("insert");
+    store.insert(entry(MarkerKind::B)).expect("insert");
     assert_eq!(store.len(), 2);
     assert_eq!(store.total_bytes(), 2);
     // Delete one; the byte cost is subtracted.
     let deleted = store.delete(1);
     assert!(deleted.is_some());
-    assert_eq!(deleted.unwrap().kind, MarkerKind::A);
+    assert_eq!(deleted.unwrap().event.kind, MarkerKind::A);
     assert_eq!(store.len(), 1);
     assert_eq!(store.total_bytes(), 1);
     // Clear the rest.
@@ -392,7 +409,7 @@ fn store_byte_accounted() {
 #[test]
 fn store_delete_missing() {
     let mut store = MarkerStore::new();
-    store.insert(ev(MarkerKind::A)).expect("insert");
+    store.insert(entry(MarkerKind::A)).expect("insert");
     assert!(store.delete(99).is_none());
     assert_eq!(store.len(), 1);
     assert_eq!(store.total_bytes(), 1);
@@ -404,4 +421,94 @@ fn store_query_missing() {
     let store = MarkerStore::new();
     assert!(store.query(1).is_none());
     assert!(store.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// MarkerAtLine::current_line (N35b)
+// ---------------------------------------------------------------------------
+
+/// A marker stored when `total_scrolled = 0` and `total_pulled = 0`
+/// stays put until the grid scrolls or resizes.
+#[test]
+fn current_line_no_scroll() {
+    let m = MarkerAtLine {
+        line: 0,
+        scrolled: 0,
+        pulled: 0,
+        event: ev(MarkerKind::A),
+    };
+    assert_eq!(m.current_line(0, 0), Some(0));
+}
+
+/// After 3 lines are added to the bottom (full-screen scrolls) since the
+/// marker was stored, it is 3 lines above where it was.
+#[test]
+fn current_line_after_scroll() {
+    let m = MarkerAtLine {
+        line: 0,
+        scrolled: 0,
+        pulled: 0,
+        event: ev(MarkerKind::A),
+    };
+    assert_eq!(m.current_line(3, 0), Some(-3));
+}
+
+/// A marker stored above the bottom (`line = -2`) at `total_scrolled = 10`
+/// is at `Line(-2 - (15 - 10)) = Line(-7)` after 5 more lines scroll.
+#[test]
+fn current_line_above_bottom() {
+    let m = MarkerAtLine {
+        line: -2,
+        scrolled: 10,
+        pulled: 0,
+        event: ev(MarkerKind::A),
+    };
+    assert_eq!(m.current_line(15, 0), Some(-7));
+}
+
+/// A vertical resize that pulls 5 lines from history (no scroll) moves the
+/// marker down by 5: `line - 0 + (5 - 0)`.
+#[test]
+fn current_line_after_resize_pull() {
+    let m = MarkerAtLine {
+        line: 23,
+        scrolled: 8,
+        pulled: 0,
+        event: ev(MarkerKind::A),
+    };
+    // 10 lines scrolled (total_scrolled 8 -> 18) and a resize pulled 5
+    // lines from history (total_pulled 0 -> 5).
+    assert_eq!(m.current_line(18, 5), Some(18));
+}
+
+/// `current_line` saturates: a marker stored at `total_scrolled = 10`
+/// queried at `total_scrolled = 5` (a clock that went backwards, which
+/// should not happen) does not underflow.
+#[test]
+fn current_line_saturates() {
+    let m = MarkerAtLine {
+        line: 0,
+        scrolled: 10,
+        pulled: 0,
+        event: ev(MarkerKind::A),
+    };
+    assert_eq!(m.current_line(5, 0), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// MarkerStore::iter (N35b)
+// ---------------------------------------------------------------------------
+
+/// `iter` yields every stored marker as `(id, &MarkerAtLine)`.
+#[test]
+fn store_iter_yields_all() {
+    let mut store = MarkerStore::new();
+    let a = store.insert(entry(MarkerKind::A)).expect("insert A");
+    let b = store.insert(entry(MarkerKind::B)).expect("insert B");
+    let mut seen: Vec<usize> = Vec::new();
+    for (id, _) in store.iter() {
+        seen.push(id);
+    }
+    seen.sort();
+    assert_eq!(seen, vec![a, b]);
 }

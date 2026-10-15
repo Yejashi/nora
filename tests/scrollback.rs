@@ -157,3 +157,104 @@ fn scroll_produces_full_damage() {
         "a viewport scroll must report full damage"
     );
 }
+
+/// N35b: with no prompt markers stored, jumping to the previous prompt
+/// is a clean no-op (returns `None` and does not scroll).
+#[test]
+fn jump_to_previous_prompt_empty() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+    assert_eq!(engine.marker_count(), 0);
+    assert!(
+        engine.jump_to_previous_prompt().is_none(),
+        "no markers: no jump"
+    );
+    assert_eq!(
+        engine.display_offset(),
+        0,
+        "no scroll when there is no marker"
+    );
+}
+
+/// N35b: jumping to the previous prompt scrolls the viewport to the most
+/// recent `A` marker, even after the terminal has scrolled past it.
+///
+/// The 24-row screen fills from the top, so the first 23 newlines do not
+/// scroll. Feed 30 lines (7 scroll off the bottom), then an `A` marker,
+/// then 10 more lines (10 scroll). The marker is recorded at the bottom
+/// (`line = 0`) after the first 30 lines, so after the final 10 lines
+/// scroll it is exactly 10 lines above the bottom — within the 17-line
+/// history — and the jump must land the viewport at `display_offset == 10`.
+#[test]
+fn jump_to_previous_prompt_across_scroll() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+
+    // 30 lines, an `A` marker, then 10 more lines, in one chunk. The
+    // marker is detected between the two line runs, so it is stored at
+    // the bottom row (`line = screen_lines - 1 = 23`) with the grid's
+    // `total_scrolled` at that point (8: the first run pushed 8 lines
+    // into history).
+    let mut buf = Vec::new();
+    for _ in 0..30 {
+        buf.extend_from_slice(b"line\n");
+    }
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'A', 0x1B, 0x5C,
+    ]);
+    for _ in 0..10 {
+        buf.extend_from_slice(b"line\n");
+    }
+    engine.feed(&buf);
+
+    // Drain the marker queue (inserts the marker into the store).
+    let markers = engine.drain_markers();
+    assert_eq!(markers.len(), 1, "one marker detected");
+    assert_eq!(engine.marker_count(), 1, "one marker stored");
+
+    // The marker is now 10 lines above the bottom (10 lines scrolled since
+    // it was stored). Jump to it.
+    let id = engine.jump_to_previous_prompt();
+    assert!(id.is_some(), "jump should find the stored marker");
+    assert_eq!(
+        engine.display_offset(),
+        10,
+        "viewport must scroll to the marker's line (10 above the bottom)"
+    );
+}
+
+/// A vertical resize that pulls lines from history into the visible area
+/// must not invalidate a stored marker's line reference (N35b). The marker
+/// stays 10 lines above the bottom after the resize, so the jump lands at
+/// the same offset.
+#[test]
+fn jump_to_previous_prompt_across_resize() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+
+    // 30 lines (8 into history), an `A` marker, then 10 more lines (10
+    // into history), in one chunk.
+    let mut buf = Vec::new();
+    for _ in 0..30 {
+        buf.extend_from_slice(b"line\n");
+    }
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'A', 0x1B, 0x5C,
+    ]);
+    for _ in 0..10 {
+        buf.extend_from_slice(b"line\n");
+    }
+    engine.feed(&buf);
+    let markers = engine.drain_markers();
+    assert_eq!(markers.len(), 1, "one marker detected");
+
+    // Grow the viewport by 5 rows; 5 lines are pulled from history into
+    // the visible area, shifting every stored line down by 5.
+    engine.resize(29, 80);
+
+    // The marker is still 10 lines above the bottom. Jump to it.
+    let id = engine.jump_to_previous_prompt();
+    assert!(id.is_some(), "jump should find the stored marker");
+    assert_eq!(
+        engine.display_offset(),
+        10,
+        "resize must not invalidate the marker's line reference"
+    );
+}

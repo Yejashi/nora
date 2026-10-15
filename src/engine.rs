@@ -68,6 +68,9 @@ pub struct Engine {
     /// Byte-bounded queue of prompt-marker events, shared between the
     /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35a).
     marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
+    /// Bounded store of detected prompt markers (N35b): drained from
+    /// [`marker_queue`] and consulted by prompt navigation.
+    marker_store: crate::prompt_marker::MarkerStore,
 }
 
 /// Kitty keyboard protocol modes (N21a).
@@ -509,6 +512,7 @@ impl Engine {
             graphics_queue: Arc::new(Mutex::new(crate::graphics_filter::GraphicsQueue::new())),
             marker_filter: crate::prompt_marker::PromptMarkerFilter::new(),
             marker_queue: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
+            marker_store: crate::prompt_marker::MarkerStore::new(),
         }
     }
 
@@ -569,17 +573,38 @@ impl Engine {
             }
         }
         let (forward, events) = self.marker_filter.process(forward);
-        if !events.is_empty() {
-            let mut queue = self
-                .marker_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for event in events {
-                queue.push(event);
-            }
-        }
         let mut term = self.term.lock();
-        self.processor.advance(&mut *term, &forward);
+        if events.is_empty() {
+            // Fast path: no markers in this chunk, process all bytes at once.
+            self.processor.advance(&mut *term, &forward);
+        } else {
+            // Segment path (N35b): markers are grid no-ops, so the cursor
+            // line after processing each marker's segment is exactly the
+            // line the marker was detected on. Process the forwarded bytes
+            // in segments (splitting at each marker position) and record
+            // the cursor line after each marker.
+            let mut pos = 0;
+            for (marker_pos, event) in events {
+                self.processor
+                    .advance(&mut *term, &forward[pos..marker_pos]);
+                let line = term.grid().cursor.point.line.0;
+                let scrolled = term.grid().total_scrolled();
+                let pulled = term.grid().total_pulled();
+                let entry = crate::prompt_marker::MarkerAtLine {
+                    line,
+                    scrolled,
+                    pulled,
+                    event,
+                };
+                let mut queue = self
+                    .marker_queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                queue.push(entry);
+                pos = marker_pos;
+            }
+            self.processor.advance(&mut *term, &forward[pos..]);
+        }
     }
 
     /// Drain the graphics queue (N32a), returning all pending graphics
@@ -600,12 +625,63 @@ impl Engine {
     }
 
     /// Drain the prompt-marker queue (N35a), returning all pending
-    /// prompt-marker events in order.
-    pub fn drain_markers(&mut self) -> Vec<crate::prompt_marker::PromptMarkerEvent> {
-        self.marker_queue
+    /// prompt-marker entries (with their grid lines, N35b) in order.
+    ///
+    /// Each drained entry is also inserted into the engine's
+    /// [`MarkerStore`](crate::prompt_marker::MarkerStore) (N35b), so it
+    /// can be consulted by prompt navigation. Entries that exceed the
+    /// store's cap are dropped (the store returns `None` for them).
+    pub fn drain_markers(&mut self) -> Vec<crate::prompt_marker::MarkerAtLine> {
+        let entries = self
+            .marker_queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .drain()
+            .drain();
+        for entry in &entries {
+            self.marker_store.insert(entry.clone());
+        }
+        entries
+    }
+
+    /// The number of prompt markers in the engine's store (N35b).
+    pub fn marker_count(&self) -> usize {
+        self.marker_store.len()
+    }
+
+    /// Jump to the previous prompt (N35b).
+    ///
+    /// Finds the most recent prompt marker (an `A` marker, which marks the
+    /// start of a prompt) in the store, computes its current grid line
+    /// (accounting for the grid's scrolls and vertical resizes since it
+    /// was stored), and scrolls the display to it.
+    ///
+    /// Returns the marker's ID on success, or `None` when there is no
+    /// prompt marker to jump to (e.g. no integration is active). When the
+    /// marker has scrolled out of the history, the viewport is scrolled
+    /// to the top of the history (the closest reachable position).
+    pub fn jump_to_previous_prompt(&mut self) -> Option<usize> {
+        // Find the most recent prompt marker (an `A` marker).
+        let mut best: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
+        for (id, entry) in self.marker_store.iter() {
+            if entry.event.kind == crate::prompt_marker::MarkerKind::A {
+                match best {
+                    Some((best_id, _)) if id > best_id => best = Some((id, entry)),
+                    None => best = Some((id, entry)),
+                    Some(_) => {}
+                }
+            }
+        }
+        let (id, entry) = best?;
+        // Compute the marker's current grid line (accounting for scrolls and
+        // resizes since it was stored).
+        let (scrolled, pulled) = {
+            let term = self.term.lock();
+            (term.grid().total_scrolled(), term.grid().total_pulled())
+        };
+        let line = entry.current_line(scrolled, pulled)?;
+        // Scroll the display to the marker's line.
+        self.scroll_to_line(line);
+        Some(id)
     }
 
     /// A clone of the shared prompt-marker-queue handle (N35a): the PTY
@@ -697,6 +773,24 @@ impl Engine {
     pub fn scroll(&self, scroll: Scroll) {
         let mut term = self.term.lock();
         term.scroll_display(scroll);
+    }
+
+    /// Scroll the viewport so that grid line `line` (a
+    /// [`alacritty_terminal::index::Line`], where `screen_lines - 1` is
+    /// the bottom row and negative values are scrollback) is at the top
+    /// of the viewport (N35b). Lines at or below the bottom scroll to
+    /// the bottom; lines above the scrollback are clamped to the top.
+    pub fn scroll_to_line(&self, line: i32) {
+        let target = {
+            let term = self.term.lock();
+            let bottom = term.grid().screen_lines() as i32 - 1;
+            (bottom - line).max(0) as usize
+        };
+        let current = self.display_offset();
+        let delta = target as i64 - current as i64;
+        if delta != 0 {
+            self.scroll(Scroll::Delta(delta as i32));
+        }
     }
 
     /// The viewport's offset into the scrollback history (0 = bottom).
