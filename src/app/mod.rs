@@ -1587,11 +1587,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
             // Expose, and every redraw this window requests (zoom, search,
             // tab or pane switch, surface reconfigure): draw the newest
             // snapshot, or redraw the retained one.
-            WindowEvent::RedrawRequested => {
-                if !self.state.zero_size {
-                    self.state.dirty = true;
-                    self.attempt_render(event_loop, true);
-                }
+            WindowEvent::RedrawRequested if !self.state.zero_size => {
+                self.state.dirty = true;
+                self.attempt_render(event_loop, true);
             }
             WindowEvent::Resized(size) => {
                 if size.width == 0 || size.height == 0 {
