@@ -45,7 +45,7 @@ Options:\n\
                              exits (windowed; headless ignores it)\n\
       --                       Remainder is the command argv (no shell\n\
                                interpolation)\n\n\
-With no command, the default shell ($SHELL, else /bin/sh) is launched.";
+With no command, the default shell ($SHELL, else /bin/sh; on Windows\nPowerShell, else %COMSPEC%) is launched.";
 
 fn main() -> ExitCode {
     nora::trace::start();
@@ -200,7 +200,7 @@ fn main() -> ExitCode {
         }
     } else {
         // No `-- COMMAND ...`: the default shell ($SHELL, else /bin/sh).
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell = default_shell();
         LaunchSpec {
             program: shell,
             args: vec![],
@@ -280,6 +280,25 @@ fn run_session(spec: LaunchSpec, explicit: bool, config: &nora::config::NoraConf
 /// one), 0 on a clean default-shell close, or 1 on a startup failure.
 /// `config` (N18b) is the loaded configuration, passed to the windowed
 /// app and the headless fallback alike.
+/// The user's shell: `$SHELL` (else `/bin/sh`) on Unix; on Windows
+/// PowerShell when found on `PATH`, else `%COMSPEC%` (normally cmd.exe).
+fn default_shell() -> String {
+    if cfg!(windows) {
+        let on_path = |exe: &str| {
+            env::var_os("PATH")
+                .is_some_and(|path| env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
+        };
+        if on_path("pwsh.exe") {
+            return "pwsh.exe".to_string();
+        }
+        if on_path("powershell.exe") {
+            return "powershell.exe".to_string();
+        }
+        return env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    }
+    env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
 fn run_windowed(
     spec: LaunchSpec,
     explicit: bool,

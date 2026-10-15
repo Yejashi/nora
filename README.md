@@ -65,7 +65,9 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
 
 ## Requirements
 
-- Linux x86_64 with a native Wayland or X11 session
+- Linux x86_64 with a native Wayland or X11 session. macOS and Windows
+  builds compile and pass the headless tests in CI but are untested
+  interactively; see [docs/15-platforms.md](docs/15-platforms.md).
 - Rust 1.95 or newer (`rust-version` in `Cargo.toml`). `rust-toolchain.toml`
   pins 1.99.0 for rustup users and CI; a distribution toolchain at or above
   1.95 builds the same tree.

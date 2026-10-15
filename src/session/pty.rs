@@ -286,6 +286,7 @@ pub struct PtySession {
     size: WindowSize,
     sender: EventLoopSender,
     /// The child's pid, which is also its process group id.
+    #[cfg(unix)]
     child_pid: libc::pid_t,
     /// Bytes sent as `Msg::Input` and not yet written (decremented by the
     /// vendored loop's `pty_write`).
@@ -362,6 +363,9 @@ impl PtySession {
             working_directory: cwd,
             env: spec.env.into_iter().collect(),
             drain_on_exit: true,
+            // Quote argv for CreateProcess like a normal Windows program.
+            #[cfg(target_os = "windows")]
+            escape_args: true,
         };
         // Nominal headless cell geometry: pixel-size replies report
         // rows/cols times the nominal cell size.
@@ -374,6 +378,7 @@ impl PtySession {
         let pty = tty::new(&options, size, id.0).map_err(PtyError::Spawn)?;
         // The child is a session leader (setsid), so this is also its
         // process group id; kept for kill escalation in `close`.
+        #[cfg(unix)]
         let child_pid = pty.child().id() as libc::pid_t;
 
         // The slave keeps the kernel's cooked line discipline (ICANON,
@@ -448,6 +453,7 @@ impl PtySession {
             size,
             sender,
             in_flight,
+            #[cfg(unix)]
             child_pid,
             loop_handle: Some(loop_handle),
             lifecycle,
@@ -708,6 +714,7 @@ impl PtySession {
     }
 
     /// The child's pid (also its process group id).
+    #[cfg(unix)]
     pub fn child_pid(&self) -> libc::pid_t {
         self.child_pid
     }
@@ -715,6 +722,7 @@ impl PtySession {
     /// SIGKILL the child's process group (and the child itself, in case it
     /// left the group). Used only after `CLOSE_GRACE` when SIGHUP did not
     /// end it.
+    #[cfg(unix)]
     fn kill_child_group(&self) {
         if self.child_pid <= 1 {
             return;
@@ -729,6 +737,11 @@ impl PtySession {
             libc::kill(self.child_pid, libc::SIGKILL);
         }
     }
+
+    /// Windows: closing the pseudo-console (ConPTY) terminates the
+    /// processes attached to it, so there is no group to signal.
+    #[cfg(not(unix))]
+    fn kill_child_group(&self) {}
 
     /// Send `Msg::Shutdown` once. A send failure means the loop is already
     /// gone — nothing left to notify.

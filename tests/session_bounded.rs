@@ -741,6 +741,7 @@ fn headless_session_title_folds_latest_wins() {
 /// Audit P9: the child-exit record survives a burst that overflows the
 /// recorder (it used to be evicted with the oldest records, losing the
 /// exit status).
+#[cfg(unix)]
 #[test]
 fn child_exit_record_is_never_evicted() {
     use alacritty_terminal::event::{Event, EventListener};

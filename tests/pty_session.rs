@@ -18,6 +18,9 @@
 //! Every wait is deadline-bounded (10 s) and polls every 10 ms on observable
 //! markers only — no sleep guesses.
 
+// Real Unix PTYs, /bin/sh and the Unix-only nora_child helper throughout.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};

@@ -225,6 +225,13 @@ fn flood_active(session: &mut PtySession) -> bool {
 }
 
 /// Cumulative process CPU time (user + sys) in seconds, via `getrusage`.
+#[cfg(not(unix))]
+fn cpu_seconds() -> f64 {
+    // No getrusage: CPU time is not reported off Unix.
+    0.0
+}
+
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };

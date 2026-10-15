@@ -35,7 +35,7 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Like a full-screen application, the helper switches its own tty to
     // raw mode: tests send escape sequences and control bytes and expect

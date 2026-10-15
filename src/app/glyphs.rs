@@ -237,13 +237,23 @@ impl Fonts {
         if !configured.is_empty() && configured != "monospace" {
             families.push(configured);
         }
-        families.extend([MONO_FAMILY, "DejaVu Sans Mono", "monospace"]);
+        // Then the platform's usual terminal faces before the generic alias
+        // (which fontdb maps to Courier New off Linux).
+        families.extend([MONO_FAMILY, "DejaVu Sans Mono"]);
+        if cfg!(target_os = "macos") {
+            families.extend(["SF Mono", "Menlo"]);
+        } else if cfg!(windows) {
+            families.extend(["Cascadia Mono", "Consolas"]);
+        }
+        families.push("monospace");
         // An explicitly configured family wins over the pinned candidates.
-        let configured_path = if families.len() > 3 {
+        let configured = !configured.is_empty() && configured != "monospace";
+        let configured_path = if configured {
             system_font(&families[..1])
         } else {
             None
         };
+        let configured_missing = configured && configured_path.is_none();
         let mono_path = configured_path
             .or_else(|| resolve_font("NORA_TEST_FONT_MONO", &MONO_CANDIDATES, &families))
             .unwrap_or_else(|| {
@@ -252,8 +262,11 @@ impl Fonts {
                      monospace font), set font.family, or set NORA_TEST_FONT_MONO"
                 )
             });
-        if families.len() > 3 && system_font(&families[..1]).is_none() {
-            eprintln!("nora: font.family '{configured}' not found; using a fallback");
+        if configured_missing {
+            eprintln!(
+                "nora: font.family '{}' not found; using a fallback",
+                font.family.trim()
+            );
         }
         // Script fallbacks are optional: without them wide/Ethiopic text
         // renders as missing glyphs instead of aborting startup.

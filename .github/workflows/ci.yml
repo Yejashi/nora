@@ -8,6 +8,9 @@
 #   backends       explicit X11-only / Wayland-only build configurations
 #   x11-smoke      windowed smoke under a virtual X11 display (Xvfb)
 #   wayland-smoke  windowed smoke under a nested Wayland compositor
+#   cross-platform macOS and Windows: release build, unit tests and the
+#                  platform-neutral integration tests (macOS also runs
+#                  the PTY tests). No display or GPU checks there.
 #   e2e-x11        end-to-end window checks (scripts/e2e-x11.sh): real key
 #                  events, screenshots, PTY evidence files
 #
@@ -227,3 +230,44 @@ jobs:
         with:
           name: e2e-x11
           path: target/e2e
+
+  cross-platform:
+    name: ${{ matrix.os }} (build + headless tests)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: Binary runs
+        run: |
+          ./target/release/nora --version
+          ./target/release/nora --check-config
+      - name: Unit tests (library and binaries)
+        run: cargo test --locked --lib --bins
+      - name: Platform-neutral integration tests
+        run: >
+          cargo test --locked
+          --test config --test engine --test engine_adapter --test engine_snapshots
+          --test input_encode --test kitty_keyboard --test layout --test mouse_input
+          --test paste_input --test prompt_marker --test render_state --test scrollback
+          --test search --test selection --test session_bounded --test session_writer
+          --test workspace --test graphics_filter --test graphics_image
+          --test graphics_protocol --test ime --test decoration_policy
+          --test resource_limits
+      - name: PTY integration tests (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          cargo test --locked
+          --test pty_session --test pump_session --test keypad_input
+          --test navigation_input --test paste_pump
