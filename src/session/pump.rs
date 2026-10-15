@@ -261,6 +261,11 @@ pub fn advance_paste_block(paste_block: &mut Option<(usize, usize)>, drained: us
 /// dead (N09b, extended for N17b paste tracking). Advances
 /// `paste_block` as bytes drain, so an in-flight paste's block stays
 /// aligned with `pending_input`. Returns the total bytes fed this call.
+/// Most input bytes a pane queues in the pump (2 MiB). With the writer
+/// budget and [`super::pty::MAX_IN_FLIGHT`] this bounds a pane's input
+/// memory end to end; past it, keys and pastes are refused.
+pub const MAX_PENDING_INPUT: usize = 2 * 1024 * 1024;
+
 pub fn feed_pending(
     session: &mut PtySession,
     pending_input: &mut Vec<u8>,
@@ -555,7 +560,13 @@ pub fn pump_thread(
                 }
                 PumpMsg::Input { pane, bytes } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        pane_pump.pending_input.extend(bytes);
+                        // Refused (never accepted, then dropped) when the
+                        // pane's queue is full: the child stopped reading.
+                        if pane_pump.pending_input.len() + bytes.len() <= MAX_PENDING_INPUT {
+                            pane_pump.pending_input.extend(bytes);
+                        } else if debug_enabled() {
+                            eprintln!("debug: pump: input refused, {pane:?} queue full");
+                        }
                     }
                 }
                 PumpMsg::Scroll { pane, scroll } => {
@@ -611,6 +622,14 @@ pub fn pump_thread(
                     bracketed,
                 } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        // Bracket markers add 12 bytes; newline
+                        // normalization never grows the text.
+                        if pane_pump.pending_input.len() + text.len() + 12 > MAX_PENDING_INPUT {
+                            if debug_enabled() {
+                                eprintln!("debug: pump: paste refused, {pane:?} queue full");
+                            }
+                            continue;
+                        }
                         let applied = apply_paste(
                             &mut pane_pump.pending_input,
                             &mut pane_pump.paste_block,

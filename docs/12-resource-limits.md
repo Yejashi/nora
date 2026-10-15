@@ -126,3 +126,16 @@ This document audits all growth limits in nora. Each section documents the limit
 | --- | --- | --- | --- |
 | OSC frame | 64 KiB (`prompt_marker::MAX_OSC_BYTES`) | frame dropped whole at its terminator; the parser never sees it | unit `unterminated_osc_is_bounded_and_dropped`; e2e `flood`: 200 MiB unterminated OSC, peak RSS +5.5 MiB (was +798 MiB) |
 | APC frame | 4 MiB (`graphics_filter::MAX_APC_BYTES`) | frame ignored for graphics | unit `unterminated_apc_is_bounded` |
+
+## Input bounds per pane (2026-10-15, M1.7c)
+
+| Stage | Limit | Past the limit |
+| --- | --- | --- |
+| Pump queue (`pump::MAX_PENDING_INPUT`) | 2 MiB | keys and pastes refused (not accepted then dropped) |
+| Session writer (`pty::DEFAULT_CAP`) | 1 MiB (64 KiB reserved for replies) | `feed` accepts nothing |
+| In flight to the PTY (`pty::MAX_IN_FLIGHT`) | 1 MiB | `flush` holds bytes in the writer |
+
+Evidence: `tests/pty_session.rs` `input_to_a_non_reading_child_is_bounded`.
+The window-to-pump channel is drained on every pump pass. A session close
+can still stall the pump for up to 5 s (audit P6, next slice); during that
+window the channel holds whatever the window sent.

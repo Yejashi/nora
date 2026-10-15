@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -94,6 +95,11 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// Optional byte-level pre-filter (e.g. a graphics APC extractor).
     /// Runs on the PTY reader thread before the parser advances.
     filter: Option<Box<dyn Filter + Send>>,
+    /// nora: bytes handed to this loop as `Msg::Input` and not yet written
+    /// to the PTY. The sender adds, `pty_write` subtracts what the PTY
+    /// accepted, so the owner can bound input end to end (the channel and
+    /// the write list are otherwise unbounded).
+    in_flight: Option<Arc<AtomicUsize>>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -121,6 +127,7 @@ where
             drain_on_exit,
             ref_test,
             filter: None,
+            in_flight: None,
         })
     }
 
@@ -131,6 +138,12 @@ where
     /// `self` and returns it.
     pub fn with_filter(mut self, filter: Box<dyn Filter + Send>) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// nora: install the shared in-flight byte counter (see the field).
+    pub fn with_in_flight(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.in_flight = Some(counter);
         self
     }
 
@@ -278,6 +291,11 @@ where
                         break 'write_many;
                     },
                     Ok(n) => {
+                        if let Some(counter) = &self.in_flight {
+                            // Every byte written was counted when nora sent
+                            // it, so the counter never drops below `n`.
+                            counter.fetch_sub(n, Ordering::AcqRel);
+                        }
                         current.advance(n);
                         if current.finished() {
                             state.goto_next();

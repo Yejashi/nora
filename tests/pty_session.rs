@@ -1348,3 +1348,47 @@ fn pty_bash_shell_integration_marker_order() {
     session.close();
     let _ = std::fs::remove_file(&rc);
 }
+
+/// Audit P4: input to a child that never reads stdin stays bounded end to
+/// end: the session writer holds at most its budget and at most
+/// `MAX_IN_FLIGHT` bytes sit between nora and the PTY, however much is
+/// offered (before, every flush released the budget into an unbounded
+/// channel and write list).
+#[test]
+fn input_to_a_non_reading_child_is_bounded() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: "/bin/sh".to_string(),
+            // Raw mode: the kernel applies backpressure instead of
+            // discarding overlong canonical lines.
+            args: vec!["-c".to_string(), "stty raw -echo; sleep 20".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        nora::session::pty::DEFAULT_CAP,
+    )
+    .expect("sh spawns over a real PTY");
+    thread::sleep(Duration::from_millis(300));
+    let chunk = vec![b'x'; 64 * 1024];
+    let offered = 16 * 1024 * 1024;
+    let mut accepted = 0usize;
+    for _ in 0..(offered / chunk.len()) {
+        accepted += session.feed(&chunk).unwrap_or(0);
+        let _ = session.flush(usize::MAX);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let in_flight = session.in_flight();
+    assert!(
+        in_flight <= nora::session::pty::MAX_IN_FLIGHT,
+        "in flight {in_flight} exceeds the cap"
+    );
+    // Writer budget + in-flight cap + what the kernel buffered: far below
+    // the 16 MiB offered.
+    assert!(
+        accepted <= 4 * 1024 * 1024,
+        "accepted {accepted} of {offered}: input was not held back"
+    );
+    session.close();
+}

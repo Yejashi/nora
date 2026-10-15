@@ -224,6 +224,12 @@ pub enum Lifecycle {
 /// is nora-side (03:107).
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Most input bytes handed to the PTY loop but not yet written to the PTY
+/// (1 MiB). Past it, `flush` holds bytes back in the session writer, so a
+/// child that stops reading stdin bounds memory instead of growing the
+/// loop's queue (audit P4).
+pub const MAX_IN_FLIGHT: usize = 1024 * 1024;
+
 /// `status` is `Some` on a clean child exit (`Event::ChildExit`), `None`
 /// when the loop died from an I/O or registration error. Not
 /// `PartialEq`-able (`ExitStatus`) — assert with `matches!` +
@@ -255,6 +261,9 @@ pub struct PtySession {
     /// size replies resolve against it, so they never cross sessions.
     size: WindowSize,
     sender: EventLoopSender,
+    /// Bytes sent as `Msg::Input` and not yet written (decremented by the
+    /// vendored loop's `pty_write`).
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// The session loop thread (N12a): a wrapper around the pinned PTY
     /// reader that folds [`Lifecycle::Exiting`] on the wrapper's return
     /// (every exit path of the pinned loop funnels through it) and
@@ -350,8 +359,13 @@ impl PtySession {
             pending_events: Vec::new(),
             pending_index: 0,
         };
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
-            .map(|loop_| loop_.with_filter(Box::new(pty_filter)))
+            .map(|loop_| {
+                loop_
+                    .with_filter(Box::new(pty_filter))
+                    .with_in_flight(in_flight.clone())
+            })
             .map_err(PtyError::Spawn)?;
         let sender = loop_.channel();
 
@@ -390,6 +404,7 @@ impl PtySession {
             ledger,
             size,
             sender,
+            in_flight,
             loop_handle: Some(loop_handle),
             lifecycle,
             done,
@@ -483,6 +498,12 @@ impl PtySession {
         Ok(accepted)
     }
 
+    /// Input bytes handed to the PTY loop and not yet written to the PTY
+    /// (at most [`MAX_IN_FLIGHT`] plus one flush chunk).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Bytes still reserved by the session writer.
     pub fn outstanding(&self) -> usize {
         self.writer.outstanding()
@@ -494,9 +515,16 @@ impl PtySession {
     /// Sender disconnected (loop dead) → close + `Err(WriterError::Closed)`.
     pub fn flush(&mut self, limit: usize) -> Result<usize, WriterError> {
         self.process_events();
+        let room = MAX_IN_FLIGHT.saturating_sub(self.in_flight());
+        let limit = limit.min(room);
+        if limit == 0 {
+            return Ok(0);
+        }
         let mut loop_dead = false;
+        let in_flight = self.in_flight.clone();
         let result = self.writer.flush(
             &mut |bytes: &[u8]| {
+                in_flight.fetch_add(bytes.len(), std::sync::atomic::Ordering::AcqRel);
                 match self.sender.send(Msg::Input(Cow::Owned(bytes.to_vec()))) {
                     // One chunk in, one ordered `Msg::Input` out: the whole
                     // chunk is delivered atomically (or not at all).

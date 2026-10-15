@@ -127,3 +127,14 @@ was lost under lock contention (CI flake in `cwd_is_honored`; deterministic
 reproduction in `tests/pty_session.rs`
 `output_of_exiting_child_survives_a_busy_terminal_lock`). Candidate for
 upstreaming.
+
+## Amendment (2026-10-15): in-flight input counter
+
+A third vendored change: `EventLoop::with_in_flight(Arc<AtomicUsize>)`.
+nora adds the bytes of each `Msg::Input` it sends; `pty_write` subtracts
+what the PTY accepted. Upstream's input channel and write list are
+unbounded, so nora's writer budget, released on send, did not bound input
+memory when the child stops reading. With the counter, `PtySession::flush`
+keeps at most `MAX_IN_FLIGHT` (1 MiB) between nora and the PTY (test
+`input_to_a_non_reading_child_is_bounded`: 16 MiB offered, at most 4 MiB
+accepted; all 16 MiB without the cap).
