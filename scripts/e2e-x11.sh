@@ -349,6 +349,48 @@ scenario_title() {
     pass title
 }
 
+# Panes and tabs: a split gives each pane its share of the grid (the
+# child's own stty size), a click focuses a pane, separators are drawn, a
+# second tab loses a row to the tab bar and gets it back when closed.
+scenario_panes() {
+    local dir="$OUT/panes"; mkdir -p "$dir"
+    launch panes bash --norc --noprofile || { fail panes "no window"; return; }
+    local cw ch
+    read -r cw ch <<<"$(sed -n 's/^fonts: cell \([0-9]*\)x\([0-9]*\).*/\1 \2/p' "$OUT/panes/nora.log" | head -1)"
+    xdotool type --delay 15 "stty size > $dir/full.txt"; xdotool key Return
+    wait_file "$dir/full.txt" || { finish; fail panes "no initial size"; return; }
+    xdotool key ctrl+shift+Return
+    sleep 1.5
+    xdotool type --delay 15 "stty size > $dir/right.txt"; xdotool key Return
+    wait_file "$dir/right.txt" || { finish; fail panes "right pane got no input"; return; }
+    # Click into the left pane, then type there.
+    xdotool mousemove --window "$WIN" $((cw * 3)) $((ch * 5)) click 1
+    sleep 0.3
+    xdotool type --delay 15 "stty size > $dir/left.txt"; xdotool key Return
+    wait_file "$dir/left.txt" || { finish; fail panes "click did not focus the left pane"; return; }
+    shot "$dir/split.png"
+    xdotool key ctrl+shift+t
+    sleep 1.5
+    xdotool type --delay 15 "stty size > $dir/tab2.txt"; xdotool key Return
+    wait_file "$dir/tab2.txt" || { finish; fail panes "new tab got no input"; return; }
+    xdotool key ctrl+shift+w
+    sleep 1
+    xdotool type --delay 15 "stty size > $dir/after.txt"; xdotool key Return
+    wait_file "$dir/after.txt" || { finish; fail panes "no input after closing the tab"; return; }
+    finish
+    local fr fc rr rc lr lc tr tc ar ac sep
+    read -r fr fc < "$dir/full.txt"; read -r rr rc < "$dir/right.txt"
+    read -r lr lc < "$dir/left.txt"; read -r tr tc < "$dir/tab2.txt"
+    read -r ar ac < "$dir/after.txt"
+    sep=$(count_color "$dir/split.png" '#555555')
+    echo "  full ${fr}x${fc}; left ${lr}x${lc} right ${rr}x${rc}; tab2 ${tr}x${tc}; after close ${ar}x${ac}; separator px $sep"
+    [ $((lc + rc)) -eq "$fc" ] && [ "$lr" -eq "$fr" ] || { fail panes "split sizes do not tile the grid"; return; }
+    [ "$sep" -ge $((ch * fr / 2)) ] || { fail panes "no separator drawn"; return; }
+    [ "$tr" -eq $((fr - 1)) ] && [ "$tc" -eq "$fc" ] || { fail panes "tab bar row not reserved"; return; }
+    [ "$ar" -eq "$fr" ] || { fail panes "row not returned after closing the tab (${ar} vs ${fr})"; return; }
+    pass panes
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -408,7 +450,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

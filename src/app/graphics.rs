@@ -570,6 +570,7 @@ impl Graphics {
         cells: &[DrawCell],
         background: [u8; 4],
         fills: &[CellFill],
+        rects: &[super::scene::PixelRect],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
     ) -> Result<(), String> {
@@ -844,6 +845,19 @@ impl Graphics {
                         push_deco_rect(&mut deco, &band(y, thickness, color), frame_w, frame_h);
                     }
                 }
+            }
+            // Pane separators, on top of the text.
+            for r in rects {
+                let line = DecoLine {
+                    x0: r.x,
+                    x1: r.x + r.w,
+                    top: r.y,
+                    bottom: r.y + r.h,
+                    y: r.y,
+                    thickness: r.h,
+                    color: r.color,
+                };
+                push_deco_rect(&mut deco, &line, frame_w, frame_h);
             }
         }
         if !deco.is_empty() {

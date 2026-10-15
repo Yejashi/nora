@@ -177,6 +177,10 @@ server available, the launch falls back to the headless session pump.
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
 
+With more than one tab a tab bar on the top row shows each tab's number
+and title. Splits are separated by a thin line, and clicking a pane
+focuses it.
+
 Plain Ctrl+letter keys always reach the program in the terminal, so
 Ctrl+D, Ctrl+W, Ctrl+T, Ctrl+F and Ctrl+X behave as in any terminal. A
 binding with nothing to act on, such as tab switching with one tab, also

@@ -60,6 +60,10 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | P6 | Session close stalled the pump up to 5 s per pane; a SIGHUP-ignoring child leaked the loop thread, process and fds | M1.7d (close off the pump thread; group SIGKILL after 1.5 s) |
 | P9 | Recorder overflow could evict the child-exit record (exit status lost) | M1.7d |
 | P12 (title, bell) | OSC 0/2 titles only printed to stderr at exit; bell discarded | M1.7d (window title per active pane; bell requests attention when unfocused) |
+| R6, I-F3 | Splits froze rendering (stale check against the full window); only the active pane drawn at 0,0; no separators or tab bar | M2.1 |
+| M2.1 found | Coalesced pulses acquired a swapchain image and dropped it unpresented; with several panes every acquire then timed out | M2.1 (gather before acquire) |
+| M2.1 found | A split lost the previous pane's snapshot slot (it stopped updating) | M2.1 |
+| M2.1 found | Tab bar row and tab open/close did not resize other tabs' panes | M2.1 |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

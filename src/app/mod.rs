@@ -6,6 +6,7 @@
 
 pub mod glyphs;
 mod graphics;
+mod scene;
 
 use std::{
     sync::{
@@ -25,7 +26,8 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use self::graphics::{CellFill, DrawCell, Graphics};
+use self::graphics::Graphics;
+use self::scene::Scene;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
@@ -41,8 +43,7 @@ use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
 use nora::render::palette::Palette;
 use nora::render::policy::snapshot_is_stale;
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
-use nora::render::style::cell_style;
-use nora::render::term::{TermLayout, cursor_fill, default_bg};
+use nora::render::term::{TermLayout, default_bg};
 use nora::session::pump::{AppEvent, PaneKey, PumpMsg};
 use nora::workspace::{TabId, Workspace};
 
@@ -283,9 +284,16 @@ impl ApplicationHandler for App {
             } else {
                 let mut frame = graphics.acquire();
                 println!("smoke: acquire status {:?}", frame.status);
-                if let Err(message) =
-                    graphics.draw_frame(&mut frame, &mut fonts, &[], [0, 0, 0, 255], &[], &[], &[])
-                {
+                if let Err(message) = graphics.draw_frame(
+                    &mut frame,
+                    &mut fonts,
+                    &[],
+                    [0, 0, 0, 255],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                ) {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
                 graphics.present(frame);
@@ -752,30 +760,45 @@ impl WinApp {
     /// `PumpMsg::Resize` to every pane whose grid changed (N24b). Called
     /// after a split/close/focus and on window resize, so panes always
     /// match their rectangles.
-    fn resize_all_panes(&mut self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-        let Some(fonts) = self.fonts.as_ref() else {
-            return;
-        };
+    /// The grid available to panes: the window grid minus the tab bar row
+    /// when more than one tab exists.
+    fn pane_area(&self) -> Option<(u16, u16)> {
+        let window = self.window.as_ref()?;
+        let fonts = self.fonts.as_ref()?;
         let (cols, rows) = window_grid(window, fonts);
-        if cols == 0 || rows == 0 {
+        let bar = u16::from(self.workspace.tab_count() > 1);
+        let rows = rows.saturating_sub(bar);
+        (cols > 0 && rows > 0).then_some((cols, rows))
+    }
+
+    /// Resize every pane of every tab to its share of the pane area
+    /// (change-only per pane). Tabs share the area, so a size change, a
+    /// zoom, or the tab bar appearing or disappearing affects them all.
+    fn resize_all_panes(&mut self) {
+        let Some((cols, rows)) = self.pane_area() else {
             return;
+        };
+        let mut layouts: Vec<(TabId, Layout)> = Vec::new();
+        if let Some(active) = self.active_tab_id() {
+            layouts.push((active, self.layout.clone()));
         }
-        for (pane_id, _x, _y, pw, ph) in self.layout.compute_rectangles(cols, rows) {
-            let pane = PaneKey {
-                tab: self.active_tab_id().unwrap_or(TabId(0)),
-                pane: pane_id,
-            };
-            let prev = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
-            if prev != (pw, ph) {
-                self.pane_grid.insert(pane, (pw, ph));
-                let _ = self.pump_commands.send(PumpMsg::Resize {
-                    pane,
-                    rows: ph as usize,
-                    cols: pw as usize,
-                });
+        for (tab, layout) in &self.tab_layouts {
+            if Some(*tab) != self.active_tab_id() {
+                layouts.push((*tab, layout.clone()));
+            }
+        }
+        for (tab, layout) in layouts {
+            for (pane_id, _x, _y, pw, ph) in layout.compute_rectangles(cols, rows) {
+                let pane = PaneKey { tab, pane: pane_id };
+                let prev = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
+                if prev != (pw, ph) {
+                    self.pane_grid.insert(pane, (pw, ph));
+                    let _ = self.pump_commands.send(PumpMsg::Resize {
+                        pane,
+                        rows: ph as usize,
+                        cols: pw as usize,
+                    });
+                }
             }
         }
     }
@@ -808,10 +831,10 @@ impl WinApp {
         // Compute the new tab's full grid size first (immutable borrows
         // of `self.window` and `self.fonts` end before the mutable
         // operations below).
+        // After the command (the tab count is already updated), so the
+        // new tab's pane gets the area below the tab bar.
         let new_tab_grid = if cmd == nora::workspace::TabCommand::New {
-            let window = self.window.as_ref().expect("the window exists");
-            let fonts = self.fonts.as_ref().expect("fonts are created at startup");
-            Some(window_grid(window, fonts))
+            self.pane_area()
         } else {
             None
         };
@@ -870,6 +893,14 @@ impl WinApp {
                 }
             }
         }
+        // Opening or closing a tab can show or hide the tab bar, which
+        // changes every tab's pane area.
+        if matches!(
+            cmd,
+            nora::workspace::TabCommand::New | nora::workspace::TabCommand::Close
+        ) {
+            self.resize_all_panes();
+        }
     }
 
     /// Split the active pane (N24b): mint a new pane in the active layout,
@@ -879,6 +910,13 @@ impl WinApp {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
+        // The new pane becomes active: park the current pane's per-pane
+        // state (its snapshot slot above all) first, as a focus change
+        // does; otherwise the old pane's slot is lost and it stops
+        // updating.
+        if let Some(prev) = self.active_pane_key() {
+            self.save_active_pane(prev);
+        }
         let new_pane_id = if vertical {
             self.layout.split_vertical()
         } else {
@@ -1062,6 +1100,20 @@ impl WinApp {
         }
     }
 
+    /// Make `target` (a pane of the active tab) the active pane.
+    fn focus_pane(&mut self, target: PaneId) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let active = self.layout.active_pane();
+        if target == active || !self.layout.has_pane(target) {
+            return;
+        }
+        self.layout.focus_pane(target);
+        self.save_active_pane(PaneKey { tab, pane: active });
+        self.load_active_pane(PaneKey { tab, pane: target });
+    }
+
     fn focus_pane_direction(&mut self, dir: FocusDir) -> bool {
         let Some(tab) = self.active_tab_id() else {
             return false;
@@ -1124,6 +1176,17 @@ impl WinApp {
                                 // closes; the resize / child-exit arms
                                 // own those.
                             }
+                        }
+                        return action;
+                    } else if Some(pane.tab) == self.active_tab_id() {
+                        // Another pane of the visible tab: the frame shows
+                        // it too, so render (the window's surface state
+                        // decides, as for the active pane).
+                        let (state, action) =
+                            on_event(self.state.clone(), RenderEvent::Dirty { non_noop: true });
+                        self.state = state;
+                        if action == Action::Render {
+                            self.attempt_render(event_loop, false);
                         }
                         return action;
                     } else if let Some(state) = self.pane_render.get_mut(&pane) {
@@ -1233,20 +1296,44 @@ impl WinApp {
 
     /// Map a logical-pixel position to a grid `(row, col)`, or `None` if
     /// the position falls outside the current grid (N14b).
-    fn grid_cell_at(&self, window: &Window, x: f64, y: f64) -> Option<(usize, usize)> {
+    /// The pane of the active tab under physical pixel (`x`, `y`): its id
+    /// and its grid rectangle (col, row, width, height) in window cells,
+    /// tab bar included.
+    fn pane_at(&self, x: f64, y: f64) -> Option<(PaneId, (u16, u16, u16, u16))> {
         let fonts = self.fonts.as_ref()?;
-        let cell_w = fonts.cell_w as f64;
-        let cell_h = fonts.cell_h() as f64;
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return None;
-        }
-        let col = (x / cell_w) as usize;
-        let row = (y / cell_h) as usize;
-        let (cols, rows) = window_grid(window, fonts);
-        if col >= cols as usize || row >= rows as usize {
-            return None;
-        }
-        Some((row, col))
+        let (cols, rows) = self.pane_area()?;
+        let bar = u16::from(self.workspace.tab_count() > 1);
+        let col = (x / f64::from(fonts.cell_w)) as u16;
+        let row = (y / f64::from(fonts.cell_h())) as u16;
+        self.layout
+            .compute_rectangles(cols, rows)
+            .into_iter()
+            .map(|(id, px, py, w, h)| (id, (px, py + bar, w, h)))
+            .find(|&(_, (px, py, w, h))| col >= px && col < px + w && row >= py && row < py + h)
+    }
+
+    /// The active pane's rectangle (col, row, width, height) in window
+    /// cells.
+    fn active_pane_rect(&self) -> Option<(u16, u16, u16, u16)> {
+        let (cols, rows) = self.pane_area()?;
+        let bar = u16::from(self.workspace.tab_count() > 1);
+        let active = self.layout.active_pane();
+        self.layout
+            .compute_rectangles(cols, rows)
+            .into_iter()
+            .find(|r| r.0 == active)
+            .map(|(_, x, y, w, h)| (x, y + bar, w, h))
+    }
+
+    /// The active pane's cell (row, col) under physical pixel (`x`, `y`),
+    /// or `None` outside it.
+    fn grid_cell_at(&self, _window: &Window, x: f64, y: f64) -> Option<(usize, usize)> {
+        let fonts = self.fonts.as_ref()?;
+        let (px, py, w, h) = self.active_pane_rect()?;
+        let col = (x / f64::from(fonts.cell_w)) as u16;
+        let row = (y / f64::from(fonts.cell_h())) as u16;
+        (col >= px && col < px + w && row >= py && row < py + h)
+            .then(|| (usize::from(row - py), usize::from(col - px)))
     }
 
     /// Encode one mouse event against the engine's live mouse mode and
@@ -1258,12 +1345,22 @@ impl WinApp {
         if !should_report(mode, self.mods.shift_key()) {
             return;
         }
-        let Some(fonts) = self.fonts.as_ref() else {
+        let _ = window;
+        // Window cells to the active pane's own grid; events outside the
+        // pane are not reported.
+        let Some((px, py, w, h)) = self.active_pane_rect() else {
             return;
         };
-        let (cols, rows) = window_grid(window, fonts);
+        if event.col < px || event.row < py {
+            return;
+        }
+        let event = MouseEvent {
+            col: event.col - px,
+            row: event.row - py,
+            ..*event
+        };
         let encoding = MouseEncoding::from_term_mode(self.modes);
-        if let Some(bytes) = encode_mouse_event(mode, encoding, event, cols, rows)
+        if let Some(bytes) = encode_mouse_event(mode, encoding, &event, w, h)
             && let Some(pane) = self.active_pane_key()
         {
             let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
@@ -1283,190 +1380,191 @@ impl WinApp {
             event_loop.exit();
             return;
         }
-        let active = self.active_pane_key();
-        // N24b: read the active pane's slot first (before the graphics
-        // borrow); the pump stores each pane's latest snapshot in its own
-        // slot.
-        let slot = match self.active_pane_key() {
-            Some(pane) => self
-                .pane_slots
-                .get(&pane)
-                .cloned()
-                .unwrap_or_else(|| self.slot.clone()),
-            None => self.slot.clone(),
+        let Some(active) = self.active_pane_key() else {
+            return;
         };
+        let slot = self
+            .pane_slots
+            .get(&active)
+            .cloned()
+            .unwrap_or_else(|| self.slot.clone());
+        let window = self.window.as_ref().expect("the window exists");
+        // Gather before acquiring a surface image: an image acquired and
+        // dropped unpresented (nothing new to draw) is not reliably
+        // returned to the swapchain by every window system, and once all
+        // images are held every acquire times out.
+        let fonts = self.fonts.as_ref().expect("fonts are loaded at startup");
+        let (grid_cols, grid_rows) = window_grid(window, fonts);
+        // With more than one tab, row 0 is the tab bar.
+        let bar = u16::from(self.workspace.tab_count() > 1);
+        let rects = self
+            .layout
+            .compute_rectangles(grid_cols, grid_rows.saturating_sub(bar));
+        // Each pane of the active tab: its fresh snapshot, else the
+        // retained one; a snapshot that does not fit its pane (from
+        // before a resize) is dropped, the pump sends a new one.
+        let mut fresh_any = false;
+        let mut panes: Vec<(PaneKey, u16, u16, u16, u16, Option<Snapshot>)> = Vec::new();
+        for &(pane_id, x, y, w, h) in &rects {
+            let key = PaneKey {
+                tab: active.tab,
+                pane: pane_id,
+            };
+            let pane_slot = if key == active {
+                Some(slot.clone())
+            } else {
+                self.pane_slots.get(&key).cloned()
+            };
+            let fresh =
+                pane_slot.and_then(|s| s.lock().unwrap_or_else(PoisonError::into_inner).take());
+            fresh_any |= fresh.is_some();
+            let snap = fresh
+                .or_else(|| self.pane_last.remove(&key))
+                .filter(|s| !snapshot_is_stale(s.rows as u16, s.cols as u16, h, w))
+                .map(|mut s| {
+                    s.colors = self.palette.overlay(&s.colors);
+                    s
+                });
+            panes.push((key, x, y + bar, w, h, snap));
+        }
+        if !fresh_any && !retained {
+            // Coalesced pulse: the earlier pulse already presented
+            // the latest content.
+            for (key, .., snap) in panes {
+                if let Some(snap) = snap {
+                    self.pane_last.insert(key, snap);
+                }
+            }
+            if debug_enabled() {
+                eprintln!("debug: coalesced pulse, nothing new to render");
+            }
+            return;
+        }
         let graphics = self
             .graphics
             .as_mut()
             .expect("graphics are created at startup");
-        let window = self.window.as_ref().expect("the window exists");
         let mut frame = graphics.acquire();
         let (state, action) = on_event(
             self.state.clone(),
             RenderEvent::SurfaceStatus(frame.status.clone()),
         );
         self.state = state;
+        if action != Action::Render {
+            // Keep what was gathered for the next frame.
+            for (key, .., snap) in panes.drain(..) {
+                if let Some(snap) = snap {
+                    self.pane_last.insert(key, snap);
+                }
+            }
+        }
         match action {
             Action::Render => {
-                let fresh = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
-                let snap = match fresh {
-                    Some(snap) => Some(snap),
-                    None if retained => active.and_then(|pane| self.pane_last.remove(&pane)),
-                    None => None,
-                };
-                let Some(mut snap) = snap else {
-                    // Coalesced pulse: the pump's single slot held one
-                    // snapshot for two rapid pulses (e.g. the
-                    // initial-state damage plus the first command's
-                    // output); the earlier pulse already presented
-                    // the latest content. Nothing to present — never
-                    // a blank frame.
-                    if debug_enabled() {
-                        eprintln!("debug: coalesced pulse, nothing new to render");
-                    }
-                    return;
-                };
-                // Resolve against a full table: the engine keeps only the
-                // colors an application changed (OSC 4/10/11/12).
-                snap.colors = self.palette.overlay(&snap.colors);
-                // N11a stale-geometry rejection: the geometry pair is the
-                // staleness tag — never present old geometry to the new
-                // surface. Fonts are shared-borrowed here, then mutably
-                // borrowed below for drawing; never both at once.
-                let (grid_cols, grid_rows) = {
-                    let fonts = self.fonts.as_ref().expect("fonts are loaded at startup");
-                    window_grid(window, fonts)
-                };
-                if snapshot_is_stale(snap.rows as u16, snap.cols as u16, grid_rows, grid_cols) {
-                    if debug_enabled() {
-                        eprintln!(
-                            "debug: stale snapshot {}x{} != grid {}x{}",
-                            snap.rows, snap.cols, grid_rows, grid_cols
-                        );
-                    }
-                    return;
-                }
-                // N20b: the search is bounded to the visible area —
-                // refresh the character snapshot of what was just taken
-                // and re-run an active search against it (the content
-                // may have scrolled). Field-level calls only: the
-                // `graphics`/`window` borrows above are still live, so
-                // no `&mut self` methods here.
-                let mut visible: Vec<Vec<char>> = Vec::with_capacity(snap.rows);
-                for row in 0..snap.rows {
-                    let mut line = Vec::with_capacity(snap.cols);
-                    for col in 0..snap.cols {
-                        line.push(snap.cells[row * snap.cols + col].ch);
-                    }
-                    visible.push(line);
-                }
-                self.last_visible = visible;
-                if self.search.visible && !self.search.state.query.is_empty() {
-                    self.search.research(&self.last_visible);
-                }
-                // N20b: highlight span of the current match, in viewport
-                // (row, col) cells; empty when there is no current match.
-                let mut search_cells: Vec<(u32, u32)> = Vec::new();
-                if let Some(m) = self.search.current_match() {
-                    let rows = self.last_visible.len();
-                    let cols = self.last_visible.first().map_or(0, |row| row.len());
-                    if m.row < rows {
-                        let start = m.col.min(cols);
-                        let end = (start + self.search.state.query.chars().count()).min(cols);
-                        search_cells.extend((start..end).map(|col| (m.row as u32, col as u32)));
-                    }
-                }
                 let fonts = self.fonts.as_mut().expect("fonts are loaded at startup");
-                // Row-major visible cells (N13a): each cell's full cluster is
-                // shaped with its resolved style; spacers and concealed cells
-                // are skipped, wide chars advance by 2.
-                let mut draw_cells: Vec<DrawCell> = Vec::new();
-                // Cell backgrounds that differ from the default background
-                // (the frame is cleared to it), then the block cursor.
-                let default_bg = default_bg(&snap);
-                let default_bg = [default_bg.r, default_bg.g, default_bg.b];
-                let mut fills: Vec<CellFill> = Vec::new();
-                for row in 0..snap.rows {
-                    for col in 0..snap.cols {
-                        let cell = &snap.cells[row * snap.cols + col];
-                        // Spacer cells (wide-char continuation) are not drawn.
-                        if cell.width() == 0 {
-                            continue;
-                        }
-                        let style = cell_style(cell.flags, cell.fg, cell.bg, &snap.colors);
-                        if style.bg[..3] != default_bg {
-                            fills.push(CellFill {
-                                row: row as u32,
-                                col: col as u32,
-                                span: cell.width(),
-                                color: style.bg,
-                            });
-                        }
-                        // Spaces carry no content.
-                        if cell.ch == ' ' {
-                            continue;
-                        }
-                        // Concealed cells are not drawn.
-                        if style.conceal {
-                            continue;
-                        }
-                        // Full cluster: the cell character plus its combining
-                        // marks, shaped together so the marks compose onto
-                        // the base character.
-                        let mut text = String::new();
-                        text.push(cell.ch);
-                        for &mark in &cell.zerowidth {
-                            text.push(mark);
-                        }
-                        draw_cells.push(DrawCell {
-                            row: row as u32,
-                            col: col as u32,
-                            text,
-                            style,
-                            width: cell.width(),
-                        });
+                let active_entry = panes.iter().find(|p| p.0 == active);
+                let frame_bg = match active_entry.and_then(|p| p.5.as_ref()) {
+                    Some(snap) => default_bg(snap),
+                    None => self.palette.background(),
+                };
+                let frame_bg = [frame_bg.r, frame_bg.g, frame_bg.b];
+                // Search and selection belong to the active pane; their
+                // cells are offset to its origin.
+                let mut search_cells: Vec<(u32, u32)> = Vec::new();
+                let mut selection_cells: Vec<(u32, u32)> = Vec::new();
+                let mut line1 = String::new();
+                if let Some(&(_, x, y, _, _, Some(ref snap))) = active_entry {
+                    let (x, y) = (u32::from(x), u32::from(y));
+                    self.last_visible = (0..snap.rows)
+                        .map(|row| {
+                            (0..snap.cols)
+                                .map(|col| snap.cells[row * snap.cols + col].ch)
+                                .collect()
+                        })
+                        .collect();
+                    if self.search.visible && !self.search.state.query.is_empty() {
+                        self.search.research(&self.last_visible);
                     }
+                    if let Some(m) = self.search.current_match()
+                        && m.row < snap.rows
+                    {
+                        let start = m.col.min(snap.cols);
+                        let end = (start + self.search.state.query.chars().count()).min(snap.cols);
+                        search_cells
+                            .extend((start..end).map(|col| (y + m.row as u32, x + col as u32)));
+                    }
+                    for (i, selected) in snap.selected.iter().enumerate() {
+                        if *selected {
+                            let (row, col) = (i / snap.cols, i % snap.cols);
+                            selection_cells.push((y + row as u32, x + col as u32));
+                        }
+                    }
+                    line1 = first_non_space_line(snap, 40);
                 }
-                // Block cursor: `cursor_fill` applies the engine's
-                // `SHOW_CURSOR` mode and range rules and resolves the cursor
-                // color; the glyph under it is drawn in the cell background
-                // so it stays legible on the block.
                 let layout = TermLayout {
                     cell_w: fonts.cell_w as f32,
                     cell_h: fonts.cell_h() as f32,
                     font_size: fonts.metrics.font_px,
                 };
-                if let Some(cursor) = cursor_fill(&snap, &layout) {
-                    let (row, col) = (cursor.row as u32, cursor.col as u32);
-                    fills.push(CellFill {
-                        row,
-                        col,
-                        span: cursor.span,
-                        color: [cursor.color.r, cursor.color.g, cursor.color.b, 255],
-                    });
-                    if let Some(cell) = draw_cells
-                        .iter_mut()
-                        .find(|cell| cell.row == row && cell.col == col)
-                    {
-                        cell.style.fg = cell.style.bg;
+                let mut scene = Scene::default();
+                for (key, x, y, _, _, snap) in &panes {
+                    if let Some(snap) = snap {
+                        let cursor = *key == active;
+                        scene.add_pane(
+                            snap,
+                            u32::from(*x),
+                            u32::from(*y),
+                            frame_bg,
+                            cursor,
+                            &layout,
+                        );
                     }
                 }
-                // N14b: selection highlight — the grid cells covered by the
-                // current selection, drawn as fill rectangles under the text.
-                let mut selection_cells: Vec<(u32, u32)> = Vec::new();
-                for (i, is_selected) in snap.selected.iter().enumerate() {
-                    if *is_selected {
-                        let (row, col) = (i / snap.cols, i % snap.cols);
-                        selection_cells.push((row as u32, col as u32));
-                    }
+                if bar == 1 {
+                    let tabs = self.workspace.tabs().to_vec();
+                    let labels: Vec<String> = tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tab)| {
+                            let pane = if *tab == active.tab {
+                                Some(active.pane)
+                            } else {
+                                self.tab_layouts.get(tab).map(|l| l.active_pane())
+                            };
+                            let title = pane.and_then(|pane| {
+                                self.pane_titles.get(&PaneKey { tab: *tab, pane })
+                            });
+                            match title {
+                                Some(t) => {
+                                    format!("{} {}", i + 1, t.chars().take(24).collect::<String>())
+                                }
+                                None => format!("{}", i + 1),
+                            }
+                        })
+                        .collect();
+                    let index = tabs.iter().position(|t| *t == active.tab).unwrap_or(0);
+                    scene.add_tab_bar(&labels, index, u32::from(grid_cols));
                 }
-                let line1 = first_non_space_line(&snap, 40);
+                if panes.len() > 1 {
+                    let tiles: Vec<(u32, u32, u32, u32)> = panes
+                        .iter()
+                        .map(|p| {
+                            (
+                                u32::from(p.1),
+                                u32::from(p.2),
+                                u32::from(p.3),
+                                u32::from(p.4),
+                            )
+                        })
+                        .collect();
+                    scene.add_separators(&tiles, u32::from(bar), layout.cell_w, layout.cell_h);
+                }
                 if let Err(message) = graphics.draw_frame(
                     &mut frame,
                     fonts,
-                    &draw_cells,
-                    [default_bg[0], default_bg[1], default_bg[2], 255],
-                    &fills,
+                    &scene.cells,
+                    [frame_bg[0], frame_bg[1], frame_bg[2], 255],
+                    &scene.fills,
+                    &scene.rects,
                     &selection_cells,
                     &search_cells,
                 ) {
@@ -1486,12 +1584,16 @@ impl WinApp {
                 self.frames += 1;
                 if debug_enabled() {
                     eprintln!(
-                        "debug: frame rendered {} (rows={} cols={} line1=\"{}\")",
-                        self.frames, snap.rows, snap.cols, line1
+                        "debug: frame rendered {} (panes={} line1=\"{}\")",
+                        self.frames,
+                        panes.len(),
+                        line1
                     );
                 }
-                if let Some(pane) = active {
-                    self.pane_last.insert(pane, snap);
+                for (key, .., snap) in panes {
+                    if let Some(snap) = snap {
+                        self.pane_last.insert(key, snap);
+                    }
                 }
             }
             Action::Reconfigure => {
@@ -1973,6 +2075,15 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             }
             WindowEvent::MouseInput { button, state, .. } => {
+                // A press in another pane of the visible tab focuses it
+                // first; the click then belongs to that pane.
+                if state == ElementState::Pressed
+                    && let Some((target, _)) = self.pane_at(self.cursor.0, self.cursor.1)
+                    && target != self.layout.active_pane()
+                {
+                    self.focus_pane(target);
+                    window.request_redraw();
+                }
                 // Local selection: a left press clears the old selection and
                 // anchors a new one that starts on drag (`MouseInput` has no
                 // position, so the last tracked cursor is used). When the
