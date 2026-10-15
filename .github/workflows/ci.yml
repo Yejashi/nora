@@ -8,6 +8,8 @@
 #   backends       explicit X11-only / Wayland-only build configurations
 #   x11-smoke      windowed smoke under a virtual X11 display (Xvfb)
 #   wayland-smoke  windowed smoke under a nested Wayland compositor
+#   e2e-x11        end-to-end window checks (scripts/e2e-x11.sh): real key
+#                  events, screenshots, PTY evidence files
 #
 # A software GPU (lavapipe) validates lifecycle and rendering paths; it
 # is not hardware performance evidence.
@@ -198,3 +200,29 @@ jobs:
           set -e
           kill "$WESTON_PID" 2>/dev/null || true
           exit "$STATUS"
+
+  e2e-x11:
+    name: end-to-end window checks (Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb xdotool imagemagick xkb-data libxkbcommon0 libxkbcommon-x11-0 \
+            libvulkan1 mesa-vulkan-drivers fonts-noto-core fonts-noto-cjk
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: scripts/e2e-x11.sh
+        run: scripts/e2e-x11.sh render
+      - name: Upload e2e artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-x11
+          path: target/e2e
