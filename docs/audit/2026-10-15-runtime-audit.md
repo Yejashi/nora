@@ -55,6 +55,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | R5, CFG font | `font.family`/`font.size` ignored; cell size hardcoded (20 px / 24 px); implausible-width assert | M1.6 |
 | R11 (bold) | Only the Regular face loaded | M1.6 (bold/italic faces loaded when installed; no synthetic bold) |
 | P3 | Unbounded OSC/APC buffering (200 MiB unterminated OSC grew RSS by 798 MiB) | M1.7a (64 KiB OSC / 4 MiB APC caps; +5.5 MiB peak under the same flood) |
+| P5 | Pump slept 10 ms per loop: 10-20 ms added to every echo; 100 wakeups/s idle | M1.7b (median key-to-present 12-19 ms -> ~1 ms; idle ~2 wakeups/s), see `docs/performance/2026-10-15-input-latency.md` |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

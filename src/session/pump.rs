@@ -184,6 +184,9 @@ pub enum PumpMsg {
     /// Reap (close) the session for the pane (N24b); the pump sends
     /// [`AppEvent::PaneGone`].
     ClosePane { pane: PaneKey },
+    /// Wake the pump: new PTY output, a child exit, or shutdown. Carries
+    /// nothing; at most one is queued at a time (see [`pump_thread`]).
+    Wake,
 }
 
 /// The outcome of applying a paste to the pump's input state (N17b).
@@ -445,21 +448,47 @@ fn tick_pane(
 /// Each pane's input is routed to its own session, so active input never
 /// reaches another pane (and never another tab); closing a pane reaps its
 /// session.
+// The thread's fixed wiring: first pane (key, session, slot), the spawn
+// spec for new panes, the window proxy, the command channel's two ends,
+// and the stop flag.
+#[allow(clippy::too_many_arguments)]
 pub fn pump_thread(
     first_pane: PaneKey,
-    first_session: PtySession,
+    mut first_session: PtySession,
     first_slot: Arc<Mutex<Option<Snapshot>>>,
     spec: LaunchSpec,
     events: winit::event_loop::EventLoopProxy<AppEvent>,
     commands: mpsc::Receiver<PumpMsg>,
+    wake_tx: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
 ) {
+    // Event-driven wakeup: each session's engine calls `waker` when the PTY
+    // loop records output or a child exit; it queues one `PumpMsg::Wake`
+    // unless one is already pending, so the queue never grows from wakes.
+    let wake_queued = Arc::new(AtomicBool::new(false));
+    let waker: crate::engine::Waker = {
+        let wake_queued = wake_queued.clone();
+        Arc::new(move || {
+            if !wake_queued.swap(true, Ordering::AcqRel) {
+                let _ = wake_tx.send(PumpMsg::Wake);
+            }
+        })
+    };
     let mut sessions: HashMap<PaneKey, PanePump> = HashMap::new();
     let mut slots: HashMap<PaneKey, Arc<Mutex<Option<Snapshot>>>> = HashMap::new();
+    first_session.engine().set_waker(waker.clone());
     sessions.insert(first_pane, PanePump::new(first_session));
     slots.insert(first_pane, first_slot);
 
+    let mut timeout = Duration::ZERO;
     loop {
+        // (0) Block until a command, a wake (PTY output, child exit), or
+        // the timeout: no fixed sleep on the echo path (audit P5).
+        let first = commands.recv_timeout(timeout).ok();
+        // Cleared before the tick: output that arrives while this pass
+        // runs queues a fresh wake.
+        wake_queued.store(false, Ordering::Release);
+
         // (1) Tick every pane; collect the ones that finished draining.
         let mut removed = Vec::new();
         {
@@ -476,8 +505,14 @@ pub fn pump_thread(
         }
 
         // (2) Drain commands, routing each to its pane's session.
-        while let Ok(msg) = commands.try_recv() {
+        let pending = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| commands.try_recv().ok()));
+        for msg in pending {
             match msg {
+                // The wake only ended the wait; the tick above already
+                // picked up the new output.
+                PumpMsg::Wake => {}
                 PumpMsg::NewPane {
                     pane,
                     rows,
@@ -488,7 +523,8 @@ pub fn pump_thread(
                         eprintln!("debug: pump: new pane {pane:?} {rows}x{cols}");
                     }
                     match PtySession::spawn(spec.clone(), rows, cols, super::pty::DEFAULT_CAP) {
-                        Ok(session) => {
+                        Ok(mut session) => {
+                            session.engine().set_waker(waker.clone());
                             sessions.insert(pane, PanePump::new(session));
                             slots.insert(pane, slot);
                             let _ = events.send_event(AppEvent::PaneReady { pane });
@@ -634,6 +670,17 @@ pub fn pump_thread(
             }
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Poll again soon only while some pane needs it: a draining pane
+        // (final output after child exit) or input still queued behind
+        // the writer's cap. Otherwise wait for a wake; the heartbeat only
+        // bounds how stale an unexpected missed wake can get.
+        let busy = sessions
+            .values()
+            .any(|p| p.draining || !p.pending_input.is_empty() || p.session.outstanding() > 0);
+        timeout = if busy {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(500)
+        };
     }
 }

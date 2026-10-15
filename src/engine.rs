@@ -293,10 +293,27 @@ fn event_record_cost(record: &EventRecord) -> usize {
 #[derive(Clone, Default)]
 pub struct Recorder {
     events: Arc<Mutex<RecorderState>>,
+    /// Called after every recorded event (outside the record lock) so the
+    /// consumer can block instead of polling. It runs on the PTY reader
+    /// thread, under the terminal lock: it must be cheap and non-blocking.
+    waker: Arc<Mutex<Option<Waker>>>,
 }
+
+/// A wake callback for [`Recorder`]; see [`Engine::set_waker`].
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 impl EventListener for Recorder {
     fn send_event(&self, event: Event) {
+        self.record(event);
+        let waker = self.waker.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+}
+
+impl Recorder {
+    fn record(&self, event: Event) {
         let mut state = self.events.lock().unwrap_or_else(|e| e.into_inner());
         let record = to_record(event);
 
@@ -593,6 +610,17 @@ impl Engine {
     /// as the engine's own events.
     pub fn recorder(&self) -> Recorder {
         self.recorder.clone()
+    }
+
+    /// Install a wake callback, called after every event the PTY loop or
+    /// the parser records (new output, child exit, replies). It runs under
+    /// the terminal lock on the reader thread, so it must not block.
+    pub fn set_waker(&self, waker: Waker) {
+        *self
+            .recorder
+            .waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(waker);
     }
 
     /// Feed raw PTY bytes into the engine, preserving parser state.

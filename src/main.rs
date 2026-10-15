@@ -353,6 +353,10 @@ fn run_windowed(
     let (pump_commands, pump_commands_rx) =
         std::sync::mpsc::channel::<nora::session::pump::PumpMsg>();
     let proxy = event_loop.create_proxy();
+    // The pump's own wake sender (PTY output wakes it), and one kept here
+    // to wake it for shutdown.
+    let pump_wake = pump_commands.clone();
+    let shutdown_wake = pump_commands.clone();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The pump thread gets its own Arcs; the window loop keeps these.
     let pump_slot = slot.clone();
@@ -369,6 +373,7 @@ fn run_windowed(
             spec_for_pump,
             proxy,
             pump_commands_rx,
+            pump_wake,
             pump_stop,
         )
     });
@@ -384,6 +389,7 @@ fn run_windowed(
         fonts,
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = shutdown_wake.send(nora::session::pump::PumpMsg::Wake);
     let _ = pump.join();
     code
 }
