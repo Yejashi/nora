@@ -349,7 +349,66 @@ scenario_title() {
     pass title
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title)
+# Real applications. Each is skipped (not failed) when not installed.
+have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
+
+# vim: insert mode, Escape and an ex command reach vim byte-exact, and
+# its alternate-screen session ends cleanly (the file is written).
+scenario_vim() {
+    have vim vim || return
+    local dir="$OUT/vim"; mkdir -p "$dir"
+    printf 'second line\n' >"$dir/file.txt"
+    launch vim vim -u NONE -N -n "$dir/file.txt" || { fail vim "no window"; return; }
+    xdotool type --delay 30 "Ofirst line"
+    xdotool key Escape
+    xdotool type --delay 30 ":wq"
+    xdotool key Return
+    local exited=no
+    for _ in $(seq 1 50); do kill -0 "$NORA_PID" 2>/dev/null || { exited=yes; break; }; sleep 0.1; done
+    finish
+    [ "$(cat "$dir/file.txt")" = "$(printf 'first line\nsecond line')" ] \
+        || { fail vim "file content: $(tr '\n' '|' < "$dir/file.txt")"; return; }
+    [ "$exited" = yes ] || { fail vim "nora did not exit with vim"; return; }
+    pass vim
+}
+
+# tmux: a full-screen multiplexer draws its status line (default green
+# background) and its pane content.
+scenario_tmux() {
+    have tmux tmux || return
+    local dir="$OUT/tmux"; mkdir -p "$dir"
+    launch tmux tmux -L nora-e2e -f /dev/null new-session "printf 'TMUX PANE TEXT\\n'; sleep 30" \
+        || { fail tmux "no window"; return; }
+    sleep 1.5
+    shot "$dir/shot.png"
+    finish
+    tmux -L nora-e2e kill-server 2>/dev/null
+    local green white
+    green=$(count_color "$dir/shot.png" '#00CD00')
+    white=$(count_color "$dir/shot.png" '#FFFFFF')
+    echo "  status-bar px: $green, text px: $white"
+    [ "$green" -gt 5000 ] || { fail tmux "no status line"; return; }
+    [ "$white" -gt 100 ] || { fail tmux "no pane text"; return; }
+    pass tmux
+}
+
+# htop: colored meters and the process list render.
+scenario_htop() {
+    have htop htop || return
+    local dir="$OUT/htop"; mkdir -p "$dir"
+    launch htop htop || { fail htop "no window"; return; }
+    sleep 2
+    shot "$dir/shot.png"
+    xdotool key q
+    finish
+    local colors
+    colors=$("${IM_CONVERT[@]}" "$dir/shot.png" -crop 800x600+0+0 +repage -unique-colors -format '%w' info:)
+    echo "  distinct colors: $colors"
+    [ "$colors" -gt 6 ] || { fail htop "too few colors rendered"; return; }
+    pass htop
+}
+
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
