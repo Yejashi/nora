@@ -20,7 +20,8 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | Clipboard | User copy/paste; OSC policy disabled by default | Native Wayland/X11 tests |
 | Hyperlinks | Preserve metadata; explicit user activation | URL validation + selection tests |
 | IME | Preedit UI and one commit; proper candidate area | Native tests and event replay |
-| Graphics | Explicitly unsupported in v0.1 | No positive support claim; bounded ignore/recovery |
+| Shell integration | OSC 133 A/B/C/D markers, OSC 7 cwd, OSC 8 hyperlinks; opt-in shell script, engine-level features (jump-to-prompt, previous-command selection, hyperlink activation) | Filter tests (`prompt_marker`), PTY shared-state tests (`pty_session`), navigation tests (`scrollback`) |
+| Graphics (kitty protocol) | Documented subset: upload/place/query/delete, f=24/f=32, chunk assembly (`m`), multiple placements, 128 MiB budgets; f=100 (PNG) a later slice | Protocol fixtures (`graphics_filter`/`graphics_image`/`graphics_protocol`) + PTY APC tests |
 
 **Engine-level evidence so far (headless, N03).** The following rows have passing fixtures in `tests/engine_adapter.rs`: Text/UTF-8 — whole/split (every byte boundary) and seeded random-chunk replay; Cursor/erase/style — overwrite/CUP, pending wrap, SGR flags+colors until reset; Screens/scrolling — ?1049 alternate-screen isolation and restore; Queries — DSR and OSC-title replies captured in order via `Recorder`. These prove engine semantics only; PTY-level proof (exact reply bytes/timeouts, TUI runs) and all other rows remain open until N04+. Full per-row status tracking starts at N04 in `docs/status/COMPATIBILITY.md`.
 

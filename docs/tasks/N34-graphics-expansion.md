@@ -1,6 +1,6 @@
 # N34: Expand graphics protocol by capability
 
-Implementation status: not_started. This card is a plan, not evidence of completion.
+Implementation status: complete (N34a formats f=24/f=32 + N34b chunk assembly; see `docs/status/PROGRESS.md` for evidence).
 
 - Dependencies: N33.
 - Read: [13-extensions.md](../13-extensions.md); [agent workflow](../08-agent-workflow.md).

@@ -1,6 +1,6 @@
 # N35: Opt-in prompt markers and hyperlink UX
 
-Implementation status: not_started. This card is a plan, not evidence of completion.
+Implementation status: complete (N35a `6fa16bb`+`4edfffb`, N35b `797d7a2`+`65d0f0b`, N35c `6a892bb`, N35d `d90f5e7`; see `docs/status/PROGRESS.md` for evidence).
 
 - Dependencies: N31.
 - Read: [13-extensions.md](../13-extensions.md), [06-compatibility.md](../06-compatibility.md); [agent workflow](../08-agent-workflow.md).
