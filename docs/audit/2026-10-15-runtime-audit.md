@@ -57,6 +57,9 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | P3 | Unbounded OSC/APC buffering (200 MiB unterminated OSC grew RSS by 798 MiB) | M1.7a (64 KiB OSC / 4 MiB APC caps; +5.5 MiB peak under the same flood) |
 | P5 | Pump slept 10 ms per loop: 10-20 ms added to every echo; 100 wakeups/s idle | M1.7b (median key-to-present 12-19 ms -> ~1 ms; idle ~2 wakeups/s), see `docs/performance/2026-10-15-input-latency.md` |
 | P4, I-F18 | Input unbounded downstream of the writer (channel, pending queue, loop write list) | M1.7c (2 MiB queue + 1 MiB writer + 1 MiB in flight per pane) |
+| P6 | Session close stalled the pump up to 5 s per pane; a SIGHUP-ignoring child leaked the loop thread, process and fds | M1.7d (close off the pump thread; group SIGKILL after 1.5 s) |
+| P9 | Recorder overflow could evict the child-exit record (exit status lost) | M1.7d |
+| P12 (title, bell) | OSC 0/2 titles only printed to stderr at exit; bell discarded | M1.7d (window title per active pane; bell requests attention when unfocused) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

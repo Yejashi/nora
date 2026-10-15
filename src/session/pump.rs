@@ -102,6 +102,13 @@ pub enum AppEvent {
     /// The pump fetched a snapshot for the pane (stored in that pane's
     /// slot); non-noop damage.
     DirtyPulse { pane: PaneKey },
+    /// The pane's title changed (OSC 0/2; `None` after a reset).
+    Title {
+        pane: PaneKey,
+        title: Option<String>,
+    },
+    /// The pane's application rang the bell.
+    Bell { pane: PaneKey },
     /// The session child for the pane exited (exit code, or None if the
     /// loop died without one).
     ChildExit { pane: PaneKey, status: Option<i32> },
@@ -261,6 +268,33 @@ pub fn advance_paste_block(paste_block: &mut Option<(usize, usize)>, drained: us
 /// dead (N09b, extended for N17b paste tracking). Advances
 /// `paste_block` as bytes drain, so an in-flight paste's block stays
 /// aligned with `pending_input`. Returns the total bytes fed this call.
+/// Close a session on its own short-lived thread (it may wait for the
+/// child, see [`PtySession::close`]). `None` if the thread could not be
+/// spawned, in which case the session is closed inline.
+fn close_in_background(mut session: PtySession) -> Option<std::thread::JoinHandle<()>> {
+    let (tx, rx) = mpsc::channel::<PtySession>();
+    let spawned = std::thread::Builder::new()
+        .name("nora-close".to_string())
+        .spawn(move || {
+            if let Ok(mut session) = rx.recv() {
+                session.close();
+            }
+        });
+    match spawned {
+        Ok(handle) => match tx.send(session) {
+            Ok(()) => Some(handle),
+            Err(mpsc::SendError(mut session)) => {
+                session.close();
+                None
+            }
+        },
+        Err(_) => {
+            session.close();
+            None
+        }
+    }
+}
+
 /// Most input bytes a pane queues in the pump (2 MiB). With the writer
 /// budget and [`super::pty::MAX_IN_FLIGHT`] this bounds a pane's input
 /// memory end to end; past it, keys and pastes are refused.
@@ -301,6 +335,8 @@ struct PanePump {
     /// Publish a snapshot on the next tick even without terminal damage:
     /// selection changes are not damage, yet must reach the screen.
     force_snapshot: bool,
+    /// The last published title.
+    last_title: Option<String>,
     /// Pending input bytes for this pane (N09b/N17b).
     pending_input: Vec<u8>,
     /// The in-flight paste block within `pending_input`, as a half-open
@@ -325,6 +361,7 @@ impl PanePump {
         Self {
             session,
             force_snapshot: false,
+            last_title: None,
             pending_input: Vec::new(),
             paste_block: None,
             last_modes: None,
@@ -389,7 +426,9 @@ fn tick_pane(
         // N06b: surface the last title set by the child, on stderr, before
         // the loop folds `ChildExited`. Enter drain mode (N12a); the drain
         // frame is probed on the next tick.
-        if let Some(title) = pane_pump.session.title() {
+        if debug_enabled()
+            && let Some(title) = pane_pump.session.title()
+        {
             eprintln!("title: {title}");
         }
         pane_pump.draining = true;
@@ -411,6 +450,16 @@ fn tick_pane(
             eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
         }
         let _ = events.send_event(AppEvent::DirtyPulse { pane });
+    }
+
+    // Publish title changes and bells for the window.
+    let title = pane_pump.session.title();
+    if title != pane_pump.last_title {
+        pane_pump.last_title = title.clone();
+        let _ = events.send_event(AppEvent::Title { pane, title });
+    }
+    if pane_pump.session.take_bell() {
+        let _ = events.send_event(AppEvent::Bell { pane });
     }
 
     // N10b: publish the engine's live `TermMode` on change. `TermMode` is
@@ -544,8 +593,11 @@ pub fn pump_thread(
                     if debug_enabled() {
                         eprintln!("debug: pump: close pane {pane:?}");
                     }
-                    if let Some(mut pane_pump) = sessions.remove(&pane) {
-                        pane_pump.session.close();
+                    if let Some(pane_pump) = sessions.remove(&pane) {
+                        // Closing can wait for a slow child (up to the
+                        // kill escalation in `close`); do it off the pump
+                        // thread so other panes keep running (audit P6).
+                        close_in_background(pane_pump.session);
                         slots.remove(&pane);
                         let _ = events.send_event(AppEvent::PaneGone { pane });
                     }
@@ -684,8 +736,13 @@ pub fn pump_thread(
             // `PeekableReceiver::recv` when its sender is dropped
             // without `Msg::Shutdown` (alacritty_terminal 0.26.0
             // event_loop.rs:483-488); `close()` sends it.
-            for pane_pump in sessions.values_mut() {
-                pane_pump.session.close();
+            // Close every pane concurrently, then wait for all of them.
+            let closers: Vec<_> = sessions
+                .drain()
+                .map(|(_, pane_pump)| close_in_background(pane_pump.session))
+                .collect();
+            for closer in closers.into_iter().flatten() {
+                let _ = closer.join();
             }
             break;
         }

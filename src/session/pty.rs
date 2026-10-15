@@ -230,6 +230,10 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// loop's queue (audit P4).
 pub const MAX_IN_FLIGHT: usize = 1024 * 1024;
 
+/// How long `close` waits for the child to exit after SIGHUP before it
+/// kills the child's process group.
+pub const CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
 /// `status` is `Some` on a clean child exit (`Event::ChildExit`), `None`
 /// when the loop died from an I/O or registration error. Not
 /// `PartialEq`-able (`ExitStatus`) — assert with `matches!` +
@@ -261,6 +265,8 @@ pub struct PtySession {
     /// size replies resolve against it, so they never cross sessions.
     size: WindowSize,
     sender: EventLoopSender,
+    /// The child's pid, which is also its process group id.
+    child_pid: libc::pid_t,
     /// Bytes sent as `Msg::Input` and not yet written (decremented by the
     /// vendored loop's `pty_write`).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
@@ -289,6 +295,8 @@ pub struct PtySession {
     /// drained [`EventRecord::Title`]/[`EventRecord::ResetTitle`]
     /// records; no cross-thread mutation of shared state.
     title: Option<String>,
+    /// A bell rang since the last [`PtySession::take_bell`].
+    bell: bool,
 }
 
 impl PtySession {
@@ -332,6 +340,9 @@ impl PtySession {
             cell_height: NOMINAL_CELL_HEIGHT,
         };
         let pty = tty::new(&options, size, id.0).map_err(PtyError::Spawn)?;
+        // The child is a session leader (setsid), so this is also its
+        // process group id; kept for kill escalation in `close`.
+        let child_pid = pty.child().id() as libc::pid_t;
 
         // The slave keeps the kernel's cooked line discipline (ICANON,
         // ECHO, ISIG, ICRNL, OPOST|ONLCR); the pinned `tty::new` adds only
@@ -405,6 +416,7 @@ impl PtySession {
             size,
             sender,
             in_flight,
+            child_pid,
             loop_handle: Some(loop_handle),
             lifecycle,
             done,
@@ -413,6 +425,7 @@ impl PtySession {
             shutdown_sent: false,
             loop_end_reported: false,
             title: None,
+            bell: false,
         })
     }
 
@@ -620,7 +633,15 @@ impl PtySession {
         let released = self.writer.cancel();
         self.ledger.release();
         self.send_shutdown();
-        let finished = self.wait_drain(DRAIN_TIMEOUT);
+        // Shutdown makes the loop drop the PTY, which SIGHUPs the child and
+        // waits for it. A child that ignores SIGHUP would block that wait
+        // forever (leaking the loop thread, the child and the PTY fds), so
+        // after a grace period its process group is killed (audit P6).
+        let mut finished = self.wait_drain(CLOSE_GRACE);
+        if !finished {
+            self.kill_child_group();
+            finished = self.wait_drain(DRAIN_TIMEOUT);
+        }
         if !finished {
             Self::warn_drain_timeout();
         }
@@ -649,6 +670,34 @@ impl PtySession {
         &mut self.engine
     }
 
+    /// Whether a bell rang since the last call (and clear it).
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
+    }
+
+    /// The child's pid (also its process group id).
+    pub fn child_pid(&self) -> libc::pid_t {
+        self.child_pid
+    }
+
+    /// SIGKILL the child's process group (and the child itself, in case it
+    /// left the group). Used only after `CLOSE_GRACE` when SIGHUP did not
+    /// end it.
+    fn kill_child_group(&self) {
+        if self.child_pid <= 1 {
+            return;
+        }
+        // SAFETY: `kill` takes plain integers and has no memory effects.
+        // The pid is our own child's: it is not reaped until the loop's
+        // `Pty::drop` wait returns, which has not happened (the loop has
+        // not finished), so it cannot have been reused; the group id is
+        // that pid, held by the group while any member lives.
+        unsafe {
+            libc::kill(-self.child_pid, libc::SIGKILL);
+            libc::kill(self.child_pid, libc::SIGKILL);
+        }
+    }
+
     /// Send `Msg::Shutdown` once. A send failure means the loop is already
     /// gone — nothing left to notify.
     fn send_shutdown(&mut self) {
@@ -674,6 +723,7 @@ impl PtySession {
             match &record {
                 EventRecord::Title(t) => self.title = Some(t.clone()),
                 EventRecord::ResetTitle => self.title = None,
+                EventRecord::Bell => self.bell = true,
                 _ => {}
             }
             match record {

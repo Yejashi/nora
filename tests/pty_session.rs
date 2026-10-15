@@ -1392,3 +1392,42 @@ fn input_to_a_non_reading_child_is_bounded() {
     );
     session.close();
 }
+
+/// Audit P6: a child that ignores SIGHUP used to block the loop's PTY
+/// teardown forever (the loop thread, the child and the PTY fds leaked).
+/// `close` now kills its process group after `CLOSE_GRACE` and returns
+/// with the child gone.
+#[test]
+fn close_kills_a_child_that_ignores_sighup() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "trap '' HUP; echo HUP-IGNORED; sleep 60".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("sh spawns over a real PTY");
+    pump(&mut session, |text, _events| text.contains("HUP-IGNORED"))
+        .expect("the child installed its trap");
+    let pid = session.child_pid();
+    let started = Instant::now();
+    session.close();
+    let elapsed = started.elapsed();
+    assert_eq!(session.lifecycle(), Lifecycle::Closed);
+    assert!(
+        elapsed < nora::session::pty::CLOSE_GRACE + Duration::from_secs(2),
+        "close took {elapsed:?}"
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the HUP-ignoring child {pid} must be gone"
+    );
+}

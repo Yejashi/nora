@@ -331,7 +331,25 @@ scenario_latency() {
     pass latency
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency)
+# Title: OSC 2 from the application becomes the window title.
+scenario_title() {
+    local dir="$OUT/title"; mkdir -p "$dir"
+    printf '#!/bin/sh\nsleep 2\nprintf "\\033]2;NORA TITLE TEST\\007"\nsleep 30\n' >"$dir/child.sh"
+    chmod +x "$dir/child.sh"
+    launch title "$dir/child.sh" || { fail title "no window"; return; }
+    local name=""
+    for _ in $(seq 1 50); do
+        name=$(xdotool getwindowname "$WIN" 2>/dev/null)
+        [ "$name" = "NORA TITLE TEST" ] && break
+        sleep 0.1
+    done
+    finish
+    echo "  window name: $name"
+    [ "$name" = "NORA TITLE TEST" ] || { fail title "title not applied"; return; }
+    pass title
+}
+
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

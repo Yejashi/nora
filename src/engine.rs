@@ -267,6 +267,8 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024;
 struct RecorderState {
     events: Vec<EventRecord>,
     bytes: usize,
+    /// Records evicted under the caps since creation (diagnostics).
+    dropped: u64,
 }
 
 /// Per-record byte cost for the recorder cap: the sum of that variant's
@@ -349,11 +351,21 @@ impl Recorder {
         state.events.push(record);
         // Never evict the last remaining record: a single record over the
         // byte cap evicts everything else and remains alone.
+        // The child's exit record is never evicted: losing it loses the
+        // exit status (audit P9). Everything else drops oldest-first.
         while state.events.len() > 1
             && (state.events.len() > MAX_RECORDS || state.bytes > MAX_RECORD_BYTES)
         {
-            let oldest = state.events.remove(0);
+            let Some(index) = state
+                .events
+                .iter()
+                .position(|r| !matches!(r, EventRecord::ChildExit(_)))
+            else {
+                break;
+            };
+            let oldest = state.events.remove(index);
             state.bytes -= event_record_cost(&oldest);
+            state.dropped += 1;
         }
     }
 }

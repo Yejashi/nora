@@ -737,3 +737,27 @@ fn headless_session_title_folds_latest_wins() {
     session.feed(b"\x1b]2;\x07");
     assert_eq!(session.title(), Some(String::new()));
 }
+
+/// Audit P9: the child-exit record survives a burst that overflows the
+/// recorder (it used to be evicted with the oldest records, losing the
+/// exit status).
+#[test]
+fn child_exit_record_is_never_evicted() {
+    use alacritty_terminal::event::{Event, EventListener};
+    use std::os::unix::process::ExitStatusExt;
+    let mut engine = Engine::new(24, 80);
+    let status = std::process::ExitStatus::from_raw(3 << 8);
+    engine.recorder().send_event(Event::ChildExit(status));
+    let mut stream = Vec::new();
+    for _ in 0..400 {
+        stream.extend_from_slice(b"\x1b[6n");
+    }
+    engine.feed(&stream);
+    let drained = engine.drain_events();
+    assert!(drained.len() <= 256, "the record cap still holds");
+    assert_eq!(
+        drained.first(),
+        Some(&EventRecord::ChildExit(status)),
+        "the exit record is kept"
+    );
+}

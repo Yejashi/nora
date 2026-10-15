@@ -401,6 +401,8 @@ struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
     /// Local UI key bindings.
     bindings: Bindings,
+    /// Each pane's title (OSC 0/2); the window shows the active pane's.
+    pane_titles: std::collections::HashMap<PaneKey, String>,
     /// The last cell a motion report was sent for (one report per cell).
     last_motion_cell: Option<(u16, u16)>,
     /// Each pane's last rendered snapshot, redrawn on redraw requests that
@@ -594,6 +596,7 @@ pub fn run_windowed(
         palette: Palette::from_theme(&config.theme),
         bindings: Bindings::default(),
         last_motion_cell: None,
+        pane_titles: std::collections::HashMap::new(),
         pane_last: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
@@ -675,6 +678,7 @@ impl WinApp {
     /// pump.
     fn drop_pane_state(&mut self, pane: PaneKey) {
         self.pane_last.remove(&pane);
+        self.pane_titles.remove(&pane);
         self.pane_slots.remove(&pane);
         self.pane_grid.remove(&pane);
         self.pane_exit.remove(&pane);
@@ -710,6 +714,17 @@ impl WinApp {
 
     /// Load `pane`'s per-pane state into the single fields (N24b), making
     /// it the active pane's state.
+    /// Set the window title to the active pane's title, or "nora".
+    fn show_title(&self) {
+        let title = self
+            .active_pane_key()
+            .and_then(|pane| self.pane_titles.get(&pane))
+            .map_or("nora", String::as_str);
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(title);
+        }
+    }
+
     fn load_active_pane(&mut self, pane: PaneKey) {
         self.slot = self
             .pane_slots
@@ -730,6 +745,7 @@ impl WinApp {
             .unwrap_or(KittyKeyboardFlags::NONE);
         self.selection = self.pane_selection.remove(&pane).unwrap_or(None);
         self.last_visible = self.pane_last_visible.remove(&pane).unwrap_or_default();
+        self.show_title();
     }
 
     /// Compute each live pane's grid from the active layout and send a
@@ -1180,6 +1196,28 @@ impl WinApp {
                 // The new pane's session is ready; input is already routed
                 // to it via the active pane.
                 let _ = pane;
+            }
+            AppEvent::Title { pane, title } => {
+                match title {
+                    Some(title) => self.pane_titles.insert(pane, title),
+                    None => self.pane_titles.remove(&pane),
+                };
+                if self.active_pane_key() == Some(pane) {
+                    self.show_title();
+                }
+            }
+            AppEvent::Bell { pane } => {
+                // Ask for attention when the window is in the background
+                // (taskbar flash / urgency hint); a focused window needs
+                // no signal for its own output.
+                if self.pane_is_live(&pane)
+                    && let Some(window) = self.window.as_ref()
+                    && !window.has_focus()
+                {
+                    window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
+                }
             }
             AppEvent::PaneGone { pane } => {
                 // The pane's session was reaped (or fully drained). Drop
