@@ -62,6 +62,12 @@ pub struct Engine {
     /// `Engine::feed` path and the PTY `EventLoop` filter (N32b), drained
     /// by the render tick (N33).
     graphics_queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
+    /// Bounded OSC 133 prompt-marker filter (N35a): detects prompt markers
+    /// in parallel with the vte parser, suppressing well-formed frames.
+    marker_filter: crate::prompt_marker::PromptMarkerFilter,
+    /// Byte-bounded queue of prompt-marker events, shared between the
+    /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35a).
+    marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
 }
 
 /// Kitty keyboard protocol modes (N21a).
@@ -501,6 +507,8 @@ impl Engine {
             kitty_modes: KittyKeyboardModes::default(),
             graphics_filter: crate::graphics_filter::GraphicsFilter::new(),
             graphics_queue: Arc::new(Mutex::new(crate::graphics_filter::GraphicsQueue::new())),
+            marker_filter: crate::prompt_marker::PromptMarkerFilter::new(),
+            marker_queue: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
         }
     }
 
@@ -543,10 +551,12 @@ impl Engine {
 
     /// Feed raw PTY bytes into the engine, preserving parser state.
     ///
-    /// The graphics filter (N32a) runs before the vte parser: it extracts
-    /// kitty-graphics APCs into the byte-bounded [`GraphicsQueue`] and
-    /// forwards all bytes to the parser (no transformation), so terminal
-    /// byte semantics are preserved.
+    /// The graphics filter (N32a) and the prompt-marker filter (N35a) run
+    /// before the vte parser: the graphics filter extracts kitty-graphics
+    /// APCs into the byte-bounded [`GraphicsQueue`] and forwards all bytes
+    /// (no transformation), and the marker filter extracts OSC 133 prompt
+    /// markers into the byte-bounded [`MarkerQueue`], suppressing well-formed
+    /// marker frames so terminal byte semantics are preserved.
     pub fn feed(&mut self, bytes: &[u8]) {
         let (forward, events) = self.graphics_filter.process(bytes);
         if !events.is_empty() {
@@ -558,8 +568,18 @@ impl Engine {
                 queue.push(event);
             }
         }
+        let (forward, events) = self.marker_filter.process(forward);
+        if !events.is_empty() {
+            let mut queue = self
+                .marker_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for event in events {
+                queue.push(event);
+            }
+        }
         let mut term = self.term.lock();
-        self.processor.advance(&mut *term, forward);
+        self.processor.advance(&mut *term, &forward);
     }
 
     /// Drain the graphics queue (N32a), returning all pending graphics
@@ -577,6 +597,23 @@ impl Engine {
     /// byte-bounded queue drained by the render tick.
     pub fn graphics_handle(&self) -> Arc<Mutex<crate::graphics_filter::GraphicsQueue>> {
         Arc::clone(&self.graphics_queue)
+    }
+
+    /// Drain the prompt-marker queue (N35a), returning all pending
+    /// prompt-marker events in order.
+    pub fn drain_markers(&mut self) -> Vec<crate::prompt_marker::PromptMarkerEvent> {
+        self.marker_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+    }
+
+    /// A clone of the shared prompt-marker-queue handle (N35a): the PTY
+    /// `EventLoop` filter pushes marker events into the same queue the
+    /// headless [`Engine::feed`] path uses, so both paths feed one
+    /// byte-bounded queue.
+    pub fn markers_handle(&self) -> Arc<Mutex<crate::prompt_marker::MarkerQueue>> {
+        Arc::clone(&self.marker_queue)
     }
 
     /// Current terminal modes.

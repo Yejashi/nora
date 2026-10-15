@@ -14,6 +14,7 @@ pub mod graphics_image;
 pub mod ime;
 pub mod input;
 pub mod layout;
+pub mod prompt_marker;
 pub mod render;
 pub mod search;
 pub mod session;
