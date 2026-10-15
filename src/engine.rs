@@ -71,6 +71,16 @@ pub struct Engine {
     /// Bounded store of detected prompt markers (N35b): drained from
     /// [`marker_queue`] and consulted by prompt navigation.
     marker_store: crate::prompt_marker::MarkerStore,
+    /// The child's current working directory (N35d): the most recent OSC 7
+    /// `file://` path, shared between the headless `Engine::feed` path and
+    /// the PTY `EventLoop` filter. `None` until the child reports one.
+    cwd: Arc<Mutex<Option<String>>>,
+    /// Byte-bounded queue of hyperlink events, shared between the
+    /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35d).
+    hyperlink_queue: Arc<Mutex<crate::prompt_marker::HyperlinkQueue>>,
+    /// Bounded store of detected hyperlinks (N35d): drained from
+    /// [`hyperlink_queue`] and consulted by hyperlink activation.
+    hyperlink_store: crate::prompt_marker::HyperlinkStore,
 }
 
 /// Kitty keyboard protocol modes (N21a).
@@ -476,6 +486,35 @@ pub struct LineDamage {
     pub right: usize,
 }
 
+/// Build the opener process argv for a hyperlink URI (N35d).
+///
+/// Only allowed schemes are opened: `http`, `https`, `mailto`, `file`,
+/// and `ftp`. The URL is passed as a single argv element to the platform
+/// opener (`xdg-open` on Linux) — never interpolated into a shell command.
+/// Returns `None` for an empty URI or a disallowed/missing scheme.
+pub fn opener_argv(uri: &str) -> Option<Vec<String>> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return None;
+    }
+    // The scheme is the part before the first `:`, `/`, or `?`. It must be
+    // ASCII alphabetic (RFC 3986 schemes are `alpha *( alpha / digit /
+    // "+" / "-" / "." )`; the allow-list below is alphabetic only).
+    let scheme_end = uri.find([':', '/', '?'])?;
+    let scheme = &uri[..scheme_end];
+    if !scheme.chars().all(|c| c.is_ascii_alphabetic()) || scheme.is_empty() {
+        return None;
+    }
+    let allowed = matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "mailto" | "file" | "ftp"
+    );
+    if !allowed {
+        return None;
+    }
+    Some(vec!["xdg-open".to_string(), uri.to_string()])
+}
+
 impl Engine {
     /// Create a headless engine with a `rows` × `cols` viewport and no
     /// scrollback.
@@ -513,6 +552,9 @@ impl Engine {
             marker_filter: crate::prompt_marker::PromptMarkerFilter::new(),
             marker_queue: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
             marker_store: crate::prompt_marker::MarkerStore::new(),
+            cwd: Arc::new(Mutex::new(None)),
+            hyperlink_queue: Arc::new(Mutex::new(crate::prompt_marker::HyperlinkQueue::new())),
+            hyperlink_store: crate::prompt_marker::HyperlinkStore::new(),
         }
     }
 
@@ -590,17 +632,40 @@ impl Engine {
                 let line = term.grid().cursor.point.line.0;
                 let scrolled = term.grid().total_scrolled();
                 let pulled = term.grid().total_pulled();
-                let entry = crate::prompt_marker::MarkerAtLine {
-                    line,
-                    scrolled,
-                    pulled,
-                    event,
-                };
-                let mut queue = self
-                    .marker_queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                queue.push(entry);
+                match event {
+                    crate::prompt_marker::ShellEvent::Marker(m) => {
+                        let entry = crate::prompt_marker::MarkerAtLine {
+                            line,
+                            scrolled,
+                            pulled,
+                            event: m,
+                        };
+                        let mut queue = self
+                            .marker_queue
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        queue.push(entry);
+                    }
+                    crate::prompt_marker::ShellEvent::Cwd(path) => {
+                        let mut cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
+                        *cwd = Some(path);
+                    }
+                    crate::prompt_marker::ShellEvent::Hyperlink(uri) => {
+                        let col = term.grid().cursor.point.column.0;
+                        let entry = crate::prompt_marker::HyperlinkAtLine {
+                            line,
+                            col,
+                            scrolled,
+                            pulled,
+                            uri,
+                        };
+                        let mut queue = self
+                            .hyperlink_queue
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        queue.push(entry);
+                    }
+                }
                 pos = marker_pos;
             }
             self.processor.advance(&mut *term, &forward[pos..]);
@@ -885,6 +950,109 @@ impl Engine {
         let delta = target as i64 - current as i64;
         if delta != 0 {
             self.scroll(Scroll::Delta(delta as i32));
+        }
+    }
+
+    /// The child's current working directory (N35d): the most recent OSC 7
+    /// `file://` path, or `None` when the child has not reported one.
+    pub fn cwd(&self) -> Option<String> {
+        self.cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A clone of the shared hyperlink-queue handle (N35d): the PTY
+    /// `EventLoop` filter pushes hyperlink events into the same queue the
+    /// headless [`Engine::feed`] path uses.
+    pub fn hyperlink_handle(&self) -> Arc<Mutex<crate::prompt_marker::HyperlinkQueue>> {
+        Arc::clone(&self.hyperlink_queue)
+    }
+
+    /// A clone of the shared cwd handle (N35d): the PTY `EventLoop` filter
+    /// writes the child's current directory into the same cell the
+    /// headless `Engine::feed` path writes and [`Engine::cwd`] reads.
+    pub fn cwd_handle(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.cwd)
+    }
+
+    /// Drain the hyperlink queue (N35d), returning all pending hyperlink
+    /// entries in order.
+    ///
+    /// Each drained entry is also inserted into the engine's
+    /// [`HyperlinkStore`](crate::prompt_marker::HyperlinkStore), so it can
+    /// be consulted by hyperlink activation.
+    pub fn drain_hyperlinks(&mut self) -> Vec<crate::prompt_marker::HyperlinkAtLine> {
+        let entries = self
+            .hyperlink_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain();
+        for entry in &entries {
+            self.hyperlink_store.insert(entry.clone());
+        }
+        entries
+    }
+
+    /// The number of hyperlinks in the engine's store (N35d).
+    pub fn hyperlink_count(&self) -> usize {
+        self.hyperlink_store.len()
+    }
+
+    /// Find the hyperlink at the viewport position `(row, col)` (N35d).
+    ///
+    /// Returns the URI of the hyperlink whose current grid line matches
+    /// the clicked viewport row and whose start column is at or before
+    /// `col`. When several hyperlinks match, the one with the greatest
+    /// start column (the most recent link start on that line) is returned.
+    /// Returns `None` when no hyperlink matches.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        let (target_line, scrolled_now, pulled_now) = {
+            let term = self.term.lock();
+            let display_offset = term.grid().display_offset() as i32;
+            let line = row as i32 - display_offset;
+            (
+                line,
+                term.grid().total_scrolled(),
+                term.grid().total_pulled(),
+            )
+        };
+        let mut best: Option<(usize, String)> = None;
+        for (_id, entry) in self.hyperlink_store.iter() {
+            if entry.col > col {
+                continue;
+            }
+            if entry.current_line(scrolled_now, pulled_now) != Some(target_line) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(bc, _)| entry.col >= *bc) {
+                best = Some((entry.col, entry.uri.clone()));
+            }
+        }
+        best.map(|(_, uri)| uri)
+    }
+
+    /// Activate the hyperlink at the viewport position `(row, col)`
+    /// (N35d).
+    ///
+    /// Returns the opener process argv for the hyperlink at that
+    /// position, or `None` when there is no hyperlink there or its scheme
+    /// is not allowed. The URL is passed as a single argv element (never
+    /// interpolated into a shell command). The matched hyperlink is
+    /// consumed (removed from the queue) whether or not its scheme is
+    /// allowed.
+    pub fn activate_hyperlink(&mut self, row: usize, col: usize) -> Option<Vec<String>> {
+        let mut queue = self
+            .hyperlink_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let idx = queue
+            .iter()
+            .find(|(_, h)| h.line == row as i32 && h.col == col)
+            .map(|(i, _)| i);
+        match idx {
+            Some(i) => queue.remove_at(i).and_then(|h| opener_argv(&h.uri)),
+            None => None,
         }
     }
 

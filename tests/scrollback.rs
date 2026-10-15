@@ -9,7 +9,7 @@
 
 use alacritty_terminal::grid::Scroll;
 
-use nora::engine::{Damage, Engine};
+use nora::engine::{Damage, Engine, opener_argv};
 
 /// Feed `count` lines of `line\n` to the engine in one chunk. Each
 /// newline past the viewport bottom pushes one line into scrollback
@@ -408,4 +408,182 @@ fn select_previous_command_across_scroll() {
         1,
         "viewport scrolled so the command's output is visible"
     );
+}
+
+// ---------------------------------------------------------------------------
+// N35d: hyperlink activation opener resolution (pure function)
+// ---------------------------------------------------------------------------
+
+/// `opener_argv` for an `https` URI returns `["xdg-open", <uri>]`.
+#[test]
+fn opener_argv_http() {
+    assert_eq!(
+        opener_argv("https://example.com"),
+        Some(vec![
+            "xdg-open".to_string(),
+            "https://example.com".to_string()
+        ])
+    );
+}
+
+/// `opener_argv` for a `mailto` URI returns `["xdg-open", <uri>]`.
+#[test]
+fn opener_argv_mailto() {
+    assert_eq!(
+        opener_argv("mailto:user@example.com"),
+        Some(vec![
+            "xdg-open".to_string(),
+            "mailto:user@example.com".to_string()
+        ])
+    );
+}
+
+/// `opener_argv` for a `file` URI returns `["xdg-open", <uri>]`.
+#[test]
+fn opener_argv_file() {
+    assert_eq!(
+        opener_argv("file:///home/user"),
+        Some(vec![
+            "xdg-open".to_string(),
+            "file:///home/user".to_string()
+        ])
+    );
+}
+
+/// `opener_argv` for a disallowed scheme (`javascript`) returns `None`.
+#[test]
+fn opener_argv_disallowed_scheme() {
+    assert_eq!(opener_argv("javascript:alert(1)"), None);
+}
+
+/// `opener_argv` for an empty URI returns `None`.
+#[test]
+fn opener_argv_empty() {
+    assert_eq!(opener_argv(""), None);
+}
+
+/// `opener_argv` for a URI with no scheme returns `None`.
+#[test]
+fn opener_argv_no_scheme() {
+    assert_eq!(opener_argv("example.com/path"), None);
+}
+
+/// `opener_argv` trims surrounding whitespace before resolving.
+#[test]
+fn opener_argv_whitespace_trimmed() {
+    assert_eq!(
+        opener_argv("  https://example.com  "),
+        Some(vec![
+            "xdg-open".to_string(),
+            "https://example.com".to_string()
+        ])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N35d: engine cwd tracking (OSC 7)
+// ---------------------------------------------------------------------------
+
+/// Wrap an OSC data string in a full OSC frame: `ESC ] <data> ESC \`.
+fn osc(data: &str) -> Vec<u8> {
+    let mut out = vec![0x1B, 0x5D]; // ESC ]
+    out.extend_from_slice(data.as_bytes());
+    out.push(0x1B); // ESC
+    out.push(0x5C); // \ (ST terminator)
+    out
+}
+
+/// A fresh engine reports no cwd.
+#[test]
+fn engine_cwd_none_initial() {
+    let engine = Engine::new(24, 80);
+    assert_eq!(engine.cwd(), None, "fresh engine has no cwd");
+}
+
+/// Feeding `OSC 7 ; file:///home/user ST` sets the engine's cwd.
+#[test]
+fn engine_cwd_from_osc7() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(&osc("7;file:///home/user"));
+    assert_eq!(
+        engine.cwd(),
+        Some("/home/user".to_string()),
+        "OSC 7 file:// path sets the cwd"
+    );
+}
+
+/// A later `OSC 7` overwrites the earlier cwd.
+#[test]
+fn engine_cwd_overwrites() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(&osc("7;file:///home/user"));
+    engine.feed(&osc("7;file:///tmp"));
+    assert_eq!(engine.cwd(), Some("/tmp".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// N35d: engine hyperlink drain and activation (OSC 8)
+// ---------------------------------------------------------------------------
+
+/// A fresh engine has no hyperlinks.
+#[test]
+fn engine_hyperlink_none_initial() {
+    let mut engine = Engine::new(24, 80);
+    assert!(engine.drain_hyperlinks().is_empty());
+}
+
+/// Feeding `OSC 8 ; ; URI ST` records a hyperlink at the cursor's cell;
+/// `activate_hyperlink` at that cell resolves the opener and consumes the
+/// hyperlink.
+#[test]
+fn engine_hyperlink_drain_and_activate() {
+    let mut engine = Engine::new(24, 80);
+    // Feed a hyperlink; the cursor starts at row 0, col 0.
+    engine.feed(&osc("8;;https://example.com"));
+    let drained = engine.drain_hyperlinks();
+    assert_eq!(drained.len(), 1, "one hyperlink drained");
+    let h = &drained[0];
+    assert_eq!(h.uri, "https://example.com");
+    assert_eq!(h.line, 0, "hyperlink at the cursor row");
+    assert_eq!(h.col, 0, "hyperlink at col 0");
+
+    // A fresh engine: activate at the hyperlink's cell resolves the
+    // opener and consumes it.
+    let mut engine = Engine::new(24, 80);
+    engine.feed(&osc("8;;https://example.com"));
+    let opener = engine.activate_hyperlink(0, 0);
+    assert_eq!(
+        opener,
+        Some(vec![
+            "xdg-open".to_string(),
+            "https://example.com".to_string()
+        ])
+    );
+
+    // The hyperlink was consumed by activation.
+    assert!(engine.drain_hyperlinks().is_empty());
+}
+
+/// `activate_hyperlink` at a cell with no hyperlink returns `None` and
+/// leaves the hyperlink unconsumed.
+#[test]
+fn engine_hyperlink_activate_wrong_cell() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(&osc("8;;https://example.com"));
+    // Activate at the wrong cell (row 22, not 0).
+    assert_eq!(engine.activate_hyperlink(22, 0), None);
+    // The hyperlink is still present.
+    assert_eq!(engine.drain_hyperlinks().len(), 1);
+}
+
+/// `activate_hyperlink` for a disallowed scheme returns `None` and still
+/// consumes the hyperlink.
+#[test]
+fn engine_hyperlink_activate_disallowed_scheme() {
+    let mut engine = Engine::new(24, 80);
+    engine.feed(&osc("8;;javascript:alert(1)"));
+    // The hyperlink is at row 0, col 0.
+    assert_eq!(engine.activate_hyperlink(0, 0), None);
+    // The hyperlink was consumed despite the disallowed scheme.
+    assert!(engine.drain_hyperlinks().is_empty());
 }

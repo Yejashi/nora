@@ -51,6 +51,40 @@ impl PromptMarkerEvent {
     }
 }
 
+/// A shell-integration event detected by the filter (N35a/N35d/hyperlinks).
+///
+/// The filter runs in parallel with the vte parser and extracts OSC
+/// sequences that carry shell-integration metadata:
+/// - [`ShellEvent::Marker`] — an OSC 133 prompt marker.
+/// - [`ShellEvent::Cwd`] — an OSC 7 current-directory update (the decoded
+///   path).
+/// - [`ShellEvent::Hyperlink`] — an OSC 8 hyperlink (the URI).
+///
+/// Cwd and hyperlink values are metadata, not authorization: they are
+/// never used to read files or spawn commands directly (hyperlink
+/// activation goes through a validated opener argv, see
+/// [`crate::engine::opener_argv`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellEvent {
+    /// An OSC 133 prompt marker.
+    Marker(PromptMarkerEvent),
+    /// An OSC 7 current-directory update (the decoded path).
+    Cwd(String),
+    /// An OSC 8 hyperlink (the URI).
+    Hyperlink(String),
+}
+
+impl ShellEvent {
+    /// The byte cost of this event (for queue/store bounding).
+    pub fn byte_cost(&self) -> usize {
+        match self {
+            ShellEvent::Marker(e) => e.byte_cost(),
+            ShellEvent::Cwd(s) => s.len(),
+            ShellEvent::Hyperlink(s) => s.len(),
+        }
+    }
+}
+
 /// The byte cap for the [`MarkerQueue`] (1 MiB, matching the graphics
 /// queue cap).
 const MAX_MARKER_BYTES: usize = 1024 * 1024;
@@ -249,6 +283,199 @@ impl MarkerStore {
     }
 }
 
+/// A hyperlink paired with the grid line it was detected on (N35d).
+///
+/// `line`/`scrolled`/`pulled` are recorded exactly as for
+/// [`MarkerAtLine`], so the hyperlink's current grid line stays correct
+/// across scrolls and vertical resizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperlinkAtLine {
+    /// The grid line the hyperlink was detected on.
+    pub line: i32,
+    /// The grid column the hyperlink started at (stable across vertical
+    /// scrolls; used to disambiguate multiple links on one line).
+    pub col: usize,
+    /// The grid's `total_scrolled` counter when it was detected.
+    pub scrolled: u64,
+    /// The grid's `total_pulled` counter when it was detected.
+    pub pulled: u64,
+    /// The hyperlink URI.
+    pub uri: String,
+}
+
+impl HyperlinkAtLine {
+    /// The byte cost of this entry (for queue/store bounding).
+    pub fn byte_cost(&self) -> usize {
+        self.uri.len()
+    }
+
+    /// The hyperlink's current grid line, given the grid's `total_scrolled`
+    /// and `total_pulled` counters now. Returns `None` when it has scrolled
+    /// out of the reachable range.
+    pub fn current_line(&self, total_scrolled_now: u64, total_pulled_now: u64) -> Option<i32> {
+        let delta_scrolled = total_scrolled_now.saturating_sub(self.scrolled) as i64;
+        let delta_pulled = total_pulled_now.saturating_sub(self.pulled) as i64;
+        (self.line as i64 - delta_scrolled + delta_pulled)
+            .try_into()
+            .ok()
+    }
+}
+
+/// A byte-bounded queue of [`HyperlinkAtLine`]s (mirrors [`MarkerQueue`]).
+#[derive(Debug, Clone, Default)]
+pub struct HyperlinkQueue {
+    events: VecDeque<HyperlinkAtLine>,
+    total_bytes: usize,
+}
+
+impl HyperlinkQueue {
+    /// Create an empty queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push an entry, evicting the oldest entry(ies) if the total byte
+    /// cost exceeds [`MAX_MARKER_BYTES`].
+    pub fn push(&mut self, entry: HyperlinkAtLine) {
+        self.total_bytes += entry.byte_cost();
+        self.events.push_back(entry);
+        while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
+            if let Some(old) = self.events.pop_front() {
+                self.total_bytes -= old.byte_cost();
+            }
+        }
+    }
+
+    /// Drain the queue, returning all entries in order (oldest first).
+    pub fn drain(&mut self) -> Vec<HyperlinkAtLine> {
+        self.total_bytes = 0;
+        self.events.drain(..).collect()
+    }
+
+    /// Remove and return the entry at `index`, or `None` if out of range.
+    pub fn remove_at(&mut self, index: usize) -> Option<HyperlinkAtLine> {
+        let len = self.events.len();
+        if index >= len {
+            return None;
+        }
+        let mut removed: Option<HyperlinkAtLine> = None;
+        let mut kept = VecDeque::with_capacity(len - 1);
+        for (i, e) in self.events.drain(..).enumerate() {
+            if i == index {
+                removed = Some(e);
+            } else {
+                kept.push_back(e);
+            }
+        }
+        self.events = kept;
+        if let Some(entry) = removed {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.byte_cost());
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// The current total byte cost of the queue.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// The number of entries in the queue.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Iterate over the entries in order (oldest first), yielding
+    /// `(index, &entry)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &HyperlinkAtLine)> + '_ {
+        self.events.iter().enumerate()
+    }
+}
+
+/// A bounded store of detected hyperlinks (mirrors [`MarkerStore`]).
+#[derive(Debug)]
+pub struct HyperlinkStore {
+    links: HashMap<usize, HyperlinkAtLine>,
+    total_bytes: usize,
+    next_id: usize,
+}
+
+impl Default for HyperlinkStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HyperlinkStore {
+    /// Create an empty store (1-based auto-assigned IDs).
+    pub fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+            total_bytes: 0,
+            next_id: 1,
+        }
+    }
+
+    /// Store a hyperlink, auto-assigning the next 1-based ID. Returns the
+    /// ID on success, or `None` when the [`MAX_MARKERS`] cap is exceeded.
+    pub fn insert(&mut self, entry: HyperlinkAtLine) -> Option<usize> {
+        if self.links.len() >= MAX_MARKERS {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.total_bytes += entry.byte_cost();
+        self.links.insert(id, entry);
+        Some(id)
+    }
+
+    /// The number of stored hyperlinks.
+    pub fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.links.is_empty()
+    }
+
+    /// Query a hyperlink by ID.
+    pub fn query(&self, id: usize) -> Option<&HyperlinkAtLine> {
+        self.links.get(&id)
+    }
+
+    /// Iterate over all stored hyperlinks as `(id, &HyperlinkAtLine)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &HyperlinkAtLine)> + '_ {
+        self.links.iter().map(|(id, entry)| (*id, entry))
+    }
+
+    /// Delete a hyperlink by ID, returning it if present.
+    pub fn delete(&mut self, id: usize) -> Option<HyperlinkAtLine> {
+        let entry = self.links.remove(&id)?;
+        self.total_bytes -= entry.byte_cost();
+        Some(entry)
+    }
+
+    /// Remove all hyperlinks, returning the number removed.
+    pub fn clear(&mut self) -> usize {
+        let n = self.links.len();
+        self.total_bytes = 0;
+        self.links.clear();
+        n
+    }
+
+    /// The total byte cost of all stored hyperlinks.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
 /// The filter's state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterState {
@@ -290,9 +517,9 @@ impl PromptMarkerFilter {
     /// `events` as `(position, PromptMarkerEvent)` pairs, where `position`
     /// is the index in `forwarded` at which the marker was detected (i.e.
     /// the number of forwarded bytes before the marker).
-    pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<(usize, PromptMarkerEvent)>) {
+    pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<(usize, ShellEvent)>) {
         let mut out: Vec<u8> = Vec::new();
-        let mut events: Vec<(usize, PromptMarkerEvent)> = Vec::new();
+        let mut events: Vec<(usize, ShellEvent)> = Vec::new();
         for &byte in bytes {
             match self.state {
                 FilterState::Pass => {
@@ -359,21 +586,38 @@ impl PromptMarkerFilter {
     fn complete_frame(
         &mut self,
         out: &mut Vec<u8>,
-        events: &mut Vec<(usize, PromptMarkerEvent)>,
+        events: &mut Vec<(usize, ShellEvent)>,
         terminator: &[u8],
     ) {
         let data = std::mem::take(&mut self.buffer);
         self.state = FilterState::Pass;
-        match parse_marker(&data) {
-            Some(kind) => {
+        match classify_frame(&data) {
+            FrameAction::Marker(kind) => {
                 // Well-formed OSC 133 marker: suppress the frame. Record
                 // the position in the forwarded stream (the number of
                 // forwarded bytes before this marker).
-                events.push((out.len(), PromptMarkerEvent { kind }));
+                events.push((out.len(), ShellEvent::Marker(PromptMarkerEvent { kind })));
             }
-            None => {
-                // Not a marker (or malformed): forward the whole frame
-                // unchanged (`ESC ] <data> <terminator>`).
+            FrameAction::Cwd(path) => {
+                // OSC 7 cwd update: suppress the frame (metadata, no
+                // display effect) and record the position.
+                events.push((out.len(), ShellEvent::Cwd(path)));
+            }
+            FrameAction::Hyperlink(uri) => {
+                // OSC 8 hyperlink: forward the frame (it has a display
+                // effect — link styling — handled by the parser) and
+                // record the position at the frame's start.
+                let pos = out.len();
+                events.push((pos, ShellEvent::Hyperlink(uri)));
+                out.push(0x1B);
+                out.push(0x5D);
+                out.extend_from_slice(&data);
+                out.extend_from_slice(terminator);
+            }
+            FrameAction::Forward => {
+                // Not a recognized shell-integration frame (or
+                // malformed): forward the whole frame unchanged
+                // (`ESC ] <data> <terminator>`).
                 out.push(0x1B);
                 out.push(0x5D);
                 out.extend_from_slice(&data);
@@ -416,4 +660,125 @@ fn parse_marker(data: &[u8]) -> Option<MarkerKind> {
         b"D" => Some(MarkerKind::D),
         _ => None,
     }
+}
+
+/// What to do with a completed OSC frame.
+#[derive(Debug, Clone)]
+enum FrameAction {
+    /// A well-formed OSC 133 marker: suppress and emit a marker event.
+    Marker(MarkerKind),
+    /// An OSC 7 cwd update: suppress and emit a cwd event.
+    Cwd(String),
+    /// An OSC 8 hyperlink: forward and emit a hyperlink event.
+    Hyperlink(String),
+    /// Forward the frame unchanged (no event).
+    Forward,
+}
+
+/// Classify a completed OSC frame's data (the bytes between `]` and the
+/// terminator).
+///
+/// Returns the action to take:
+/// - OSC 133 with a valid kind → [`FrameAction::Marker`].
+/// - OSC 7 with a valid `file://` local path → [`FrameAction::Cwd`].
+/// - OSC 8 with a non-empty URI → [`FrameAction::Hyperlink`].
+/// - Anything else → [`FrameAction::Forward`] (forward unchanged).
+fn classify_frame(data: &[u8]) -> FrameAction {
+    // Split on the first `;`.
+    let semi = match data.iter().position(|&b| b == b';') {
+        Some(p) => p,
+        None => return FrameAction::Forward,
+    };
+    let head = &data[..semi];
+    let rest = &data[semi + 1..];
+    let head = head.strip_suffix(b" ").unwrap_or(head);
+    match std::str::from_utf8(head) {
+        Ok("133") => match parse_marker(data) {
+            Some(kind) => FrameAction::Marker(kind),
+            None => FrameAction::Forward,
+        },
+        Ok("7") => match parse_cwd(rest) {
+            Some(path) => FrameAction::Cwd(path),
+            None => FrameAction::Forward,
+        },
+        Ok("8") => match parse_hyperlink(rest) {
+            Some(uri) => FrameAction::Hyperlink(uri),
+            None => FrameAction::Forward,
+        },
+        _ => FrameAction::Forward,
+    }
+}
+
+/// Parse an OSC 7 cwd frame's data (the bytes after `7;`).
+///
+/// Accepts either a `file://` URI for a local path (host empty or
+/// `localhost`, path absolute, percent-decoded) or a bare absolute path.
+/// Returns the path, or `None` when the frame is not a valid local path.
+fn parse_cwd(data: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(data).ok()?;
+    if let Some(rest) = s.strip_prefix("file://") {
+        // `rest` is `host/path`. Split on the first `/`.
+        let slash = rest.find('/')?;
+        let host = &rest[..slash];
+        let path = &rest[slash..];
+        // The host must be empty or `localhost` (local path only).
+        if !host.is_empty() && host != "localhost" {
+            return None;
+        }
+        // The path must be absolute.
+        if !path.starts_with('/') {
+            return None;
+        }
+        Some(percent_decode(path))
+    } else {
+        // A bare path (no `file://` scheme). Must be absolute.
+        if !s.starts_with('/') {
+            return None;
+        }
+        Some(s.to_string())
+    }
+}
+
+/// Parse an OSC 8 hyperlink frame's data (the bytes after `8;`), which is
+/// `params;URI`.
+///
+/// The params are `;`-separated `key=value` pairs (ignored); the URI is
+/// the last `;`-separated field. Returns the URI, or `None` when it is
+/// empty. (Senders percent-encode any `;` inside the URI, so the last
+/// field is unambiguously the URI.)
+fn parse_hyperlink(data: &[u8]) -> Option<String> {
+    let fields: Vec<&[u8]> = data.split(|&b| b == b';').collect();
+    let uri_field = fields.last()?;
+    if uri_field.is_empty() {
+        return None;
+    }
+    let uri = std::str::from_utf8(uri_field).ok()?;
+    if uri.is_empty() {
+        return None;
+    }
+    Some(uri.to_string())
+}
+
+/// Percent-decode a string (`%XX` → byte `XX`). Non-`%` bytes are copied
+/// through; a malformed escape (not followed by two hex digits) is copied
+/// as the literal `%`.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = if bytes[i] == b'%' && i + 2 < bytes.len() {
+            u8::from_str_radix(&s[i + 1..i + 3], 16).ok()
+        } else {
+            None
+        };
+        if let Some(v) = decoded {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

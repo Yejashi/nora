@@ -9,6 +9,7 @@
 
 use nora::prompt_marker::{
     MarkerAtLine, MarkerKind, MarkerQueue, MarkerStore, PromptMarkerEvent, PromptMarkerFilter,
+    ShellEvent,
 };
 
 /// Wrap an OSC data string in a full OSC frame: `ESC ] <data> ESC \`.
@@ -20,8 +21,13 @@ fn osc(data: &str) -> Vec<u8> {
     out
 }
 
-/// A single prompt-marker event.
-fn ev(kind: MarkerKind) -> PromptMarkerEvent {
+/// A single prompt-marker shell event (the filter's output type).
+fn ev(kind: MarkerKind) -> ShellEvent {
+    ShellEvent::Marker(PromptMarkerEvent { kind })
+}
+
+/// A bare marker event (the `MarkerAtLine.event` field type).
+fn marker_event(kind: MarkerKind) -> PromptMarkerEvent {
     PromptMarkerEvent { kind }
 }
 
@@ -31,7 +37,7 @@ fn entry(kind: MarkerKind) -> MarkerAtLine {
         line: 0,
         scrolled: 0,
         pulled: 0,
-        event: ev(kind),
+        event: marker_event(kind),
     }
 }
 
@@ -280,6 +286,129 @@ fn filter_chunking_reassembles() {
 }
 
 // ---------------------------------------------------------------------------
+// Filter: OSC 7 cwd frames (N35d)
+// ---------------------------------------------------------------------------
+
+/// Feed `OSC 7 ; file:///home/user ST`; assert one `Cwd` event with the
+/// decoded path and the frame is suppressed.
+#[test]
+fn filter_cwd_file_uri() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("7;file:///home/user");
+    let (forward, events) = filter.process(&bytes);
+    assert!(forward.is_empty(), "well-formed cwd frame suppressed");
+    assert_eq!(events, vec![(0, ShellEvent::Cwd("/home/user".to_string()))]);
+}
+
+/// Feed `OSC 7 ; /relative/path ST` (no `file://` prefix); assert one
+/// `Cwd` event with the raw path.
+#[test]
+fn filter_cwd_relative_path() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("7;/relative/path");
+    let (forward, events) = filter.process(&bytes);
+    assert!(forward.is_empty());
+    assert_eq!(
+        events,
+        vec![(0, ShellEvent::Cwd("/relative/path".to_string()))]
+    );
+}
+
+/// Feed `OSC 7 ; http://example.com ST` (non-file scheme); assert no
+/// event and the frame is forwarded unchanged.
+#[test]
+fn filter_cwd_non_file_scheme_forwarded() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("7;http://example.com");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes, "non-file cwd frame forwarded unchanged");
+    assert!(events.is_empty(), "no event for a non-file cwd");
+}
+
+/// Feed `OSC 7 ST` (no path); assert no event and the frame is forwarded
+/// unchanged.
+#[test]
+fn filter_cwd_no_path() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("7");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes);
+    assert!(events.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Filter: OSC 8 hyperlink frames (N35d)
+// ---------------------------------------------------------------------------
+
+/// Feed `OSC 8 ; ; https://example.com ST`; assert one `Hyperlink` event
+/// with the URI and the frame is forwarded (display effect).
+#[test]
+fn filter_hyperlink_basic() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("8;;https://example.com");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes, "hyperlink frame forwarded");
+    assert_eq!(
+        events,
+        vec![(0, ShellEvent::Hyperlink("https://example.com".to_string()))]
+    );
+}
+
+/// Feed `OSC 8 ; id=123 ; https://example.com ST`; assert one `Hyperlink`
+/// event (params are ignored, URI is the last part) and the frame is
+/// forwarded.
+#[test]
+fn filter_hyperlink_with_params() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("8;id=123;https://example.com");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes);
+    assert_eq!(
+        events,
+        vec![(0, ShellEvent::Hyperlink("https://example.com".to_string()))]
+    );
+}
+
+/// Feed `OSC 8 ;; ST` (empty URI); assert no event and the frame is
+/// forwarded unchanged.
+#[test]
+fn filter_hyperlink_empty_uri() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("8;;");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes);
+    assert!(events.is_empty());
+}
+
+/// Feed `OSC 8 ; id=123 ; ST` (params but no URI); assert no event and the
+/// frame is forwarded unchanged.
+#[test]
+fn filter_hyperlink_no_uri_part() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("8;id=123;");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes);
+    assert!(events.is_empty());
+}
+
+/// Feed a hyperlink with a `file://` URI; assert one `Hyperlink` event and
+/// the frame is forwarded.
+#[test]
+fn filter_hyperlink_file_uri() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("8;;file:///home/user/doc.txt");
+    let (forward, events) = filter.process(&bytes);
+    assert_eq!(forward, bytes);
+    assert_eq!(
+        events,
+        vec![(
+            0,
+            ShellEvent::Hyperlink("file:///home/user/doc.txt".to_string())
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // MarkerQueue: byte-bounded
 // ---------------------------------------------------------------------------
 
@@ -435,7 +564,7 @@ fn current_line_no_scroll() {
         line: 0,
         scrolled: 0,
         pulled: 0,
-        event: ev(MarkerKind::A),
+        event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(0, 0), Some(0));
 }
@@ -448,7 +577,7 @@ fn current_line_after_scroll() {
         line: 0,
         scrolled: 0,
         pulled: 0,
-        event: ev(MarkerKind::A),
+        event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(3, 0), Some(-3));
 }
@@ -461,7 +590,7 @@ fn current_line_above_bottom() {
         line: -2,
         scrolled: 10,
         pulled: 0,
-        event: ev(MarkerKind::A),
+        event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(15, 0), Some(-7));
 }
@@ -474,7 +603,7 @@ fn current_line_after_resize_pull() {
         line: 23,
         scrolled: 8,
         pulled: 0,
-        event: ev(MarkerKind::A),
+        event: marker_event(MarkerKind::A),
     };
     // 10 lines scrolled (total_scrolled 8 -> 18) and a resize pulled 5
     // lines from history (total_pulled 0 -> 5).
@@ -490,7 +619,7 @@ fn current_line_saturates() {
         line: 0,
         scrolled: 10,
         pulled: 0,
-        event: ev(MarkerKind::A),
+        event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(5, 0), Some(0));
 }

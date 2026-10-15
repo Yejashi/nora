@@ -60,16 +60,18 @@ pub trait Filter {
     fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>);
 
     /// Called by the event loop after processing the segment ending at
-    /// `position`, with the cursor's grid line and the grid's monotonic
-    /// `total_scrolled` and `total_pulled` counters at that point.
-    /// Implementors use this to record each marker's grid position (N35b);
-    /// storing both counters lets them recompute the marker's current line
-    /// later, which stays correct across scrolls and across vertical
-    /// resizes that pull lines from history.
+    /// `position`, with the cursor's grid line and column and the grid's
+    /// monotonic `total_scrolled` and `total_pulled` counters at that
+    /// point.
+    /// Implementors use this to record each shell event's grid position
+    /// (N35b/N35d); storing both counters lets them recompute the event's
+    /// current line later, which stays correct across scrolls and across
+    /// vertical resizes that pull lines from history.
     fn on_marker(
         &mut self,
         _position: usize,
         _cursor_line: i32,
+        _cursor_col: usize,
         _total_scrolled: u64,
         _total_pulled: u64,
     ) {
@@ -224,10 +226,11 @@ where
                 for &mpos in &marker_positions {
                     state.parser.advance(&mut **terminal, &to_parse[pos..mpos]);
                     let line = terminal.grid().cursor.point.line.0;
+                    let col = terminal.grid().cursor.point.column.0;
                     let scrolled = terminal.grid().total_scrolled();
                     let pulled = terminal.grid().total_pulled();
                     if let Some(filter) = self.filter.as_mut() {
-                        filter.on_marker(mpos, line, scrolled, pulled);
+                        filter.on_marker(mpos, line, col, scrolled, pulled);
                     }
                     pos = mpos;
                 }
