@@ -13,9 +13,14 @@ history = 1000
 mouse = false
 
 [font]
-# Font family, and size in points (0 < size <= 1000).
+# Font family: a fontconfig family name (e.g. "JetBrains Mono",
+# "FiraCode Nerd Font Mono"), or "monospace" for nora's default chain
+# (Noto Sans Mono, DejaVu Sans Mono, fontconfig's monospace). Bold and
+# italic faces of the family are used when installed.
 family = "monospace"
-size = 12.0
+# Size in points (0 < size <= 1000); 1 pt = 4/3 px at 96 DPI, scaled by
+# the display's scale factor. Ctrl+Shift+Plus/Minus/0 zoom from here.
+size = 15.0
 
 [theme]
 # Colors are #RRGGBB.

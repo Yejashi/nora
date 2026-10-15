@@ -58,7 +58,7 @@ fn default_config() {
     assert_eq!(c.terminal.history, 1000);
     assert!(!c.terminal.mouse);
     assert_eq!(c.font.family, "monospace");
-    assert_eq!(c.font.size, 12.0);
+    assert_eq!(c.font.size, 15.0);
     assert_eq!(c.theme.background, "#000000");
     assert_eq!(c.theme.foreground, "#ffffff");
     assert_eq!(c.theme.cursor, "#ffffff");

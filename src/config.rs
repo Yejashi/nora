@@ -92,8 +92,9 @@ fn default_font_family() -> String {
     "monospace".to_string()
 }
 
+/// 15 pt = 20 px at 96 DPI, the size nora has always rendered at.
 fn default_font_size() -> f32 {
-    12.0
+    15.0
 }
 
 /// Theme/color settings.

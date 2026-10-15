@@ -34,8 +34,7 @@ use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
     MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event,
-    logical_to_cell, mouse_modifiers, physical_to_cell, should_report, track_button,
-    wheel_directions,
+    logical_to_cell, mouse_modifiers, should_report, track_button, wheel_directions,
 };
 use nora::input::{BindingTable, InputAction, encode};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
@@ -137,18 +136,13 @@ fn platform_hint() -> String {
     }
 }
 
-/// The grid that fits the window's current *logical* size (N11a): the
-/// mono cell metrics in [`glyphs`] are logical pixels, so the derivation
-/// converts the physical inner size to logical first — correct at every
-/// scale factor, not just 1.0.
+/// The grid that fits the window's physical inner size: the cell metrics
+/// in [`glyphs::Fonts`] are physical pixels (they include the scale factor
+/// and zoom), so the grid, the renderer and the mouse mapping agree at
+/// every scale.
 pub(crate) fn window_grid(window: &Window, fonts: &glyphs::Fonts) -> (u16, u16) {
-    let logical = window.inner_size().to_logical::<f64>(window.scale_factor());
-    glyphs::grid_size(
-        logical.width as u32,
-        logical.height as u32,
-        fonts.cell_w,
-        fonts.cell_h(),
-    )
+    let size = window.inner_size();
+    glyphs::grid_size(size.width, size.height, fonts.cell_w, fonts.cell_h())
 }
 
 /// The direction to focus an adjacent pane (N24b).
@@ -273,7 +267,8 @@ impl ApplicationHandler for App {
         if self.smoke {
             // N08b2b: live render foundation — load the pinned fonts and
             // drive one full frame through the pinned wgpu 30 surface flow.
-            let mut fonts = glyphs::Fonts::load();
+            let mut fonts = glyphs::Fonts::load(&nora::config::FontConfig::default());
+            fonts.measure(window.scale_factor(), 1.0);
             println!(
                 "fonts: cell {}x{} | mono {}",
                 fonts.cell_w,
@@ -288,17 +283,9 @@ impl ApplicationHandler for App {
             } else {
                 let mut frame = graphics.acquire();
                 println!("smoke: acquire status {:?}", frame.status);
-                if let Err(message) = graphics.draw_frame(
-                    &mut frame,
-                    &mut fonts,
-                    &[],
-                    [0, 0, 0, 255],
-                    &[],
-                    &[],
-                    &[],
-                    1.0,
-                    nora::config::ZOOM_DEFAULT,
-                ) {
+                if let Err(message) =
+                    graphics.draw_frame(&mut frame, &mut fonts, &[], [0, 0, 0, 255], &[], &[], &[])
+                {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
                 graphics.present(frame);
@@ -539,6 +526,7 @@ pub fn run_windowed(
     explicit: bool,
     hold: bool,
     config: &nora::config::NoraConfig,
+    fonts: glyphs::Fonts,
 ) -> std::process::ExitCode {
     if debug_enabled() {
         eprintln!(
@@ -586,7 +574,7 @@ pub fn run_windowed(
         mods: ModifiersState::default(),
         modes: TermMode::SHOW_CURSOR,
         kitty_flags: KittyKeyboardFlags::NONE,
-        fonts: None,
+        fonts: Some(fonts),
         graphics: None,
         window: Some(window),
         failed: false,
@@ -938,6 +926,26 @@ impl WinApp {
     /// Focus an adjacent pane (N24b): `dir` is Left/Right/Up/Down. The
     /// target is the sibling (or ancestor's sibling) in that direction,
     /// found by walking the active layout tree.
+    /// Re-measure the cells for the current scale factor and zoom, then
+    /// resize every pane's grid (and PTY) to the new metrics. Called on
+    /// zoom and on a display scale-factor change.
+    fn apply_metrics(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(fonts) = self.fonts.as_mut() else {
+            return;
+        };
+        let metrics = fonts.measure(window.scale_factor(), self.zoom);
+        if debug_enabled() {
+            eprintln!(
+                "debug: cell metrics {}x{} at {:.1}px (zoom {:.1})",
+                metrics.cell_w, metrics.cell_h, metrics.font_px, self.zoom
+            );
+        }
+        self.resize_all_panes();
+    }
+
     /// Perform a bound UI action. `false` when the action had nothing to
     /// act on, so the key goes to the application instead.
     fn perform(&mut self, action: UiAction) -> bool {
@@ -980,9 +988,14 @@ impl WinApp {
                 return self.focus_pane_direction(dir);
             }
             UiAction::ToggleSearch => self.search.toggle(),
-            UiAction::ZoomIn => self.zoom = nora::config::zoom_in(self.zoom),
-            UiAction::ZoomOut => self.zoom = nora::config::zoom_out(self.zoom),
-            UiAction::ZoomReset => self.zoom = nora::config::zoom_reset(),
+            UiAction::ZoomIn | UiAction::ZoomOut | UiAction::ZoomReset => {
+                self.zoom = match action {
+                    UiAction::ZoomIn => nora::config::zoom_in(self.zoom),
+                    UiAction::ZoomOut => nora::config::zoom_out(self.zoom),
+                    _ => nora::config::zoom_reset(),
+                };
+                self.apply_metrics();
+            }
             UiAction::ScrollPageUp
             | UiAction::ScrollPageDown
             | UiAction::ScrollToTop
@@ -1376,8 +1389,8 @@ impl WinApp {
                 // so it stays legible on the block.
                 let layout = TermLayout {
                     cell_w: fonts.cell_w as f32,
-                    cell_h: glyphs::CELL_H,
-                    font_size: glyphs::zoomed_font_size(self.zoom),
+                    cell_h: fonts.cell_h() as f32,
+                    font_size: fonts.metrics.font_px,
                 };
                 if let Some(cursor) = cursor_fill(&snap, &layout) {
                     let (row, col) = (cursor.row as u32, cursor.col as u32);
@@ -1412,8 +1425,6 @@ impl WinApp {
                     &fills,
                     &selection_cells,
                     &search_cells,
-                    window.scale_factor() as f32,
-                    self.zoom,
                 ) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
@@ -1503,7 +1514,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
         };
 
-        let fonts = glyphs::Fonts::load();
+        let mut fonts = match self.fonts.take() {
+            Some(fonts) => fonts,
+            None => glyphs::Fonts::load(&nora::config::FontConfig::default()),
+        };
+        fonts.measure(window.scale_factor(), self.zoom);
         let info = graphics.adapter_info();
         println!("nora {}", env!("CARGO_PKG_VERSION"));
         println!("platform: {}", platform_hint());
@@ -1651,9 +1666,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             }
             // N11a: the window's scale factor changed (monitor move, DPI
-            // change). The physical size is unchanged — no `set_size`, no
-            // reconfigure; only the logical grid is re-derived, so the
-            // same surface now shows a different cell count.
+            // change). The cells are re-measured for the new scale (font
+            // pixels scale with it), then the grid is re-derived.
             WindowEvent::ScaleFactorChanged {
                 scale_factor: _,
                 inner_size_writer: _,
@@ -1663,8 +1677,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 if self.state.zero_size || self.state.surface_retry >= 3 {
                     return;
                 }
-                let (cols, rows) = match self.fonts.as_ref() {
-                    Some(fonts) => window_grid(&window, fonts),
+                let (cols, rows) = match self.fonts.as_mut() {
+                    Some(fonts) => {
+                        fonts.measure(window.scale_factor(), self.zoom);
+                        window_grid(&window, fonts)
+                    }
                     None => (0, 0),
                 };
                 // (c) Fold the scale change through the machine with the
@@ -1862,8 +1879,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // reports physical). While a selection drag is in
                 // progress, extend the selection to the cell under the
                 // cursor.
-                let scale = window.scale_factor();
-                let (x, y) = (position.x / scale, position.y / scale);
+                // Physical pixels, like the cell metrics and the grid.
+                let (x, y) = (position.x, position.y);
                 self.cursor = (x, y);
                 if let Some((start_row, start_col)) = self.selection
                     && self.pressed_buttons.contains(&0)
@@ -1884,13 +1901,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // and `Normal` encode to nothing without a held
                 // button).
                 if let Some(fonts) = self.fonts.as_ref()
-                    && let Some((col, row)) = physical_to_cell(
-                        position.x,
-                        position.y,
-                        scale,
-                        fonts.cell_w,
-                        fonts.cell_h(),
-                    )
+                    && let Some((col, row)) =
+                        logical_to_cell(position.x, position.y, fonts.cell_w, fonts.cell_h())
                     // Motion is reported once per cell, not per pixel.
                     && self.last_motion_cell != Some((col, row))
                 {

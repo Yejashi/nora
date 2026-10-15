@@ -556,15 +556,13 @@ impl Graphics {
     /// resolved by [`decoration_style`] and drawn as fill lines in the same
     /// pass, after the text.
     ///
-    /// `scale` is the window's scale factor (native DPI, N13d), applied as
-    /// each area's `TextArea.scale`; logical cell metrics are unchanged.
-    /// `zoom` is the window's zoom level (N19b), which scales the shaping
-    /// font size; cell-metric and grid re-derivation are staged for a
-    /// later slice.
+    /// Geometry is physical pixels throughout: `fonts.metrics` already
+    /// includes the display scale factor and the zoom level, so the grid,
+    /// fills, glyph bounds and mouse mapping agree at every scale.
     ///
     /// `search_cells` (N20b) are the viewport cells of the current
     /// search match's span, drawn as fill rectangles under the text.
-    #[allow(clippy::too_many_arguments)] // fixed render wiring: frame + fonts + cells + highlights + scale/zoom
+    #[allow(clippy::too_many_arguments)] // fixed render wiring: frame + fonts + cells + background + fills + highlights
     pub fn draw_frame(
         &mut self,
         frame: &mut Frame,
@@ -574,16 +572,17 @@ impl Graphics {
         fills: &[CellFill],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
-        scale: f32,
-        zoom: f32,
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
             return Ok(());
         };
 
-        let cell_w = fonts.cell_w;
+        // Everything is laid out in physical pixels with the measured cell
+        // metrics (font size already includes the scale factor and zoom).
+        let cell_w = fonts.metrics.cell_w;
         let cw = cell_w as f32;
-        let metrics = Metrics::new(glyphs::zoomed_font_size(zoom), glyphs::CELL_H);
+        let cell_h = fonts.metrics.cell_h as f32;
+        let metrics = Metrics::new(fonts.metrics.font_px, cell_h);
 
         // Shape every cell first (N27b): glyphon's `TextArea` borrows its
         // `Buffer`, so all buffers must be pushed before any area borrows the
@@ -613,13 +612,13 @@ impl Graphics {
             areas.push(TextArea {
                 buffer,
                 left: cell.col as f32 * cw,
-                top: cell.row as f32 * glyphs::CELL_H,
-                scale,
+                top: cell.row as f32 * cell_h,
+                scale: 1.0,
                 bounds: TextBounds {
                     left: cell.col as i32 * cell_w as i32,
-                    top: cell.row as i32 * glyphs::CELL_H as i32,
+                    top: cell.row as i32 * cell_h as i32,
                     right: (cell.col as i32 + span) * cell_w as i32,
-                    bottom: (cell.row + 1) as i32 * glyphs::CELL_H as i32,
+                    bottom: (cell.row + 1) as i32 * cell_h as i32,
                 },
                 default_color: Color::rgba(
                     cell.style.fg[0],
@@ -661,14 +660,14 @@ impl Graphics {
             let frame_h = size.height as f32;
             for fill in fills {
                 let x0 = fill.col as f32 * cw;
-                let y0 = fill.row as f32 * glyphs::CELL_H;
+                let y0 = fill.row as f32 * cell_h;
                 let line = DecoLine {
                     x0,
                     x1: x0 + cw * fill.span.max(1) as f32,
                     top: y0,
-                    bottom: y0 + glyphs::CELL_H,
+                    bottom: y0 + cell_h,
                     y: y0,
-                    thickness: glyphs::CELL_H,
+                    thickness: cell_h,
                     color: fill.color,
                 };
                 push_deco_rect(&mut fill_vertices, &line, frame_w, frame_h);
@@ -699,14 +698,14 @@ impl Graphics {
             let frame_h = size.height as f32;
             for &(row, col) in selection_cells {
                 let x0 = col as f32 * cw;
-                let y0 = row as f32 * glyphs::CELL_H;
+                let y0 = row as f32 * cell_h;
                 let line = DecoLine {
                     x0,
                     x1: x0 + cw,
                     top: y0,
-                    bottom: y0 + glyphs::CELL_H,
+                    bottom: y0 + cell_h,
                     y: y0,
-                    thickness: glyphs::CELL_H,
+                    thickness: cell_h,
                     color: SELECTION_BG,
                 };
                 push_deco_rect(&mut selection, &line, frame_w, frame_h);
@@ -741,14 +740,14 @@ impl Graphics {
             let frame_h = size.height as f32;
             for &(row, col) in search_cells {
                 let x0 = col as f32 * cw;
-                let y0 = row as f32 * glyphs::CELL_H;
+                let y0 = row as f32 * cell_h;
                 let line = DecoLine {
                     x0,
                     x1: x0 + cw,
                     top: y0,
-                    bottom: y0 + glyphs::CELL_H,
+                    bottom: y0 + cell_h,
                     y: y0,
-                    thickness: glyphs::CELL_H,
+                    thickness: cell_h,
                     color: SEARCH_BG,
                 };
                 push_deco_rect(&mut search, &line, frame_w, frame_h);
@@ -805,13 +804,13 @@ impl Graphics {
                     // (glyphon places glyphs at `area.top + line_y + y`);
                     // decoration offsets are EM units from the baseline,
                     // positive up.
-                    let baseline = cell.row as f32 * glyphs::CELL_H + run.line_y;
+                    let baseline = cell.row as f32 * cell_h + run.line_y;
                     let font_size = span.font_size;
                     let span_w = cell.width.max(1) as i32;
                     let x0 = cell.col as f32 * cw;
                     let x1 = (cell.col as i32 + span_w) as f32 * cw;
-                    let top = cell.row as f32 * glyphs::CELL_H;
-                    let bottom = (cell.row + 1) as f32 * glyphs::CELL_H;
+                    let top = cell.row as f32 * cell_h;
+                    let bottom = (cell.row + 1) as f32 * cell_h;
                     let band = |y: f32, thickness: f32, color: [u8; 4]| DecoLine {
                         x0,
                         x1,

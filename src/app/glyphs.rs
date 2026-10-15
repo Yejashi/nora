@@ -10,11 +10,9 @@ use std::path::{Path, PathBuf};
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, fontdb};
 
-/// N02/N08 base font size, in logical pixels (matches `tests/text_render.rs`).
-pub const FONT_SIZE: f32 = 20.0;
-
-/// Fixed cell height, in logical pixels (matches the N02 test).
-pub const CELL_H: f32 = 24.0;
+/// Pixels per point at the 96 DPI reference (CSS and most toolkits): a
+/// point is 1/72 inch.
+const PX_PER_PT: f32 = 96.0 / 72.0;
 
 /// Preferred mono family (the N02 test font); the system fallback may load another.
 const MONO_FAMILY: &str = "Noto Sans Mono";
@@ -61,12 +59,22 @@ fn resolve_font(env_var: &str, candidates: &[&str], families: &[&str]) -> Option
     system_font(families)
 }
 
+/// The system font database (fontconfig directories), scanned once per
+/// process on first use.
+fn system_db() -> &'static fontdb::Database {
+    static DB: std::sync::OnceLock<fontdb::Database> = std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
 /// Query the system font database for the first of `families` that resolves
 /// to a font file. `"monospace"` is the fontconfig generic alias; any other
 /// entry is an exact family name.
 fn system_font(families: &[&str]) -> Option<PathBuf> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = system_db();
     for family in families {
         let family = match *family {
             "monospace" => fontdb::Family::Monospace,
@@ -111,30 +119,70 @@ fn shape_cell(fs: &mut FontSystem, text: &str, family: Family, metrics: Metrics)
     buffer
 }
 
-/// Loaded fonts and the mono cell metrics they imply.
+/// Cell geometry in physical pixels for one font size, scale factor and
+/// zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellMetrics {
+    /// Shaping font size (physical px).
+    pub font_px: f32,
+    /// Cell width: the mono advance, rounded to a whole pixel.
+    pub cell_w: u32,
+    /// Cell height: the face's ascent + descent + line gap, rounded up.
+    pub cell_h: u32,
+}
+
+/// The configured font size in points converted to physical pixels at a
+/// display scale factor and zoom level.
+pub fn font_px(size_pt: f32, scale: f64, zoom: f32) -> f32 {
+    size_pt * PX_PER_PT * scale as f32 * zoom
+}
+
+/// Loaded fonts and the current cell metrics.
 pub struct Fonts {
     pub fs: FontSystem,
-    /// Mono advance (cell width), in logical pixels; a whole pixel by
-    /// construction (derived from the mono face, as in the N02 test).
-    pub cell_w: u32,
-    /// The resolved mono font file (env override or candidate-list hit).
+    /// The mono family the cells are shaped with.
+    pub family: String,
+    /// The resolved mono font file (env override, config family, pinned
+    /// candidate or fontconfig match).
     pub mono_path: PathBuf,
+    /// Configured size in points.
+    size_pt: f32,
+    /// Current metrics (physical pixels); see [`Fonts::measure`].
+    pub metrics: CellMetrics,
+    /// Cell width in physical pixels (mirrors `metrics.cell_w`).
+    pub cell_w: u32,
 }
 
 impl Fonts {
-    /// Load the pinned fonts and derive the mono cell metrics (N02 pattern).
-    pub fn load() -> Self {
-        let mono_path = resolve_font(
-            "NORA_TEST_FONT_MONO",
-            &MONO_CANDIDATES,
-            &[MONO_FAMILY, "DejaVu Sans Mono", "monospace"],
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "no monospace font found: install Noto Sans Mono (or any fontconfig \
-                 monospace font) or set NORA_TEST_FONT_MONO to a font file"
-            )
-        });
+    /// Load the fonts for `font` (family preference and size in points)
+    /// and measure the cells at scale 1 and zoom 1. The configured family
+    /// is tried first, unless it is the generic `monospace`; then Noto Sans
+    /// Mono, DejaVu Sans Mono and fontconfig's monospace alias. Bold faces
+    /// of the mono family are loaded when installed (no synthetic bold).
+    pub fn load(font: &nora::config::FontConfig) -> Self {
+        let mut families: Vec<&str> = Vec::new();
+        let configured = font.family.trim();
+        if !configured.is_empty() && configured != "monospace" {
+            families.push(configured);
+        }
+        families.extend([MONO_FAMILY, "DejaVu Sans Mono", "monospace"]);
+        // An explicitly configured family wins over the pinned candidates.
+        let configured_path = if families.len() > 3 {
+            system_font(&families[..1])
+        } else {
+            None
+        };
+        let mono_path = configured_path
+            .or_else(|| resolve_font("NORA_TEST_FONT_MONO", &MONO_CANDIDATES, &families))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no monospace font found: install Noto Sans Mono (or any fontconfig \
+                     monospace font), set font.family, or set NORA_TEST_FONT_MONO"
+                )
+            });
+        if families.len() > 3 && system_font(&families[..1]).is_none() {
+            eprintln!("nora: font.family '{configured}' not found; using a fallback");
+        }
         // Script fallbacks are optional: without them wide/Ethiopic text
         // renders as missing glyphs instead of aborting startup.
         let cjk_path = resolve_font(
@@ -154,46 +202,102 @@ impl Fonts {
                 .flatten()
                 .map(fontdb::Source::File),
         );
-
-        // Shape against the family that actually loaded, and make it the
-        // `Family::Monospace` target for the cell shaper.
-        let mono_family = family_of(&fs, &mono_path, MONO_FAMILY);
-        fs.db_mut().set_monospace_family(mono_family.clone());
-        let mono = Family::Name(&mono_family);
-        let metrics = Metrics::new(FONT_SIZE, CELL_H);
-        let advance = cluster_advance(&shape_cell(&mut fs, "M", mono, metrics));
-        // Noto Sans Mono yields a whole-pixel advance at this size; other
-        // monospace faces may not, so the cell snaps to the nearest pixel.
-        let cell_w = advance.round() as u32;
-        assert!(
-            (8..24).contains(&cell_w),
-            "cell width {cell_w} px is implausible"
-        );
-
-        Self {
-            fs,
-            cell_w,
-            mono_path,
+        let family = family_of(&fs, &mono_path, MONO_FAMILY);
+        for path in styled_faces(&family) {
+            if path != mono_path {
+                fs.db_mut().load_font_source(fontdb::Source::File(path));
+            }
         }
+        fs.db_mut().set_monospace_family(family.clone());
+        let mut fonts = Self {
+            fs,
+            family,
+            mono_path,
+            size_pt: font.size,
+            metrics: CellMetrics {
+                font_px: 0.0,
+                cell_w: 1,
+                cell_h: 1,
+            },
+            cell_w: 1,
+        };
+        fonts.measure(1.0, 1.0);
+        fonts
     }
 
-    /// Cell height in logical pixels (fixed by the N02 metrics).
-    pub const fn cell_h(&self) -> u32 {
-        CELL_H as u32
+    /// Recompute the cell metrics for a display scale factor and zoom;
+    /// returns them. Pure font work: no GPU, no display.
+    pub fn measure(&mut self, scale: f64, zoom: f32) -> CellMetrics {
+        let px = font_px(self.size_pt, scale, zoom).max(1.0);
+        let family = self.family.clone();
+        let advance = cluster_advance(&shape_cell(
+            &mut self.fs,
+            "M",
+            Family::Name(&family),
+            Metrics::new(px, px),
+        ));
+        let line = self.line_height(px).unwrap_or(px * 1.2);
+        let metrics = CellMetrics {
+            font_px: px,
+            cell_w: (advance.round() as u32).max(1),
+            cell_h: (line.ceil() as u32).max(1),
+        };
+        self.metrics = metrics;
+        self.cell_w = metrics.cell_w;
+        metrics
+    }
+
+    /// The mono face's line height at `px`: (ascent + descent + leading)
+    /// scaled from font units.
+    fn line_height(&mut self, px: f32) -> Option<f32> {
+        let id = self.fs.db().faces().find_map(|face| {
+            matches!(&face.source, fontdb::Source::File(p) if *p == self.mono_path)
+                .then_some(face.id)
+        })?;
+        let font = self.fs.get_font(id, fontdb::Weight::NORMAL)?;
+        let m = font.as_swash().metrics(&[]);
+        if m.units_per_em == 0 {
+            return None;
+        }
+        Some((m.ascent + m.descent + m.leading) * px / f32::from(m.units_per_em))
+    }
+
+    /// Cell height in physical pixels.
+    pub fn cell_h(&self) -> u32 {
+        self.metrics.cell_h
     }
 }
 
-/// The shaping font size at a zoom level (N19b): the base [`FONT_SIZE`]
-/// scaled by the zoom factor.
-pub fn zoomed_font_size(zoom: f32) -> f32 {
-    FONT_SIZE * zoom
+/// Font files for the bold, italic and bold-italic faces of `family`, as
+/// fontconfig knows them (regular excluded).
+fn styled_faces(family: &str) -> Vec<PathBuf> {
+    let db = system_db();
+    let mut out = Vec::new();
+    for (weight, style) in [
+        (fontdb::Weight::BOLD, fontdb::Style::Normal),
+        (fontdb::Weight::NORMAL, fontdb::Style::Italic),
+        (fontdb::Weight::BOLD, fontdb::Style::Italic),
+    ] {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            weight,
+            style,
+            ..fontdb::Query::default()
+        };
+        if let Some(id) = db.query(&query)
+            && let Some(face) = db.face(id)
+            && face.weight == weight
+            && face.style == style
+            && let fontdb::Source::File(path) = &face.source
+        {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// The whole cell grid that fits in a physical window size, from the mono cell
 /// metrics. Pure: no GPU, no display.
-// The N08b2b-2 window loop drives it; b-1 draws an empty grid, so it is
-// unused here.
-#[allow(dead_code)]
 pub fn grid_size(width: u32, height: u32, cell_w: u32, cell_h: u32) -> (u16, u16) {
     let cols = width.checked_div(cell_w).unwrap_or(0);
     let rows = height.checked_div(cell_h).unwrap_or(0);
@@ -229,22 +333,39 @@ mod tests {
     }
 
     #[test]
-    fn font_constants_match_the_n02_test() {
-        assert_eq!(FONT_SIZE, 20.0);
-        assert_eq!(CELL_H, 24.0);
-    }
-
-    #[test]
-    fn zoomed_font_size_scales_the_base_size() {
-        assert_eq!(zoomed_font_size(1.0), FONT_SIZE);
-        assert_eq!(zoomed_font_size(2.0), FONT_SIZE * 2.0);
-        assert_eq!(zoomed_font_size(0.5), FONT_SIZE * 0.5);
+    fn font_px_converts_points_at_96_dpi() {
+        assert_eq!(font_px(15.0, 1.0, 1.0), 20.0);
+        assert_eq!(font_px(12.0, 2.0, 1.0), 32.0);
+        assert_eq!(font_px(15.0, 1.0, 2.0), 40.0);
     }
 }
 
 #[cfg(test)]
 mod font_resolution_tests {
     use super::*;
+
+    /// Cell metrics are physical pixels: they scale with the display scale
+    /// factor and zoom alike, the line box covers the em, and the derived
+    /// grid always fits the surface (audit R3/R4/R5).
+    #[test]
+    fn metrics_scale_with_display_and_zoom() {
+        let mut fonts = Fonts::load(&nora::config::FontConfig::default());
+        let m1 = fonts.measure(1.0, 1.0);
+        assert_eq!(m1.font_px, 20.0, "15 pt default = 20 px at 96 DPI");
+        assert!(m1.cell_h as f32 >= m1.font_px, "line box covers the em");
+        let m2 = fonts.measure(2.0, 1.0);
+        assert!((m2.font_px - 2.0 * m1.font_px).abs() < 0.01);
+        assert!((i64::from(m2.cell_w) - 2 * i64::from(m1.cell_w)).abs() <= 1);
+        assert!((i64::from(m2.cell_h) - 2 * i64::from(m1.cell_h)).abs() <= 1);
+        assert_eq!(fonts.measure(1.0, 2.0), m2, "zoom 2 at scale 1 == scale 2");
+        let m125 = fonts.measure(1.25, 1.0);
+        for m in [m1, m125, m2] {
+            let (cols, rows) = grid_size(1000, 700, m.cell_w, m.cell_h);
+            assert!(u32::from(cols) * m.cell_w <= 1000);
+            assert!(u32::from(rows) * m.cell_h <= 700);
+            assert!(cols > 0 && rows > 0);
+        }
+    }
 
     #[test]
     fn unknown_family_does_not_resolve() {

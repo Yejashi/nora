@@ -320,7 +320,10 @@ fn run_windowed(
             )
             .expect("creating the nora window"),
     );
-    let fonts = app::glyphs::Fonts::load();
+    // Loaded once here (the first PTY needs the grid) and handed to the
+    // window loop.
+    let mut fonts = app::glyphs::Fonts::load(&config.font);
+    fonts.measure(window.scale_factor(), nora::config::ZOOM_DEFAULT);
     let (cols, rows) = app::window_grid(&window, &fonts);
     let (rows, cols) = if rows == 0 || cols == 0 {
         eprintln!("debug: degenerate window grid at spawn; falling back to 24x80");
@@ -378,6 +381,7 @@ fn run_windowed(
         explicit,
         hold,
         config,
+        fonts,
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pump.join();

@@ -72,8 +72,10 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
 - A Vulkan loader and driver. Any GPU with a Vulkan driver works; CI and
   GPU-less machines use Mesa's lavapipe software driver, which validates the
   rendering path but is not hardware performance evidence.
-- Fonts: nora prefers **Noto Sans Mono** and falls back to any monospace
-  font fontconfig knows. Noto Sans CJK and Noto Serif Ethiopic are optional
+- Fonts: `font.family` in the config picks the face (any fontconfig family,
+  e.g. a Nerd Font for prompt icons); `font.size` is in points (default 15).
+  Without a configured family nora prefers **Noto Sans Mono** and falls back
+  to any monospace font fontconfig knows. Noto Sans CJK and Noto Serif Ethiopic are optional
   script fallbacks (without them, wide and Ethiopic text renders as missing
   glyphs). The GPU and text tests assert Noto metrics, so install Noto to
   run the full test suite:

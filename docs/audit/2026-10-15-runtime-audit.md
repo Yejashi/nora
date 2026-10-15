@@ -50,6 +50,10 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | R8 | Glyph atlas never trimmed (unbounded growth) | M1.5 (trim per frame; soak test pending in M3) |
 | I-F16 (late) | Selection changes reached the screen only with the next output | M1.5 |
 | P13 | Poisoned-mutex unwraps on the snapshot slot | M1.5 |
+| R3, I-F13 | Scale factor applied to glyph size only; positions logical on a physical surface | M1.6 |
+| R4, I-F8 | Zoom changed glyph size only: no cell resize, no PTY resize, no redraw | M1.6 |
+| R5, CFG font | `font.family`/`font.size` ignored; cell size hardcoded (20 px / 24 px); implausible-width assert | M1.6 |
+| R11 (bold) | Only the Regular face loaded | M1.6 (bold/italic faces loaded when installed; no synthetic bold) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

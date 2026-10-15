@@ -259,7 +259,29 @@ scenario_selection() {
     pass selection
 }
 
-ALL=(render tty resize keys mouse redraw selection)
+# Zoom: Ctrl+Shift+Plus enlarges the cells, so the child's grid shrinks
+# (the PTY is resized), with no other trigger.
+scenario_zoom() {
+    local dir="$OUT/zoom"; mkdir -p "$dir"
+    launch zoom bash --norc --noprofile || { fail zoom "no window"; return; }
+    xdotool type --delay 15 "stty size > $dir/before.txt"
+    xdotool key Return
+    wait_file "$dir/before.txt" || { finish; fail zoom "no initial size"; return; }
+    xdotool key ctrl+shift+equal ctrl+shift+equal
+    sleep 1
+    xdotool type --delay 15 "stty size > $dir/after.txt"
+    xdotool key Return
+    wait_file "$dir/after.txt" || { finish; fail zoom "no size after zoom"; return; }
+    shot "$dir/shot.png"
+    finish
+    local r0 c0 r1 c1
+    read -r r0 c0 < "$dir/before.txt"; read -r r1 c1 < "$dir/after.txt"
+    echo "  size: ${r0}x${c0} -> ${r1}x${c1}"
+    [ "$c1" -lt "$c0" ] && [ "$r1" -lt "$r0" ] || { fail zoom "grid did not shrink"; return; }
+    pass zoom
+}
+
+ALL=(render tty resize keys mouse redraw selection zoom)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
