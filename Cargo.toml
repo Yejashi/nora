@@ -33,6 +33,8 @@ serde = { version = "1", features = ["derive"] }
 # Validated TOML configuration (N18a). Resolves against the existing
 # `toml_edit`/`serde` family in the lock.
 toml = "0.8"
+# Display width of IME preedit text (same version alacritty_terminal pins).
+unicode-width = "0.2.2"
 wgpu = "30.0.1"
 winit = "0.30.13"
 

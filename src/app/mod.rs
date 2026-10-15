@@ -1582,6 +1582,33 @@ impl WinApp {
                     let index = tabs.iter().position(|t| *t == active.tab).unwrap_or(0);
                     scene.add_tab_bar(&labels, index, u32::from(grid_cols));
                 }
+                // IME composition: the preedit is drawn at the active pane's
+                // cursor, and the input method is told where that is so its
+                // candidate window opens next to it.
+                if let Some(&(_, x, y, w, _, Some(ref snap))) = panes.iter().find(|p| p.0 == active)
+                    && let Some((row, col)) = snap.cursor
+                {
+                    let (row, col) = (u32::from(y) + row as u32, u32::from(x) + col as u32);
+                    let preedit = self.ime.preedit();
+                    let mut covered = 1;
+                    if !preedit.is_empty() {
+                        let fg = self.palette.foreground();
+                        let fg = [fg.r, fg.g, fg.b, 255];
+                        let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
+                        let right = u32::from(x) + u32::from(w);
+                        covered = scene.add_preedit(preedit, row, col, right, fg, bg).max(1);
+                    }
+                    window.set_ime_cursor_area(
+                        winit::dpi::PhysicalPosition::new(
+                            col as f32 * layout.cell_w,
+                            row as f32 * layout.cell_h,
+                        ),
+                        winit::dpi::PhysicalSize::new(
+                            covered as f32 * layout.cell_w,
+                            layout.cell_h,
+                        ),
+                    );
+                }
                 if self.search.visible {
                     let state = &self.search.state;
                     let status = if state.query.is_empty() {
@@ -2212,6 +2239,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     if debug_enabled() {
                         eprintln!("IME: preedit = {text:?}");
                     }
+                    // The preedit is drawn by the window, not the PTY: no
+                    // output will trigger the frame.
+                    window.request_redraw();
                 }
                 winit::event::Ime::Commit(text) => {
                     // The platform text is authoritative: under Wayland

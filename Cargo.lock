@@ -1162,6 +1162,7 @@ dependencies = [
  "pollster",
  "serde",
  "toml",
+ "unicode-width",
  "wgpu",
  "winit",
 ]

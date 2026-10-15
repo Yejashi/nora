@@ -219,6 +219,53 @@ impl Scene {
 
 const SEARCH_BAR_BG: [u8; 4] = [0x3a, 0x2e, 0x10, 255];
 
+impl Scene {
+    /// IME preedit text (being composed, not yet sent) at grid cell
+    /// (`row`, `col`), underlined over an opaque background so it reads
+    /// over whatever is under it; clipped at `cols`. Returns the columns
+    /// it covers.
+    pub fn add_preedit(
+        &mut self,
+        text: &str,
+        row: u32,
+        col: u32,
+        cols: u32,
+        fg: [u8; 4],
+        bg: [u8; 4],
+    ) -> u32 {
+        use unicode_width::UnicodeWidthChar;
+        let mut at = col;
+        for ch in text.chars() {
+            let width = ch.width().unwrap_or(0) as u32;
+            if width == 0 {
+                continue;
+            }
+            if at + width > cols {
+                break;
+            }
+            self.cells
+                .retain(|c| !(c.row == row && c.col >= at && c.col < at + width));
+            self.fills.push(CellFill {
+                row,
+                col: at,
+                span: width as u16,
+                color: bg,
+            });
+            let mut style = tab_style(fg, bg, false);
+            style.underline = UnderlineStyle::Single;
+            self.cells.push(DrawCell {
+                row,
+                col: at,
+                text: ch.to_string(),
+                style,
+                width: width as u16,
+            });
+            at += width;
+        }
+        at - col
+    }
+}
+
 fn tab_style(fg: [u8; 4], bg: [u8; 4], bold: bool) -> CellStyle {
     CellStyle {
         fg,
@@ -260,6 +307,18 @@ mod tests {
         let text: String = scene.cells.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(text, "Find:ab");
         assert_eq!(scene.fills.len(), 1);
+    }
+
+    #[test]
+    fn preedit_uses_display_width_and_clips() {
+        let mut scene = Scene::default();
+        let fg = [255, 255, 255, 255];
+        let bg = [0, 0, 0, 255];
+        assert_eq!(scene.add_preedit("日本a", 2, 5, 40, fg, bg), 5);
+        let cols: Vec<u32> = scene.cells.iter().map(|c| c.col).collect();
+        assert_eq!(cols, vec![5, 7, 9]);
+        let mut clipped = Scene::default();
+        assert_eq!(clipped.add_preedit("日本", 0, 38, 40, fg, bg), 2);
     }
 
     #[test]
