@@ -152,6 +152,13 @@ pub struct SessionOptions {
     pub history: usize,
     /// The cursor shape used until the application sets one.
     pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
+    /// Colors reported for OSC 4/10/11/12 queries where the application
+    /// set none (the window's palette).
+    pub palette: crate::render::palette::Palette,
+    /// Cell size in pixels, reported to the child (TIOCSWINSZ pixel fields,
+    /// CSI 14 t / 16 t).
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 impl Default for SessionOptions {
@@ -161,6 +168,9 @@ impl Default for SessionOptions {
         Self {
             history: 0,
             cursor_shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+            palette: crate::render::palette::Palette::default(),
+            cell_width: NOMINAL_CELL_WIDTH,
+            cell_height: NOMINAL_CELL_HEIGHT,
         }
     }
 }
@@ -288,6 +298,8 @@ pub struct PtySession {
     /// The child's pid, which is also its process group id.
     #[cfg(unix)]
     child_pid: libc::pid_t,
+    /// Colors for OSC 4/10/11/12 queries the application did not set.
+    palette: crate::render::palette::Palette,
     /// Bytes sent as `Msg::Input` and not yet written (decremented by the
     /// vendored loop's `pty_write`).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
@@ -358,7 +370,7 @@ impl PtySession {
         let writer = BoundedWriter::new(cap);
         let ledger = ReplyLedger::new(cap.reserved_bytes.min(cap.max_bytes));
 
-        let options = Options {
+        let pty_options = Options {
             shell: Some(Shell::new(spec.program, spec.args)),
             working_directory: cwd,
             env: spec.env.into_iter().collect(),
@@ -367,15 +379,15 @@ impl PtySession {
             #[cfg(target_os = "windows")]
             escape_args: true,
         };
-        // Nominal headless cell geometry: pixel-size replies report
-        // rows/cols times the nominal cell size.
+        // Pixel fields come from the window's cell size (nominal 8x16
+        // headless), so size reports and TIOCSWINSZ match the screen.
         let size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
-            cell_width: NOMINAL_CELL_WIDTH,
-            cell_height: NOMINAL_CELL_HEIGHT,
+            cell_width: options.cell_width,
+            cell_height: options.cell_height,
         };
-        let pty = tty::new(&options, size, id.0).map_err(PtyError::Spawn)?;
+        let pty = tty::new(&pty_options, size, id.0).map_err(PtyError::Spawn)?;
         // The child is a session leader (setsid), so this is also its
         // process group id; kept for kill escalation in `close`.
         #[cfg(unix)]
@@ -452,6 +464,7 @@ impl PtySession {
             ledger,
             size,
             sender,
+            palette: options.palette,
             in_flight,
             #[cfg(unix)]
             child_pid,
@@ -491,8 +504,7 @@ impl PtySession {
         self.size = WindowSize {
             num_lines: rows,
             num_cols: cols,
-            cell_width: NOMINAL_CELL_WIDTH,
-            cell_height: NOMINAL_CELL_HEIGHT,
+            ..self.size
         };
         self.engine().resize(rows as usize, cols as usize);
         // Tell the child: the loop applies TIOCSWINSZ on the master, and
@@ -713,6 +725,22 @@ impl PtySession {
         std::mem::take(&mut self.bell)
     }
 
+    /// The cell size in pixels reported to the child (on zoom or a scale
+    /// change); the PTY's pixel fields are updated in place.
+    pub fn set_cell_size(&mut self, width: u16, height: u16) {
+        if (width, height) == (self.size.cell_width, self.size.cell_height) {
+            return;
+        }
+        self.size.cell_width = width;
+        self.size.cell_height = height;
+        let _ = self.sender.send(Msg::Resize(self.size));
+    }
+
+    /// The palette answering color queries the application did not set.
+    pub fn set_palette(&mut self, palette: crate::render::palette::Palette) {
+        self.palette = palette;
+    }
+
     /// The child's pid (also its process group id).
     #[cfg(unix)]
     pub fn child_pid(&self) -> libc::pid_t {
@@ -783,7 +811,9 @@ impl PtySession {
                         .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Exiting;
                 }
                 record => {
-                    if let Some(reply) = resolve_record(&self.engine, self.size, record) {
+                    if let Some(reply) =
+                        resolve_record(&self.engine, self.size, &self.palette, record)
+                    {
                         self.ledger.accept(&mut self.writer, &reply);
                     }
                 }

@@ -59,9 +59,11 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
 **Shell integration (N35)** — opt-in via `shell/nora-bash.sh`:
 
 - OSC 133 prompt markers (A/B/C/D)
-- Jump to previous prompt and previous-command selection
+- Jump to the previous prompt (Ctrl+Shift+Z) and select the previous
+  command's output (Ctrl+Shift+G)
 - Working-directory tracking (OSC 7)
-- Hyperlinks (OSC 8) with click activation via `xdg-open`
+- Hyperlinks (OSC 8): Ctrl+click opens http(s), mailto, file and ftp links
+  with the platform opener (`xdg-open`, `open`, `explorer`)
 
 ## Requirements
 
@@ -176,6 +178,7 @@ server available, the launch falls back to the headless session pump.
 | Focus pane | Ctrl+Shift+Arrow |
 | Close pane (tab, window) | Ctrl+Shift+W |
 | Reload config | Ctrl+Shift+F5 |
+| Previous prompt / select last output | Ctrl+Shift+Z / Ctrl+Shift+G (shell integration) |
 | Search (visible screen) | Ctrl+Shift+F; Enter / Shift+Enter next / previous, Escape closes |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |

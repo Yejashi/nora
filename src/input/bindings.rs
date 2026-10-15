@@ -44,6 +44,10 @@ pub enum Action {
     ScrollToTop,
     ScrollToBottom,
     ReloadConfig,
+    /// Scroll to the previous shell prompt (needs shell integration).
+    PreviousPrompt,
+    /// Select the previous command's output (needs shell integration).
+    SelectPreviousCommand,
 }
 
 impl Action {
@@ -111,6 +115,8 @@ impl Default for Bindings {
             (K::Home, s, ScrollToTop),
             (K::End, s, ScrollToBottom),
             (K::F5, cs, ReloadConfig),
+            (K::KeyZ, cs, PreviousPrompt),
+            (K::KeyG, cs, SelectPreviousCommand),
         ];
         Self {
             entries: table
@@ -285,6 +291,8 @@ fn action_named(name: &str) -> Option<Action> {
         "scroll_to_top" => Action::ScrollToTop,
         "scroll_to_bottom" => Action::ScrollToBottom,
         "reload_config" => Action::ReloadConfig,
+        "previous_prompt" => Action::PreviousPrompt,
+        "select_previous_command" => Action::SelectPreviousCommand,
         _ => return None,
     })
 }

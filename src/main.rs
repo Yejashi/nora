@@ -47,8 +47,39 @@ Options:\n\
                                interpolation)\n\n\
 With no command, the default shell ($SHELL, else /bin/sh; on Windows\nPowerShell, else %COMSPEC%) is launched.";
 
+/// Variables that identify the terminal nora was started from. Children
+/// would otherwise inherit them and take nora for that terminal (or think
+/// they run inside tmux or screen).
+const INHERITED_IDENTITY: &[&str] = &[
+    "VTE_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_PUBLIC_KEY",
+    "WEZTERM_PANE",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "ITERM_SESSION_ID",
+    "TERMINATOR_UUID",
+    "TERMINAL_EMULATOR",
+    "WT_SESSION",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOWID",
+];
+
 fn main() -> ExitCode {
     nora::trace::start();
+    for var in INHERITED_IDENTITY {
+        // SAFETY: first thing in `main`, before any thread is spawned, so
+        // nothing reads the environment concurrently.
+        unsafe { env::remove_var(var) };
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     let mut smoke = false;
     let mut hold = false;
@@ -190,6 +221,9 @@ fn main() -> ExitCode {
     let child_env = vec![
         ("TERM".to_string(), term),
         ("COLORTERM".to_string(), "truecolor".to_string()),
+        // The terminal's identity for programs that adapt to it.
+        ("TERM_PROGRAM".to_string(), "nora".to_string()),
+        ("TERM_PROGRAM_VERSION".to_string(), VERSION.to_string()),
     ];
     let spec = if let Some((program, rest)) = command.split_first() {
         LaunchSpec {
@@ -364,7 +398,7 @@ fn run_windowed(
     // N23b: the pump spawns new-tab sessions from the same launch spec.
     let spec_for_pump = spec.clone();
     nora::trace::stage("cells measured");
-    let options = app::session_options(config);
+    let options = app::session_options(config, (fonts.cell_w, fonts.cell_h()));
     let session = match PtySession::spawn_configured(
         spec,
         rows as usize,
@@ -445,6 +479,12 @@ fn resolve_term() -> String {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(terminfo) = env::var_os("TERMINFO") {
         candidates.push(std::path::Path::new(&terminfo).join("n").join("nora"));
+    }
+    // TERMINFO_DIRS (colon-separated; NixOS and others use it).
+    if let Some(dirs) = env::var_os("TERMINFO_DIRS") {
+        for dir in env::split_paths(&dirs).filter(|d| !d.as_os_str().is_empty()) {
+            candidates.push(dir.join("n").join("nora"));
+        }
     }
     if let Some(home) = env::var_os("HOME") {
         candidates.push(

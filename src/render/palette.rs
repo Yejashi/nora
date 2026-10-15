@@ -60,7 +60,7 @@ pub fn parse_hex(s: &str) -> Option<Rgb> {
 }
 
 /// A fully populated color table (all [`COUNT`] slots).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     slots: [Rgb; COUNT],
 }

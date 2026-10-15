@@ -71,6 +71,9 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | M3 found | Pump snapshotted under the terminal lock on every wake while the window held an undrawn snapshot | M3 (backpressure; 56 MiB/s windowed) |
 | CFG (all) | Config parsed but nothing applied; no reload; scrollback 0 | M4 (schema v2, every key consumed, file watch + Ctrl+Shift+F5, scrollback 10 000 default) |
 | R10 | Cursor shape ignored; no hollow cursor when unfocused | M4 (block/beam/underline/hidden; hollow when unfocused) |
+| P10 | Child inherited the parent terminal's identity (VTE_VERSION, TMUX, ...); no TERM_PROGRAM; TERMINFO_DIRS ignored | M1.8 |
+| P11 | OSC 10/11/12 replies hardcoded white/black; pixel sizes nominal 8x16 | M1.8 (palette replies; real cell pixels, updated on zoom/scale) |
+| I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

@@ -474,6 +474,58 @@ scenario_config() {
     pass config
 }
 
+# Reports and environment: an OSC 11 query answers with the configured
+# background, CSI 14 t reports the real pixel size, TERM_PROGRAM is set,
+# and an inherited VTE_VERSION does not reach the child.
+scenario_reports() {
+    local dir="$OUT/reports"; mkdir -p "$dir/home/.config/nora"
+    printf '[colors]\nbackground = "#123456"\n' >"$dir/home/.config/nora/config.toml"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+printf '%s|%s' "\$TERM_PROGRAM" "\${VTE_VERSION:-unset}" > "$dir/env.txt"
+stty raw -echo
+printf '\033]11;?\033\\\\'
+dd bs=1 count=24 of="$dir/osc11.raw" 2>/dev/null
+printf '\033[14t'
+dd bs=1 count=12 of="$dir/px.raw" 2>/dev/null
+stty sane
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    VTE_VERSION=7000 launch reports "$dir/child.sh" || { fail reports "no window"; return; }
+    wait_file "$dir/px.raw" || { finish; fail reports "no reply to the size query"; return; }
+    finish
+    local osc px
+    osc=$(tr -d '\033\\' < "$dir/osc11.raw" | tr -cd '[:print:]')
+    px=$(tr -cd '0-9;' < "$dir/px.raw")
+    echo "  env: $(cat "$dir/env.txt"); osc11: $osc; 14t: $px"
+    [ "$(cat "$dir/env.txt")" = "nora|unset" ] || { fail reports "environment"; return; }
+    case "$osc" in *rgb:1212/3434/5656*) ;; *) fail reports "OSC 11 reply is not the configured background"; return ;; esac
+    case "$px" in 4\;*\;*) ;; *) fail reports "no CSI 4 t size report"; return ;; esac
+    [ "$px" != "4;384;640" ] || { fail reports "nominal 8x16 pixel size reported"; return; }
+    pass reports
+}
+
+# Hyperlinks: Ctrl+click on an OSC 8 link runs the opener with the URL as
+# one argument (a stand-in xdg-open records it).
+scenario_hyperlink() {
+    local dir="$OUT/hyperlink"; mkdir -p "$dir/bin"
+    printf '#!/bin/sh\nprintf "%%s" "$1" > "%s/opened.txt"\n' "$dir" >"$dir/bin/xdg-open"
+    chmod +x "$dir/bin/xdg-open"
+    printf '#!/bin/sh\nprintf "\\033]8;;https://example.com/nora?a=1\\033\\\\LINK TEXT\\033]8;;\\033\\\\\\r\\n"\nsleep 30\n' >"$dir/child.sh"
+    chmod +x "$dir/child.sh"
+    PATH="$dir/bin:$PATH" launch hyperlink "$dir/child.sh" || { fail hyperlink "no window"; return; }
+    local cw ch
+    read -r cw ch <<<"$(sed -n 's/^fonts: cell \([0-9]*\)x\([0-9]*\).*/\1 \2/p' "$OUT/hyperlink/nora.log" | head -1)"
+    xdotool mousemove --window "$WIN" $((cw * 3)) $((ch / 2))
+    xdotool keydown ctrl click 1 keyup ctrl
+    wait_file "$dir/opened.txt" || { finish; fail hyperlink "opener not run"; return; }
+    finish
+    echo "  opened: $(cat "$dir/opened.txt")"
+    [ "$(cat "$dir/opened.txt")" = "https://example.com/nora?a=1" ] || { fail hyperlink "wrong URL"; return; }
+    pass hyperlink
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -533,7 +585,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config reports hyperlink vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

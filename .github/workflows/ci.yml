@@ -267,7 +267,13 @@ jobs:
           --test resource_limits
       - name: PTY integration tests (macOS)
         if: runner.os == 'macOS'
-        run: >
-          cargo test --locked
-          --test pty_session --test pump_session --test keypad_input
-          --test navigation_input --test paste_pump
+        run: |
+          set +e
+          cargo test --locked --no-fail-fast \
+            --test pty_session --test pump_session --test keypad_input \
+            --test navigation_input --test paste_pump 2>&1 | tee pty.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          grep -E "^test .* FAILED$|panicked at" pty.log \
+            | sort -u | head -40 | sed 's/^/::error::/' || true
+          exit "$STATUS"

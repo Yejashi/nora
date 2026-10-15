@@ -209,7 +209,16 @@ pub enum PumpMsg {
     /// New terminal options from a config reload: future panes use them,
     /// running panes take the cursor shape (scrollback is fixed per
     /// session).
-    Configure { options: super::pty::SessionOptions },
+    Configure {
+        options: Box<super::pty::SessionOptions>,
+    },
+    /// Scroll the pane to its previous prompt (OSC 133).
+    PreviousPrompt { pane: PaneKey },
+    /// Select the pane's previous command output (OSC 133).
+    SelectPreviousCommand { pane: PaneKey },
+    /// The window's cell size in pixels changed (zoom, scale factor):
+    /// reported to every child and used for new panes.
+    CellSize { width: u16, height: u16 },
     /// Wake the pump: new PTY output, a child exit, or shutdown. Carries
     /// nothing; at most one is queued at a time (see [`pump_thread`]).
     Wake,
@@ -595,7 +604,37 @@ pub fn pump_thread(
                 // The wake only ended the wait; the tick above already
                 // picked up the new output.
                 PumpMsg::Wake => {}
+                PumpMsg::PreviousPrompt { pane } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        let _ = pane_pump.session.engine().jump_to_previous_prompt();
+                        pane_pump.force_snapshot = true;
+                    }
+                }
+                PumpMsg::SelectPreviousCommand { pane } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        let _ = pane_pump.session.engine().select_previous_command();
+                        pane_pump.force_snapshot = true;
+                    }
+                }
+                PumpMsg::CellSize { width, height } => {
+                    for pane_pump in sessions.values_mut() {
+                        pane_pump.session.set_cell_size(width, height);
+                    }
+                    options.cell_width = width;
+                    options.cell_height = height;
+                }
                 PumpMsg::Configure { options: new } => {
+                    let new = *new;
+                    for pane_pump in sessions.values_mut() {
+                        pane_pump.session.set_palette(new.palette);
+                    }
+                    let new = super::pty::SessionOptions {
+                        // The window's current cell size stays: only
+                        // CellSize changes it.
+                        cell_width: options.cell_width,
+                        cell_height: options.cell_height,
+                        ..new
+                    };
                     if new.cursor_shape != options.cursor_shape {
                         for pane_pump in sessions.values_mut() {
                             pane_pump

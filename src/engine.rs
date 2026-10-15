@@ -544,7 +544,14 @@ pub fn opener_argv(uri: &str) -> Option<Vec<String>> {
     if !allowed {
         return None;
     }
-    Some(vec!["xdg-open".to_string(), uri.to_string()])
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    Some(vec![opener.to_string(), uri.to_string()])
 }
 
 impl Engine {

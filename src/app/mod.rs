@@ -141,8 +141,37 @@ fn platform_hint() -> String {
 /// in [`glyphs::Fonts`] are physical pixels (they include the scale factor
 /// and zoom), so the grid, the renderer and the mouse mapping agree at
 /// every scale.
-/// Terminal options for new sessions from the configuration.
-pub(crate) fn session_options(config: &nora::config::NoraConfig) -> nora::session::SessionOptions {
+/// Open a hyperlink with the platform opener on a short-lived thread (the
+/// spawn and wait stay off the window thread). Disallowed schemes are
+/// ignored.
+fn open_hyperlink(uri: &str) {
+    let Some(argv) = nora::engine::opener_argv(uri) else {
+        if debug_enabled() {
+            eprintln!("debug: hyperlink not opened (scheme not allowed): {uri}");
+        }
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("nora-open".to_string())
+        .spawn(move || {
+            if let Ok(mut child) = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                let _ = child.wait();
+            }
+        });
+}
+
+/// Terminal options for new sessions from the configuration and the cell
+/// size in pixels.
+pub(crate) fn session_options(
+    config: &nora::config::NoraConfig,
+    cell: (u32, u32),
+) -> nora::session::SessionOptions {
     use alacritty_terminal::vte::ansi::CursorShape as Shape;
     use nora::config::CursorShape;
     nora::session::SessionOptions {
@@ -152,6 +181,9 @@ pub(crate) fn session_options(config: &nora::config::NoraConfig) -> nora::sessio
             CursorShape::Beam => Shape::Beam,
             CursorShape::Underline => Shape::Underline,
         },
+        palette: Palette::from_config(config),
+        cell_width: u16::try_from(cell.0).unwrap_or(u16::MAX),
+        cell_height: u16::try_from(cell.1).unwrap_or(u16::MAX),
     }
 }
 
@@ -851,6 +883,14 @@ impl WinApp {
         let Some((cols, rows)) = self.pane_area() else {
             return;
         };
+        // Report the cell size in pixels with every geometry change (the
+        // pump ignores an unchanged size).
+        if let Some(fonts) = self.fonts.as_ref() {
+            let _ = self.pump_commands.send(PumpMsg::CellSize {
+                width: u16::try_from(fonts.cell_w).unwrap_or(u16::MAX),
+                height: u16::try_from(fonts.cell_h()).unwrap_or(u16::MAX),
+            });
+        }
         let mut layouts: Vec<(TabId, Layout)> = Vec::new();
         if let Some(active) = self.active_tab_id() {
             layouts.push((active, self.layout.clone()));
@@ -1110,8 +1150,12 @@ impl WinApp {
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.set_selection_color(self.selection_color);
         }
+        let cell = self
+            .fonts
+            .as_ref()
+            .map_or((8, 16), |f| (f.cell_w, f.cell_h()));
         let _ = self.pump_commands.send(PumpMsg::Configure {
-            options: session_options(&config),
+            options: Box::new(session_options(&config, cell)),
         });
         if old.current.font != config.font
             && let Some(window) = self.window.clone()
@@ -1180,6 +1224,16 @@ impl WinApp {
             }
             UiAction::ToggleSearch => self.search.toggle(),
             UiAction::ReloadConfig => self.reload_config(),
+            UiAction::PreviousPrompt | UiAction::SelectPreviousCommand => {
+                if let Some(pane) = self.active_pane_key() {
+                    let msg = if action == UiAction::PreviousPrompt {
+                        PumpMsg::PreviousPrompt { pane }
+                    } else {
+                        PumpMsg::SelectPreviousCommand { pane }
+                    };
+                    let _ = self.pump_commands.send(msg);
+                }
+            }
             UiAction::ZoomIn | UiAction::ZoomOut | UiAction::ZoomReset => {
                 self.zoom = match action {
                     UiAction::ZoomIn => nora::config::zoom_in(self.zoom),
@@ -1268,6 +1322,15 @@ impl WinApp {
         let _ = self.pump_commands.send(PumpMsg::ClosePane { pane });
         self.drop_pane_state(pane);
         self.resize_all_panes();
+    }
+
+    /// The OSC 8 hyperlink URI in the active pane's cell under the mouse,
+    /// from the last drawn snapshot.
+    fn hyperlink_under_cursor(&self, window: &Window) -> Option<String> {
+        let (row, col) = self.grid_cell_at(window, self.cursor.0, self.cursor.1)?;
+        let snap = self.pane_last.get(&self.active_pane_key()?)?;
+        let cell = snap.cells.get(row * snap.cols + col)?;
+        cell.hyperlink.as_ref().map(|(_, uri)| uri.clone())
     }
 
     /// Make `target` (a pane of the active tab) the active pane.
@@ -2403,6 +2466,17 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 {
                     self.focus_pane(target);
                     window.request_redraw();
+                }
+                // Ctrl+click on an OSC 8 hyperlink opens it (only allowed
+                // schemes, through the platform opener, URL as one argv
+                // element); the click does nothing else.
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.mods.control_key()
+                    && let Some(uri) = self.hyperlink_under_cursor(&window)
+                {
+                    open_hyperlink(&uri);
+                    return;
                 }
                 // Local selection: a left press clears the old selection and
                 // anchors a new one that starts on drag (`MouseInput` has no

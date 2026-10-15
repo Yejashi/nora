@@ -20,7 +20,6 @@
 use std::collections::VecDeque;
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::vte::ansi::Rgb;
 
 use crate::engine::{Engine, EventRecord};
 
@@ -56,35 +55,28 @@ pub const NOMINAL_CELL_HEIGHT: u16 = 16;
 pub(crate) fn resolve_record(
     engine: &Engine,
     size: WindowSize,
+    palette: &crate::render::palette::Palette,
     record: EventRecord,
 ) -> Option<String> {
     match record {
         EventRecord::PtyWrite(reply) => Some(reply),
-        EventRecord::ColorRequest(index, format) => {
-            Some(format(engine.color(index).unwrap_or(default_color(index))))
-        }
+        // A color the application set itself, else the palette the window
+        // draws with (OSC 10/11 replies let programs pick light or dark
+        // themes, so they must match the screen).
+        EventRecord::ColorRequest(index, format) => Some(format(
+            engine
+                .color(index)
+                .unwrap_or_else(|| palette.get(index.min(palette_last()))),
+        )),
         EventRecord::TextAreaSizeRequest(format) => Some(format(size)),
         EventRecord::ClipboardLoad(_, format) => Some(format("")),
         _ => None,
     }
 }
 
-/// Default for an unset color-table slot, applied at resolution time.
-fn default_color(index: usize) -> Rgb {
-    match index {
-        256 => Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        }, // foreground
-        257 => Rgb { r: 0, g: 0, b: 0 }, // background
-        258 => Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        }, // cursor
-        _ => Rgb { r: 0, g: 0, b: 0 },
-    }
+/// The last valid palette index.
+fn palette_last() -> usize {
+    alacritty_terminal::term::color::COUNT - 1
 }
 
 /// Reply-byte accounting for one parser turn ([`Session::feed`]).
@@ -259,7 +251,12 @@ impl Session {
                 EventRecord::ResetTitle => self.title = None,
                 _ => {}
             }
-            if let Some(reply) = resolve_record(&self.engine, self.size, record) {
+            if let Some(reply) = resolve_record(
+                &self.engine,
+                self.size,
+                &crate::render::palette::Palette::default(),
+                record,
+            ) {
                 enqueued += self.ledger.accept(&mut self.writer, &reply);
             }
         }
