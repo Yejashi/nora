@@ -489,11 +489,19 @@ enum FilterState {
     OscEsc,
 }
 
+/// Largest OSC frame passed to the parser (64 KiB). Larger frames are
+/// discarded whole (audit P3): without a cap, `printf '\e]0;'` followed by
+/// endless output grew this buffer and vte's own OSC buffer without bound.
+pub const MAX_OSC_BYTES: usize = 64 * 1024;
+
 /// A byte-level state machine that extracts OSC 133 prompt markers in
 /// parallel with the vte parser.
 #[derive(Debug, Clone)]
 pub struct PromptMarkerFilter {
     state: FilterState,
+    /// The current frame outgrew [`MAX_OSC_BYTES`]: it is dropped whole
+    /// at its terminator instead of being forwarded.
+    overflow: bool,
     /// The OSC data bytes being accumulated (between `]` and the
     /// terminator).
     buffer: Vec<u8>,
@@ -504,6 +512,7 @@ impl PromptMarkerFilter {
     pub fn new() -> Self {
         Self {
             state: FilterState::Pass,
+            overflow: false,
             buffer: Vec::new(),
         }
     }
@@ -557,9 +566,10 @@ impl PromptMarkerFilter {
                     } else if byte == 0x18 || byte == 0x1A {
                         // CAN / ABORT: discard the in-progress frame.
                         self.buffer.clear();
+                        self.overflow = false;
                         self.state = FilterState::Pass;
                     } else {
-                        self.buffer.push(byte);
+                        self.hold(&[byte]);
                     }
                 }
                 FilterState::OscEsc => {
@@ -568,8 +578,7 @@ impl PromptMarkerFilter {
                         self.complete_frame(&mut out, &mut events, &[0x1B, 0x5C]);
                     } else {
                         // Not ST: the ESC is part of the data.
-                        self.buffer.push(0x1B);
-                        self.buffer.push(byte);
+                        self.hold(&[0x1B, byte]);
                         self.state = FilterState::Osc;
                     }
                 }
@@ -583,6 +592,20 @@ impl PromptMarkerFilter {
     ///
     /// `terminator` is the byte sequence that terminated the frame (so it
     /// can be forwarded when the frame is not a marker).
+    /// Buffer frame bytes up to [`MAX_OSC_BYTES`]; past it, mark the frame
+    /// overflowed and stop growing.
+    fn hold(&mut self, bytes: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        if self.buffer.len() + bytes.len() > MAX_OSC_BYTES {
+            self.overflow = true;
+            self.buffer = Vec::new();
+        } else {
+            self.buffer.extend_from_slice(bytes);
+        }
+    }
+
     fn complete_frame(
         &mut self,
         out: &mut Vec<u8>,
@@ -591,6 +614,11 @@ impl PromptMarkerFilter {
     ) {
         let data = std::mem::take(&mut self.buffer);
         self.state = FilterState::Pass;
+        if std::mem::take(&mut self.overflow) {
+            // An overlong frame is dropped whole: neither this filter nor
+            // the parser behind it ever buffers more than the cap.
+            return;
+        }
         match classify_frame(&data) {
             FrameAction::Marker(kind) => {
                 // Well-formed OSC 133 marker: suppress the frame. Record
@@ -781,4 +809,39 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod osc_cap_tests {
+    use super::*;
+
+    /// Audit P3: an unterminated OSC followed by endless output keeps the
+    /// held frame at or below the cap, the overlong frame is never
+    /// forwarded, and output after its terminator flows normally.
+    #[test]
+    fn unterminated_osc_is_bounded_and_dropped() {
+        let mut filter = PromptMarkerFilter::new();
+        let (out, _) = filter.process(b"before\x1b]0;");
+        assert_eq!(out, b"before");
+        let chunk = vec![b'a'; 1 << 20];
+        for _ in 0..100 {
+            let (out, _) = filter.process(&chunk);
+            assert!(out.is_empty(), "the held frame must not leak out");
+            assert!(filter.buffer.len() <= MAX_OSC_BYTES);
+        }
+        let (out, _) = filter.process(b"\x07after");
+        assert_eq!(out, b"after", "the overlong frame is dropped whole");
+        let (out, _) = filter.process(b"\x1b]2;title\x07");
+        assert_eq!(out, b"\x1b]2;title\x07", "the next frame is forwarded");
+    }
+
+    #[test]
+    fn frame_at_the_cap_is_forwarded() {
+        let mut filter = PromptMarkerFilter::new();
+        let mut frame = b"\x1b]2;".to_vec();
+        frame.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES - 2));
+        frame.push(0x07);
+        let (out, _) = filter.process(&frame);
+        assert_eq!(out, frame);
+    }
 }

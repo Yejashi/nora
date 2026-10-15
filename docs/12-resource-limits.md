@@ -119,3 +119,10 @@ This document audits all growth limits in nora. Each section documents the limit
 2. **Font/glyph cache:** The atlas is bounded by the device's max texture dimension, but the exact limit is device-dependent.
 
 3. **Hyperlinks and titles:** These are bounded by the terminal protocol, not by nora. No explicit cap is set.
+
+## Escape-sequence frame caps (2026-10-15, M1.7a)
+
+| Limit | Value | Behaviour past the limit | Evidence |
+| --- | --- | --- | --- |
+| OSC frame | 64 KiB (`prompt_marker::MAX_OSC_BYTES`) | frame dropped whole at its terminator; the parser never sees it | unit `unterminated_osc_is_bounded_and_dropped`; e2e `flood`: 200 MiB unterminated OSC, peak RSS +5.5 MiB (was +798 MiB) |
+| APC frame | 4 MiB (`graphics_filter::MAX_APC_BYTES`) | frame ignored for graphics | unit `unterminated_apc_is_bounded` |

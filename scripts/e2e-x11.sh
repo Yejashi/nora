@@ -281,7 +281,37 @@ scenario_zoom() {
     pass zoom
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom)
+# Flood: an unterminated OSC followed by 200 MiB of payload must not grow
+# nora's memory (the frame is capped and dropped), and output after the
+# terminator still renders.
+scenario_flood() {
+    local dir="$OUT/flood"; mkdir -p "$dir"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+sleep 1
+printf '\033]0;'
+head -c 209715200 /dev/zero | tr '\\000' a
+printf '\007FLOOD DONE\r\n'
+touch "$dir/done"
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch flood "$dir/child.sh" || { fail flood "no window"; return; }
+    local before after
+    before=$(awk '/^VmRSS/{print $2}' "/proc/$NORA_PID/status")
+    for _ in $(seq 1 600); do [ -e "$dir/done" ] && break; sleep 0.1; done
+    sleep 1
+    after=$(awk '/^VmHWM/{print $2}' "/proc/$NORA_PID/status")
+    shot "$dir/shot.png"
+    finish
+    [ -e "$dir/done" ] || { fail flood "child did not finish the flood"; return; }
+    echo "  rss before ${before} kB, peak after ${after} kB"
+    [ $((after - before)) -lt 65536 ] || { fail flood "memory grew by $(( (after - before) / 1024 )) MiB"; return; }
+    [ "$(count_color "$dir/shot.png" '#FFFFFF')" -gt 100 ] || { fail flood "no output after the flood"; return; }
+    pass flood
+}
+
+ALL=(render tty resize keys mouse redraw selection zoom flood)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

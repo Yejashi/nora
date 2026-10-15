@@ -123,12 +123,20 @@ enum FilterState {
     ApcEsc,
 }
 
+/// Largest single APC frame inspected for graphics (4 MiB; the kitty
+/// protocol recommends 4096-byte chunks). Larger frames are ignored, and
+/// the buffer never grows past the cap (audit P3).
+pub const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
+
 /// A byte-level state machine that extracts graphics APCs in parallel with
 /// the vte parser.
 #[derive(Debug, Clone)]
 pub struct GraphicsFilter {
     state: FilterState,
     buffer: Vec<u8>,
+    /// The current APC outgrew [`MAX_APC_BYTES`]; it is ignored at its
+    /// terminator.
+    overflow: bool,
 }
 
 impl GraphicsFilter {
@@ -137,6 +145,21 @@ impl GraphicsFilter {
         Self {
             state: FilterState::Pass,
             buffer: Vec::new(),
+            overflow: false,
+        }
+    }
+
+    /// Buffer APC bytes up to [`MAX_APC_BYTES`]; past it, mark the frame
+    /// overflowed and release the buffer.
+    fn hold(&mut self, bytes: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        if self.buffer.len() + bytes.len() > MAX_APC_BYTES {
+            self.overflow = true;
+            self.buffer = Vec::new();
+        } else {
+            self.buffer.extend_from_slice(bytes);
         }
     }
 
@@ -166,7 +189,9 @@ impl GraphicsFilter {
                     if byte == 0x1B {
                         self.state = FilterState::ApcEsc;
                     } else if byte == 0x9C {
-                        if let Some(event) = parse_payload(&self.buffer) {
+                        if !std::mem::take(&mut self.overflow)
+                            && let Some(event) = parse_payload(&self.buffer)
+                        {
                             // Only 'G' is the graphics protocol; other APC
                             // commands (e.g. titles) are not graphics events.
                             if event.command == b'G' {
@@ -177,14 +202,17 @@ impl GraphicsFilter {
                         self.state = FilterState::Pass;
                     } else if byte == 0x18 || byte == 0x1A {
                         self.buffer.clear();
+                        self.overflow = false;
                         self.state = FilterState::Pass;
                     } else {
-                        self.buffer.push(byte);
+                        self.hold(&[byte]);
                     }
                 }
                 FilterState::ApcEsc => {
                     if byte == 0x5C {
-                        if let Some(event) = parse_payload(&self.buffer) {
+                        if !std::mem::take(&mut self.overflow)
+                            && let Some(event) = parse_payload(&self.buffer)
+                        {
                             // Only 'G' is the graphics protocol; other APC
                             // commands (e.g. titles) are not graphics events.
                             if event.command == b'G' {
@@ -194,8 +222,7 @@ impl GraphicsFilter {
                         self.buffer.clear();
                         self.state = FilterState::Pass;
                     } else {
-                        self.buffer.push(0x1B);
-                        self.buffer.push(byte);
+                        self.hold(&[0x1B, byte]);
                         self.state = FilterState::Apc;
                     }
                 }
@@ -291,4 +318,27 @@ fn decode_base64_bytes(input: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod apc_cap_tests {
+    use super::*;
+
+    /// Audit P3: an endless APC keeps the buffer at or below the cap and
+    /// yields no graphics event.
+    #[test]
+    fn unterminated_apc_is_bounded() {
+        let mut filter = GraphicsFilter::new();
+        let _ = filter.process(b"\x1b_Ga=t;");
+        let chunk = vec![b'A'; 1 << 20];
+        for _ in 0..100 {
+            let (_, events) = filter.process(&chunk);
+            assert!(events.is_empty());
+            assert!(filter.buffer.len() <= MAX_APC_BYTES);
+        }
+        let (_, events) = filter.process(b"\x1b\\");
+        assert!(events.is_empty(), "an overlong APC is ignored");
+        let (_, events) = filter.process(b"\x1b_Ga=q,i=1;AAAA\x1b\\");
+        assert_eq!(events.len(), 1, "the next APC is parsed again");
+    }
 }
