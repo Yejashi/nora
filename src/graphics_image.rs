@@ -1,9 +1,12 @@
-//! Bounded inline image upload and storage (N33a).
+//! Bounded inline image upload and storage (N33a, N34).
 //!
-//! [`ImageStore`] decodes and stores uploaded graphics images with strict
-//! size validation, checked allocation arithmetic, and per-image and total
-//! byte budgets. It advertises only the capabilities it supports (one pixel
-//! format: RGBA).
+//! [`ImageStore`] stores uploaded graphics images with strict size
+//! validation, checked allocation arithmetic, and per-image and total byte
+//! budgets. It advertises only the capabilities it supports (the `f=24`
+//! RGB and `f=32` RGBA pixel formats, stored internally as RGBA).
+//! [`GraphicsHandler`] processes the real kitty-graphics protocol
+//! (`G` + `key=value` control data, per ADR-011) against the image and
+//! placement stores and generates protocol replies.
 
 use std::collections::HashMap;
 
@@ -17,8 +20,6 @@ pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum number of stored image IDs.
 pub const MAX_IMAGE_IDS: usize = 1024;
-/// Bytes per pixel for the supported RGBA format.
-const BYTES_PER_PIXEL: usize = 4;
 
 /// An upload error (protocol-appropriate).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,13 +58,68 @@ impl Image {
     }
 }
 
+/// Bytes per source pixel for each supported kitty pixel format.
+///
+/// The real protocol uses `f=24` (8-bit RGB) and `f=32` (8-bit RGBA, the
+/// default); `f=100` (PNG) is a later slice. Returns `None` for unsupported
+/// formats.
+fn bytes_per_pixel(format: u32) -> Option<usize> {
+    Some(match format {
+        24 => 3, // 8-bit-per-channel RGB (f=24)
+        32 => 4, // 8-bit-per-channel RGBA (f=32)
+        _ => return None,
+    })
+}
+
+/// Convert pixel data from a supported kitty format to the internal RGBA
+/// representation (4 bytes per pixel).
+///
+/// `data` must be exactly `width * height * bytes_per_pixel(format)` bytes;
+/// a mismatch is a `DataLengthMismatch` error. An unsupported `format` is an
+/// `UnsupportedFormat` error. The colorspace field is ignored (all source
+/// values are used as-is; linear/scRGB conversion is a later concern).
+pub fn convert_to_rgba(
+    format: u32,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<Vec<u8>, UploadError> {
+    let bpp = bytes_per_pixel(format).ok_or(UploadError::UnsupportedFormat)?;
+    // A zero dimension is degenerate; reject it (consistent with upload_rgba).
+    if width == 0 || height == 0 {
+        return Err(UploadError::DimensionTooLarge);
+    }
+    let expected = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|v| v.checked_mul(bpp as u64))
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or(UploadError::DimensionTooLarge)?;
+    if data.len() != expected as usize {
+        return Err(UploadError::DataLengthMismatch);
+    }
+    let pixels = width as usize * height as usize;
+    let mut out = Vec::with_capacity(pixels * 4);
+    match format {
+        32 => out.extend_from_slice(data),
+        24 => {
+            // RGB: append alpha = 255.
+            for chunk in data.chunks_exact(3) {
+                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+        }
+        _ => return Err(UploadError::UnsupportedFormat),
+    }
+    Ok(out)
+}
+
 /// The capabilities the graphics implementation advertises.
 ///
 /// Only what is actually supported is listed; unsupported capabilities are
 /// not advertised as full protocol support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphicsCapabilities {
-    /// Supported pixel formats (RGBA only).
+    /// Supported pixel format `f` values (`24` RGB, `32` RGBA; stored
+    /// internally as RGBA).
     pub supported_formats: &'static [u32],
     /// Maximum dimension (width or height) for a single image.
     pub max_dimension: u32,
@@ -76,105 +132,86 @@ pub struct GraphicsCapabilities {
 }
 
 /// A bounded image cache (per-image and total budgets).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ImageStore {
     images: HashMap<u32, Image>,
     total_bytes: usize,
     next_id: u32,
 }
 
+impl Default for ImageStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImageStore {
     /// Create an empty store.
+    ///
+    /// Image IDs are auto-assigned starting at 1 (0 is reserved for the
+    /// "clear all" delete sentinel).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            images: HashMap::new(),
+            total_bytes: 0,
+            next_id: 1,
+        }
     }
 
-    /// Upload an image from a decoded payload.
+    /// Store an image from decoded RGBA pixel data.
     ///
-    /// `params` is the raw params string (after the command char), with the
-    /// form `<flags>;<id>;<width>;<height>;<colorspace>;<format>;<data>`.
-    /// `data` is the base64-decoded pixel data (from the N32a filter).
+    /// `rgba` is the pixel data (4 bytes per pixel, `width * height * 4`
+    /// bytes) already converted to the internal RGBA representation (see
+    /// [`convert_to_rgba`]). `image_id` is the requested image ID, or `None`
+    /// (or `Some(0)`) to auto-assign.
     ///
     /// Returns the image ID on success, or an error on failure.
-    pub fn upload(&mut self, params: &str, data: &[u8]) -> Result<u32, UploadError> {
-        // Split params on `;` into fields.
-        let fields: Vec<&str> = params.split(';').collect();
-        // Need exactly 7 fields: flags, id, width, height, colorspace, format, data.
-        if fields.len() != 7 {
-            return Err(UploadError::MalformedParams);
-        }
-        // Parse the metadata fields.
-        let flags: u32 = fields[0]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        let id: u32 = fields[1]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        let width: u32 = fields[2]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        let height: u32 = fields[3]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        let _colorspace: u32 = fields[4]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        let format: u32 = fields[5]
-            .parse()
-            .map_err(|_| UploadError::MalformedParams)?;
-        // Validate flags (0 = no reply, 1 = reply).
-        if flags > 1 {
-            return Err(UploadError::MalformedParams);
-        }
+    pub fn upload_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        image_id: Option<u32>,
+    ) -> Result<u32, UploadError> {
         // Validate dimensions (non-zero, within max).
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(UploadError::DimensionTooLarge);
         }
-        // Validate the pixel format (only RGBA = 1 is supported).
-        if format != 1 {
-            return Err(UploadError::UnsupportedFormat);
-        }
-        // Checked allocation arithmetic: width * height * BYTES_PER_PIXEL.
-        let expected_bytes = (width as u64)
-            .checked_mul(height as u64)
-            .and_then(|v| v.checked_mul(BYTES_PER_PIXEL as u64))
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or(UploadError::DimensionTooLarge)?;
-        // Validate the data length matches the expected size.
-        if data.len() != expected_bytes as usize {
-            return Err(UploadError::DataLengthMismatch);
-        }
-        // Enforce the per-image byte budget.
-        if data.len() > MAX_IMAGE_BYTES {
+        // Enforce the per-image byte budget (on the stored RGBA data).
+        if rgba.len() > MAX_IMAGE_BYTES {
             return Err(UploadError::PerImageBudget);
         }
         // Enforce the total byte budget.
-        if self.total_bytes + data.len() > MAX_TOTAL_BYTES {
+        if self.total_bytes + rgba.len() > MAX_TOTAL_BYTES {
             return Err(UploadError::TotalBudget);
         }
-        // Determine the image ID (auto-assign if 0).
-        let image_id = if id == 0 {
-            if self.images.len() >= MAX_IMAGE_IDS {
-                return Err(UploadError::TooManyIds);
+        // Determine the image ID (auto-assign if absent or 0).
+        let image_id = match image_id {
+            Some(0) | None => {
+                if self.images.len() >= MAX_IMAGE_IDS {
+                    return Err(UploadError::TooManyIds);
+                }
+                // IDs are 1-based (0 is the auto-assign / clear-all sentinel).
+                let new_id = self.next_id;
+                self.next_id = self.next_id.wrapping_add(1);
+                new_id
             }
-            let new_id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1);
-            new_id
-        } else {
-            // Explicit ID: must not already be in use.
-            if self.images.contains_key(&id) {
-                return Err(UploadError::MalformedParams);
+            Some(id) => {
+                // Explicit ID: must not already be in use.
+                if self.images.contains_key(&id) {
+                    return Err(UploadError::MalformedParams);
+                }
+                if self.images.len() >= MAX_IMAGE_IDS {
+                    return Err(UploadError::TooManyIds);
+                }
+                id
             }
-            if self.images.len() >= MAX_IMAGE_IDS {
-                return Err(UploadError::TooManyIds);
-            }
-            id
         };
         // Store the image.
         let image = Image {
             width,
             height,
-            pixels: data.to_vec(),
+            pixels: rgba.to_vec(),
         };
         self.total_bytes += image.byte_cost();
         self.images.insert(image_id, image);
@@ -203,15 +240,24 @@ impl ImageStore {
         Some(image)
     }
 
+    /// Remove all images, returning the number removed.
+    pub fn clear(&mut self) -> usize {
+        let n = self.images.len();
+        self.total_bytes = 0;
+        self.images.clear();
+        n
+    }
+
     /// The total byte cost of all images.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
-    /// The capabilities this implementation advertises (RGBA only).
+    /// The capabilities this implementation advertises (the supported pixel
+    /// formats: `f=24` RGB and `f=32` RGBA; `f=100` PNG is a later slice).
     pub fn capabilities() -> GraphicsCapabilities {
         GraphicsCapabilities {
-            supported_formats: &[1],
+            supported_formats: &[24, 32],
             max_dimension: MAX_DIMENSION,
             max_image_bytes: MAX_IMAGE_BYTES,
             max_total_bytes: MAX_TOTAL_BYTES,
@@ -406,33 +452,18 @@ pub fn clip(
     })
 }
 
-/// Protocol reply status codes (documented subset of the kitty graphics
-/// protocol).
-pub mod status {
-    /// The command succeeded.
-    pub const SUCCESS: u8 = 0;
-    /// Too many images / IDs (total budget or ID cap reached).
-    pub const TOO_MANY: u8 = 1;
-    /// Invalid parameter (malformed params, unsupported format, bad
-    /// dimensions, unknown image).
-    pub const INVALID_PARAM: u8 = 2;
-    /// Corrupted image data (length mismatch).
-    pub const CORRUPTED: u8 = 3;
-    /// Memory allocation failure (per-image budget exceeded).
-    pub const ALLOC_FAILURE: u8 = 4;
-    /// Internal error.
-    pub const INTERNAL: u8 = 5;
-    /// Query: the image was not found.
-    pub const NOT_FOUND: u8 = 1;
-}
-
 /// A protocol handler that processes [`GraphicsEvent`]s against the image
 /// and placement stores and generates protocol replies.
 ///
-/// The reply format (documented subset) is an APC reusing the command
-/// character: `ESC _ <cmd>;<status>;<id> ST`. Query replies additionally
-/// carry the image dimensions. Replies are produced only when the reply
-/// flag (bit 0 of the flags field) is set.
+/// The handler speaks the real kitty-graphics protocol (per ADR-011): a `G`
+/// command character followed by comma-separated `key=value` control data.
+/// The action is selected by the `a` key (`T` transmit [default], `p`
+/// placement, `q` query, `d` delete); `q=1` suppresses replies.
+///
+/// The reply format (documented subset) is an APC reusing the `G` command
+/// character: `ESC _ G <keys> ST`, where `<keys>` carries the image ID
+/// (`i`), the placement ID (`p`, for placement replies), the image
+/// dimensions (`s`/`v`, for query replies), and an `OK`/`ERR` status.
 pub struct GraphicsHandler {
     /// The uploaded images.
     pub images: ImageStore,
@@ -455,122 +486,141 @@ impl GraphicsHandler {
         }
     }
 
-    /// Process a graphics event, returning the reply string (if the reply
-    /// flag is set and a reply is due) or `None`.
+    /// Process a graphics event, returning the reply string (if a reply is
+    /// due and not suppressed) or `None`.
     pub fn process(&mut self, event: &GraphicsEvent) -> Option<String> {
-        let fields: Vec<&str> = event.params.split(';').collect();
-        let reply = fields
-            .first()
-            .and_then(|f| f.parse::<u32>().ok())
-            .is_some_and(|f| f & 1 == 1);
-        match event.command {
-            b'e' => self.process_upload(&event.params, &event.data, reply),
-            b't' => self.process_place(&fields, reply),
-            b'q' => self.process_query(&fields, reply),
-            b'c' => self.process_delete_image(&fields, reply),
-            b'd' => self.process_delete_placement(&fields, reply),
-            _ => None, // Unsupported command: not advertised, no reply.
+        // The real protocol uses command 'G' with an 'a' action key.
+        if event.command != b'G' {
+            return None;
+        }
+        // Quiet mode: q=1 suppresses replies.
+        let quiet = event.get("q").is_some_and(|v| v == "1");
+        // The action key defaults to transmit (a=T) when absent.
+        let action = event.get("a").unwrap_or("T");
+        match action {
+            "T" => self.process_transmit(event, quiet),
+            "p" => self.process_place(event, quiet),
+            "q" => self.process_query(event, quiet),
+            "d" => self.process_delete(event, quiet),
+            _ => None, // Unsupported action: not advertised, no reply.
         }
     }
 
-    fn process_upload(&mut self, params: &str, data: &[u8], reply: bool) -> Option<String> {
-        // params = <flags>;<id>;<w>;<h>;<colorspace>;<format>;<data>
-        let result = self.images.upload(params, data);
-        let status = match result {
-            Ok(_) => status::SUCCESS,
-            Err(UploadError::MalformedParams)
-            | Err(UploadError::UnsupportedFormat)
-            | Err(UploadError::DimensionTooLarge) => status::INVALID_PARAM,
-            Err(UploadError::DataLengthMismatch) => status::CORRUPTED,
-            Err(UploadError::PerImageBudget) => status::ALLOC_FAILURE,
-            Err(UploadError::TotalBudget) | Err(UploadError::TooManyIds) => status::TOO_MANY,
-        };
-        if reply {
-            match result {
-                Ok(id) => Some(format!("ESC _ e;{status};{id} ST")),
-                Err(_) => Some(format!("ESC _ e;{status};0 ST")),
-            }
-        } else {
+    /// Build a reply APC (`ESC _ G <keys> ST`), or `None` when quiet.
+    fn reply(&self, quiet: bool, keys: &str) -> Option<String> {
+        if quiet {
             None
+        } else {
+            Some(format!("ESC _ G {keys} ST"))
         }
     }
 
-    fn process_place(&mut self, fields: &[&str], reply: bool) -> Option<String> {
-        // params = <flags>;<image_id>;<x>;<y>;<columns>;<rows>
-        if fields.len() != 6 {
-            return reply.then(|| format!("ESC _ t;{};0 ST", status::INVALID_PARAM));
+    /// Transmit (store) an image: `f` (format, default 32), `s`/`v`
+    /// (dimensions), `i` (image ID, optional). Replies only when `i` is
+    /// present (the real protocol) and not quiet.
+    fn process_transmit(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
+        let format = event.get_u32("f").unwrap_or(32);
+        let width = event.get_u32("s").unwrap_or(0);
+        let height = event.get_u32("v").unwrap_or(0);
+        let image_id = event.get_u32("i");
+        // Convert the payload to RGBA (validates format + data length).
+        let rgba = match convert_to_rgba(format, width, height, &event.data) {
+            Ok(rgba) => rgba,
+            Err(_) => {
+                let id = image_id.unwrap_or(0);
+                return self.reply(quiet, &format!("i={id};ERR"));
+            }
+        };
+        let result = self.images.upload_rgba(width, height, &rgba, image_id);
+        match result {
+            Ok(id) => {
+                // Reply only when an image ID was requested (real protocol).
+                if image_id.is_some() {
+                    self.reply(quiet, &format!("i={id};OK"))
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                let id = image_id.unwrap_or(0);
+                self.reply(quiet, &format!("i={id};ERR"))
+            }
         }
-        let image_id: u32 = fields[1].parse().unwrap_or(u32::MAX);
-        let x: i32 = fields[2].parse().unwrap_or(0);
-        let y: i32 = fields[3].parse().unwrap_or(0);
-        let columns: u32 = fields[4].parse().unwrap_or(0);
-        let rows: u32 = fields[5].parse().unwrap_or(0);
-        // The caller ensures the image exists; a missing image is an
-        // invalid parameter.
+    }
+
+    /// Place an image: `i` (image ID), `X`/`Y` (cell offsets), `c`/`r`
+    /// (destination columns/rows). Placement IDs are auto-assigned (1-based);
+    /// the `p` key is not yet supported in this subset.
+    fn process_place(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
+        let image_id = event.get_u32("i").unwrap_or(0);
+        let x = event.get_i32("X").unwrap_or(0);
+        let y = event.get_i32("Y").unwrap_or(0);
+        let columns = event.get_u32("c").unwrap_or(0);
+        let rows = event.get_u32("r").unwrap_or(0);
+        // The image must exist.
         if self.images.query(image_id).is_none() {
-            return reply.then(|| format!("ESC _ t;{};0 ST", status::INVALID_PARAM));
+            return self.reply(quiet, &format!("i={image_id};ERR"));
         }
         let result = self.placements.place(image_id, x, y, columns, rows);
-        let (status, id) = match result {
-            Ok(id) => (status::SUCCESS, id),
-            Err(PlacementError::InvalidDimensions) | Err(PlacementError::TooManyPlacements) => {
-                (status::INVALID_PARAM, 0)
-            }
-        };
-        reply.then(|| format!("ESC _ t;{status};{id} ST"))
+        match result {
+            Ok(id) => self.reply(quiet, &format!("i={image_id},p={id};OK")),
+            Err(_) => self.reply(quiet, &format!("i={image_id};ERR")),
+        }
     }
 
-    fn process_query(&mut self, fields: &[&str], reply: bool) -> Option<String> {
-        // params = <flags>;<id>
-        if fields.len() != 2 {
-            return reply.then(|| format!("ESC _ q;{};0 ST", status::INVALID_PARAM));
-        }
-        let id: u32 = fields[1].parse().unwrap_or(u32::MAX);
+    /// Query an image: `i` (image ID). Replies with the dimensions when
+    /// found, `ERR` when not.
+    fn process_query(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
+        let id = event.get_u32("i").unwrap_or(0);
         match self.images.query(id) {
-            Some(image) => reply.then(|| {
-                format!(
-                    "ESC _ q;{};{};{};{};1;1 ST",
-                    status::SUCCESS,
-                    id,
-                    image.width,
-                    image.height
+            Some(image) => self.reply(
+                quiet,
+                &format!("i={id},s={},v={};OK", image.width, image.height),
+            ),
+            None => self.reply(quiet, &format!("i={id};ERR")),
+        }
+    }
+
+    /// Delete: `a=d` with a `d` variant.
+    /// - no `d` key: clear all visible placements.
+    /// - `d=i` (+ `i`): delete image(s); no `i`/`i=0` deletes all images.
+    /// - `d=p` (+ `p`): delete the placement with that ID.
+    ///
+    /// Other variants are not supported in this subset.
+    fn process_delete(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
+        match event.get("d") {
+            None => {
+                // Clear all visible placements.
+                let had = !self.placements.is_empty();
+                self.placements.clear();
+                self.reply(quiet, if had { "i=0;OK" } else { "i=0;ERR" })
+            }
+            Some("i") => {
+                match event.get_u32("i") {
+                    Some(0) | None => {
+                        // Delete all images.
+                        let had = !self.images.is_empty();
+                        self.images.clear();
+                        self.reply(quiet, if had { "i=0;OK" } else { "i=0;ERR" })
+                    }
+                    Some(id) => {
+                        let found = self.images.delete(id).is_some();
+                        self.reply(
+                            quiet,
+                            &format!("i={id};{}", if found { "OK" } else { "ERR" }),
+                        )
+                    }
+                }
+            }
+            Some("p") => {
+                let id = event.get_u32("p").unwrap_or(0);
+                let found = self.placements.delete(id).is_some();
+                self.reply(
+                    quiet,
+                    &format!("p={id};{}", if found { "OK" } else { "ERR" }),
                 )
-            }),
-            None => reply.then(|| format!("ESC _ q;{};{id} ST", status::NOT_FOUND)),
+            }
+            _ => self.reply(quiet, "ERR"),
         }
-    }
-
-    fn process_delete_image(&mut self, fields: &[&str], reply: bool) -> Option<String> {
-        // params = <flags>;<id> (id=0 clears all)
-        if fields.len() != 2 {
-            return reply.then(|| format!("ESC _ c;{};0 ST", status::INVALID_PARAM));
-        }
-        let id: u32 = fields[1].parse().unwrap_or(u32::MAX);
-        let found = if id == 0 {
-            !self.images.is_empty()
-        } else {
-            self.images.delete(id).is_some()
-        };
-        let status = if found {
-            status::SUCCESS
-        } else {
-            status::NOT_FOUND
-        };
-        reply.then(|| format!("ESC _ c;{status};{id} ST"))
-    }
-
-    fn process_delete_placement(&mut self, fields: &[&str], reply: bool) -> Option<String> {
-        // params = <flags>;<id>
-        if fields.len() != 2 {
-            return reply.then(|| format!("ESC _ d;{};0 ST", status::INVALID_PARAM));
-        }
-        let id: u32 = fields[1].parse().unwrap_or(u32::MAX);
-        let found = self.placements.delete(id).is_some();
-        let status = if found {
-            status::SUCCESS
-        } else {
-            status::NOT_FOUND
-        };
-        reply.then(|| format!("ESC _ d;{status};{id} ST"))
     }
 }

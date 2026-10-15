@@ -6,6 +6,10 @@
 //! transformation). The vte parser drops APC bytes correctly, so forwarding
 //! all bytes keeps the parser in sync.
 //!
+//! The extracted APC payload is parsed into the real kitty-graphics wire
+//! format: a `G` command character, a comma-separated `key=value` control
+//! list, and an optional `;`-separated base64 payload (N34, per ADR-011).
+//!
 //! [`GraphicsQueue`] is a byte-bounded queue of [`GraphicsEvent`]s, evicting
 //! the oldest event when the byte cap is exceeded. The cap matches the
 //! recorder's 1 MiB byte cap, so large graphics payloads do not evict
@@ -13,22 +17,44 @@
 
 use std::collections::VecDeque;
 
-/// A parsed kitty-graphics APC payload.
+/// A parsed kitty-graphics APC payload (the real `G` + `key=value` protocol).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphicsEvent {
-    /// The command character (e, t, q, c, ...).
+    /// The command character (`G` in the real protocol).
     pub command: u8,
-    /// The raw params string (the part after the first `;`), unparsed.
-    pub params: String,
-    /// Base64-decoded image data, if present; empty when the payload has none.
+    /// The parsed control keys (comma-separated `key=value` pairs, in order).
+    pub keys: Vec<(String, String)>,
+    /// Base64-decoded payload (empty when the APC has none).
     pub data: Vec<u8>,
 }
 
 impl GraphicsEvent {
-    /// The byte cost of this event (for queue bounding). The command is 1
-    /// byte and is not counted separately.
+    /// Look up a control key by name (case-sensitive), returning its value.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.keys
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Look up a control key as a parsed `u32`.
+    pub fn get_u32(&self, key: &str) -> Option<u32> {
+        self.get(key).and_then(|v| v.parse::<u32>().ok())
+    }
+
+    /// Look up a control key as a parsed `i32`.
+    pub fn get_i32(&self, key: &str) -> Option<i32> {
+        self.get(key).and_then(|v| v.parse::<i32>().ok())
+    }
+
+    /// The byte cost of this event (for queue bounding).
     fn byte_cost(&self) -> usize {
-        self.data.len() + self.params.len()
+        self.data.len()
+            + self
+                .keys
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 2)
+                .sum::<usize>()
     }
 }
 
@@ -141,7 +167,11 @@ impl GraphicsFilter {
                         self.state = FilterState::ApcEsc;
                     } else if byte == 0x9C {
                         if let Some(event) = parse_payload(&self.buffer) {
-                            events.push(event);
+                            // Only 'G' is the graphics protocol; other APC
+                            // commands (e.g. titles) are not graphics events.
+                            if event.command == b'G' {
+                                events.push(event);
+                            }
                         }
                         self.buffer.clear();
                         self.state = FilterState::Pass;
@@ -155,7 +185,11 @@ impl GraphicsFilter {
                 FilterState::ApcEsc => {
                     if byte == 0x5C {
                         if let Some(event) = parse_payload(&self.buffer) {
-                            events.push(event);
+                            // Only 'G' is the graphics protocol; other APC
+                            // commands (e.g. titles) are not graphics events.
+                            if event.command == b'G' {
+                                events.push(event);
+                            }
                         }
                         self.buffer.clear();
                         self.state = FilterState::Pass;
@@ -179,13 +213,15 @@ impl Default for GraphicsFilter {
 
 /// Parse an APC payload into a [`GraphicsEvent`].
 ///
-/// The payload is split on the first `;` — the part before is the command
-/// char, the part after is `params` + optional base64 `data`. The base64
-/// `data` is decoded into `data` (empty on failure/absent).
-fn parse_payload(buffer: &[u8]) -> Option<GraphicsEvent> {
-    // The buffer is the APC payload (after `ESC _`, before the ST
-    // terminator). It has the form: <command> ; <params> [ <base64> ]
-    // e.g. "e;25;25;0;0;1;100;100;..."
+/// The payload has the form `G<control data>[;<base64 payload>]`, where the
+/// control data is a comma-separated list of `key=value` pairs (the real
+/// kitty-graphics protocol, per ADR-011). The optional base64 payload follows
+/// the first `;`. The base64 alphabet contains no `;`, so the first `;` is
+/// always the control/payload separator. Examples:
+/// - `Gf=24,s=10,v=20;<payload>` — transmit 24-bit RGB, 10x20.
+/// - `Gm=1;<chunk>` — first chunk (not the last).
+/// - `Ga=d,d=i,i=10` — delete image 10 (no payload).
+pub fn parse_payload(buffer: &[u8]) -> Option<GraphicsEvent> {
     if buffer.is_empty() {
         return None;
     }
@@ -193,69 +229,66 @@ fn parse_payload(buffer: &[u8]) -> Option<GraphicsEvent> {
     if !command.is_ascii_alphanumeric() {
         return None;
     }
-    // Find the first `;` after the command char.
     let rest = &buffer[1..];
-    let split = rest.iter().position(|&b| b == b';')?;
-    let params = &rest[split + 1..];
-    // Everything after the first `;` is the params string (unparsed). The
-    // base64 data is the last comma-separated field if it looks like base64.
-    // For N32a, we keep the params unparsed and attempt to decode the last
-    // field as base64 if it is long enough to be image data.
-    let params_str = String::from_utf8_lossy(params).into_owned();
-    // Attempt to decode the last comma-separated field as base64.
-    let data = decode_trailing_base64(&params_str);
+    // Split on the first `;`: control data before it, base64 payload after.
+    let (control, payload_b64) = match rest.iter().position(|&b| b == b';') {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => (rest, &b""[..]),
+    };
+    let keys = parse_control_data(control)?;
+    let data = if payload_b64.is_empty() {
+        Vec::new()
+    } else {
+        decode_base64_bytes(payload_b64)?
+    };
     Some(GraphicsEvent {
         command,
-        params: params_str,
+        keys,
         data,
     })
 }
 
-/// Attempt to decode the last comma-separated field of `params` as base64.
-/// Returns the decoded bytes, or empty if the field is not valid base64 or
-/// is too short to be image data (less than 4 chars).
-fn decode_trailing_base64(params: &str) -> Vec<u8> {
-    // The last comma-separated field is the base64 data (if present).
-    let last_field = params.rsplit(';').next().unwrap_or("");
-    if last_field.len() < 4 {
-        return Vec::new();
+/// Parse comma-separated `key=value` control data into an ordered list of
+/// `(key, value)` pairs. Pairs without an `=` are skipped (lenient); an empty
+/// control string yields an empty list.
+fn parse_control_data(control: &[u8]) -> Option<Vec<(String, String)>> {
+    let control_str = std::str::from_utf8(control).ok()?;
+    let mut keys = Vec::new();
+    for pair in control_str.split(',') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some(eq) = pair.find('=') {
+            let key = &pair[..eq];
+            let value = &pair[eq + 1..];
+            keys.push((key.to_string(), value.to_string()));
+        }
     }
-    // Validate that the field is valid base64 (A-Z, a-z, 0-9, +, /, =).
-    let is_base64 = last_field
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-');
-    if !is_base64 {
-        return Vec::new();
-    }
-    // Decode base64. We use a simple hand-written decoder to avoid a
-    // dependency.
-    decode_base64(last_field)
+    Some(keys)
 }
 
-/// A simple hand-written base64 decoder (no external dependency).
-/// Returns the decoded bytes, or empty on failure.
-fn decode_base64(input: &str) -> Vec<u8> {
+/// A hand-written base64 decoder over bytes (no external dependency).
+/// Returns the decoded bytes, or `None` on invalid input.
+fn decode_base64_bytes(input: &[u8]) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     let mut buf: u32 = 0;
     let mut bits = 0;
-    for c in input.chars() {
-        if c == '=' {
-            break;
-        }
-        let val = match c {
-            'A'..='Z' => c as u32 - 'A' as u32,
-            'a'..='z' => c as u32 - 'a' as u32 + 26,
-            '0'..='9' => c as u32 - '0' as u32 + 52,
-            '+' | '-' => 62,
-            '/' | '_' => 63,
-            _ => return Vec::new(),
+    for &b in input {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
         };
-        buf = (buf << 6) | val;
+        buf = (buf << 6) | val as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             output.push(((buf >> bits) & 0xFF) as u8);
         }
     }
-    output
+    Some(output)
 }

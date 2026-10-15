@@ -1,20 +1,20 @@
-//! Synthetic-payload experiment for the N32a graphics filter.
+//! Synthetic-payload tests for the N32a/N34 graphics filter.
 //!
 //! These tests exercise `GraphicsFilter` and `GraphicsQueue` directly (not
-//! through `Engine`), verifying that the filter extracts kitty-graphics
-//! APCs in parallel with the vte parser without breaking ordinary terminal
-//! text.
+//! through `Engine`), verifying that the filter extracts kitty-graphics APCs
+//! (the real protocol: `G` + comma-separated `key=value` control data, per
+//! ADR-011) in parallel with the vte parser without breaking ordinary
+//! terminal text.
 
-use nora::graphics_filter::{GraphicsFilter, GraphicsQueue};
+use nora::graphics_filter::{GraphicsEvent, GraphicsFilter, GraphicsQueue};
 
-/// Build a well-formed kitty-graphics APC: `ESC _ e ; <params> <base64> ST`.
-fn apc(command: u8, params: &str, base64: &str) -> Vec<u8> {
-    let mut out = vec![0x1B, 0x5F, command, b';']; // ESC _ <command> ;
-    out.extend_from_slice(params.as_bytes());
-    if !base64.is_empty() {
-        out.push(b';');
-        out.extend_from_slice(base64.as_bytes());
-    }
+/// Build a well-formed kitty-graphics APC: `ESC _ G<control data>;<base64> ST`.
+///
+/// `payload` is the bytes between `ESC _` and `ESC \`, starting with the `G`
+/// command character (e.g. `Gs=2,v=2;YWJj`).
+fn apc(payload: &str) -> Vec<u8> {
+    let mut out = vec![0x1B, 0x5F]; // ESC _
+    out.extend_from_slice(payload.as_bytes());
     out.push(0x1B); // ESC
     out.push(0x5C); // \ (ST terminator)
     out
@@ -32,17 +32,19 @@ fn ordinary_text_preserved() {
 }
 
 /// Synthetic APC: feed a well-formed kitty-graphics APC; verify one
-/// GraphicsEvent with the correct command, params, and base64-decoded data.
+/// GraphicsEvent with the correct command, keys, and base64-decoded data.
 #[test]
 fn synthetic_apc() {
     let mut filter = GraphicsFilter::new();
-    // base64 of "abc" is "YWJj"
-    let payload = apc(b'e', "25;25;0;0;1", "YWJj");
+    // base64 of "abc" is "YWJj".
+    let payload = apc("Gs=2,v=2;YWJj");
     let (forward, events) = filter.process(&payload);
     assert_eq!(forward, payload.as_slice(), "all bytes must be forwarded");
     assert_eq!(events.len(), 1, "exactly one GraphicsEvent");
     let event = &events[0];
-    assert_eq!(event.command, b'e');
+    assert_eq!(event.command, b'G');
+    assert_eq!(event.get("s"), Some("2"));
+    assert_eq!(event.get("v"), Some("2"));
     assert_eq!(event.data, b"abc", "base64 'YWJj' decodes to 'abc'");
 }
 
@@ -51,7 +53,7 @@ fn synthetic_apc() {
 /// GraphicsEvent.
 #[test]
 fn chunking_reassembles() {
-    let payload = apc(b'e', "25;25;0;0;1", "YWJj");
+    let payload = apc("Gs=2,v=2;YWJj");
 
     // Byte-by-byte.
     let mut filter = GraphicsFilter::new();
@@ -61,7 +63,7 @@ fn chunking_reassembles() {
         all_events.extend(events);
     }
     assert_eq!(all_events.len(), 1, "byte-by-byte reassembly");
-    assert_eq!(all_events[0].command, b'e');
+    assert_eq!(all_events[0].command, b'G');
     assert_eq!(all_events[0].data, b"abc");
 
     // Irregular chunks (split in the middle of the base64).
@@ -72,7 +74,7 @@ fn chunking_reassembles() {
     all_events.extend(filter.process(first).1);
     all_events.extend(filter.process(second).1);
     assert_eq!(all_events.len(), 1, "irregular-chunk reassembly");
-    assert_eq!(all_events[0].command, b'e');
+    assert_eq!(all_events[0].command, b'G');
     assert_eq!(all_events[0].data, b"abc");
 }
 
@@ -85,9 +87,9 @@ fn oversize_evicts_oldest() {
     for i in 0..3u8 {
         let mut data = vec![0u8; 500_000];
         data[0] = i;
-        let event = nora::graphics_filter::GraphicsEvent {
-            command: b'e',
-            params: String::new(),
+        let event = GraphicsEvent {
+            command: b'G',
+            keys: Vec::new(),
             data,
         };
         queue.push(event);
@@ -114,7 +116,7 @@ fn oversize_evicts_oldest() {
 fn recovery_after_abort() {
     let mut filter = GraphicsFilter::new();
     // Start an APC, then abort it with CAN (0x18).
-    let mut payload = vec![0x1B, 0x5F, b'e', b';', b'2', b'5'];
+    let mut payload = vec![0x1B, 0x5F, b'G', b's', b'='];
     payload.push(0x18); // CAN: abort the APC
     let (forward, events) = filter.process(&payload);
     assert_eq!(forward, payload.as_slice(), "all bytes must be forwarded");
@@ -131,11 +133,11 @@ fn recovery_after_abort() {
 /// the filter stays in sync (the parser would also handle this correctly).
 #[test]
 fn mid_sequence_frame() {
-    let mut filter = GraphicsFilter::new();
     // Partial CSI (incomplete sequence), then a well-formed APC.
     let mut payload = vec![0x1B, b'[', b'1', b';', b'3']; // partial CSI
-    let apc = apc(b'e', "25;25;0;0;1", "YWJj");
+    let apc = apc("Gs=2,v=2;YWJj");
     payload.extend_from_slice(&apc);
+    let mut filter = GraphicsFilter::new();
     let (forward, events) = filter.process(&payload);
     assert_eq!(forward, payload.as_slice(), "all bytes must be forwarded");
     assert_eq!(
@@ -143,7 +145,7 @@ fn mid_sequence_frame() {
         1,
         "the APC after the partial CSI must be extracted"
     );
-    assert_eq!(events[0].command, b'e');
+    assert_eq!(events[0].command, b'G');
     assert_eq!(events[0].data, b"abc");
 }
 
@@ -157,14 +159,14 @@ fn engine_feed_preserves_semantics() {
     // Feed ordinary text.
     engine.feed(b"Hello");
     // Feed a well-formed APC.
-    let payload = apc(b'e', "25;25;0;0;1", "YWJj");
+    let payload = apc("Gs=2,v=2;YWJj");
     engine.feed(&payload);
     // The graphics queue should have one event.
     let events = engine.drain_graphics();
     assert_eq!(events.len(), 1, "Engine must have extracted the APC");
-    assert_eq!(events[0].command, b'e');
+    assert_eq!(events[0].command, b'G');
     assert_eq!(events[0].data, b"abc");
-    // The terminal state should be correct (the filter did not break normal text).
-    // (We don't assert the full grid here; the point is that the filter
-    // did not panic or corrupt the parser state.)
+    // The terminal state should be correct (the filter did not break normal
+    // text). (We don't assert the full grid here; the point is that the
+    // filter did not panic or corrupt the parser state.)
 }

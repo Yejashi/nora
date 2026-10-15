@@ -1193,8 +1193,8 @@ fn pty_graphics_apc_reaches_shared_queue() {
     assert!(
         events
             .iter()
-            .any(|event| event.command == b'e' && event.data == b"hello"),
-        "expected a graphics event with command 'e' and data 'hello'; got {events:?}"
+            .any(|event| event.command == b'G' && event.data == b"hello"),
+        "expected a graphics event with command 'G' and data 'hello'; got {events:?}"
     );
 
     session.close();
