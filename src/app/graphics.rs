@@ -242,7 +242,7 @@ fn clear_color(rgba: [u8; 4], srgb_target: bool) -> wgpu::Color {
 
 /// The selection highlight background (N14b), as resolved RGBA: a muted
 /// blue drawn under the selected cells before the glyphs.
-const SELECTION_BG: [u8; 4] = [0x33, 0x55, 0x77, 255];
+pub const SELECTION_BG: [u8; 4] = [0x33, 0x55, 0x77, 255];
 
 /// The search highlight background (N20b), as resolved RGBA: a muted
 /// amber drawn under the current match's span; drawn after the selection
@@ -348,6 +348,8 @@ pub struct Graphics {
     glyph_cache: GlyphCache,
     /// N13c decoration (underline/strikethrough) fill pipeline.
     deco_pipeline: wgpu::RenderPipeline,
+    /// Selection highlight color (`[colors] selection_background`).
+    selection_bg: [u8; 4],
 }
 
 impl Graphics {
@@ -427,6 +429,7 @@ impl Graphics {
             renderer,
             glyph_cache: GlyphCache::new(),
             deco_pipeline,
+            selection_bg: SELECTION_BG,
         })
     }
 
@@ -707,7 +710,7 @@ impl Graphics {
                     bottom: y0 + cell_h,
                     y: y0,
                     thickness: cell_h,
-                    color: SELECTION_BG,
+                    color: self.selection_bg,
                 };
                 push_deco_rect(&mut selection, &line, frame_w, frame_h);
             }
@@ -891,6 +894,11 @@ impl Graphics {
     /// On a frame without a texture the (possibly empty) encoder is still
     /// finished and submitted, and dropping the frame releases the failed
     /// acquire before the caller reconfigures the surface.
+    /// Set the selection highlight color.
+    pub fn set_selection_color(&mut self, color: [u8; 4]) {
+        self.selection_bg = color;
+    }
+
     /// Drop every shaped cell: required when the font system is replaced
     /// (font ids change).
     pub fn clear_glyph_cache(&mut self) {

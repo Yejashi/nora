@@ -47,6 +47,9 @@ pub struct Engine {
     /// Per-capture monotonic snapshot epoch (starts at 0; the first
     /// [`Engine::snapshot`] is epoch 1).
     snapshot_epoch: u64,
+    /// Scrollback lines this engine was created with (re-applied when
+    /// terminal options change).
+    history: usize,
     recorder: Recorder,
     /// Shared selection state (N14b): the window thread and pump thread
     /// both touch it through `&self` accessors, so it lives behind a
@@ -573,6 +576,7 @@ impl Engine {
             rows,
             cols,
             snapshot_epoch: 0,
+            history: scrollback,
             recorder,
             selection: Arc::new(Mutex::new(None)),
             kitty_modes: KittyKeyboardModes::default(),
@@ -585,6 +589,20 @@ impl Engine {
             hyperlink_queue: Arc::new(Mutex::new(crate::prompt_marker::HyperlinkQueue::new())),
             hyperlink_store: crate::prompt_marker::HyperlinkStore::new(),
         }
+    }
+
+    /// The cursor shape used until the application sets one (DECSCUSR).
+    pub fn set_default_cursor_shape(&mut self, shape: CursorShape) {
+        let config = Config {
+            scrolling_history: self.history,
+            osc52: Osc52::Disabled,
+            default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+                shape,
+                blinking: false,
+            },
+            ..Default::default()
+        };
+        self.term.lock().set_options(config);
     }
 
     /// Resize the viewport to `rows` × `cols`.

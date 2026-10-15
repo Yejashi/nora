@@ -141,6 +141,55 @@ fn platform_hint() -> String {
 /// in [`glyphs::Fonts`] are physical pixels (they include the scale factor
 /// and zoom), so the grid, the renderer and the mouse mapping agree at
 /// every scale.
+/// Terminal options for new sessions from the configuration.
+pub(crate) fn session_options(config: &nora::config::NoraConfig) -> nora::session::SessionOptions {
+    use alacritty_terminal::vte::ansi::CursorShape as Shape;
+    use nora::config::CursorShape;
+    nora::session::SessionOptions {
+        history: config.history(),
+        cursor_shape: match config.cursor.style {
+            CursorShape::Block => Shape::Block,
+            CursorShape::Beam => Shape::Beam,
+            CursorShape::Underline => Shape::Underline,
+        },
+    }
+}
+
+/// The selection highlight color: `[colors] selection_background`, else
+/// the built-in muted blue.
+fn selection_color(config: &nora::config::NoraConfig) -> [u8; 4] {
+    config
+        .colors
+        .selection_background
+        .as_deref()
+        .and_then(nora::render::palette::parse_hex)
+        .map_or(graphics::SELECTION_BG, |c| [c.r, c.g, c.b, 255])
+}
+
+/// Poll the config file's modification time once a second and send
+/// `AppEvent::ConfigChanged` when it changes (also when it first appears).
+fn watch_config(path: std::path::PathBuf, proxy: winit::event_loop::EventLoopProxy<AppEvent>) {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let spawned = std::thread::Builder::new()
+        .name("nora-config-watch".to_string())
+        .spawn(move || {
+            let mut last = modified(&path);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let now = modified(&path);
+                if now != last {
+                    last = now;
+                    if proxy.send_event(AppEvent::ConfigChanged).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    if spawned.is_err() && debug_enabled() {
+        eprintln!("debug: config watcher not started");
+    }
+}
+
 pub(crate) fn window_grid(window: &Window, fonts: &glyphs::Fonts) -> (u16, u16) {
     let size = window.inner_size();
     glyphs::grid_size(size.width, size.height, fonts.cell_w, fonts.cell_h())
@@ -409,6 +458,15 @@ struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
     /// Local UI key bindings.
     bindings: Bindings,
+    /// Lines per mouse-wheel step (`[scrolling] multiplier`).
+    scroll_lines: i32,
+    /// Selection highlight color.
+    selection_color: [u8; 4],
+    /// A transient message on the bottom row (config reload result),
+    /// cleared by the next key press.
+    notice: Option<String>,
+    /// The loaded configuration and where it came from (for reload).
+    config_state: nora::config::ConfigState,
     /// Wakes this window from other threads (the font loader).
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     /// The full font system being built in the background.
@@ -545,13 +603,15 @@ pub fn run_windowed(
     stop: Arc<AtomicBool>,
     explicit: bool,
     hold: bool,
-    config: &nora::config::NoraConfig,
+    config_state: nora::config::ConfigState,
     fonts: glyphs::Fonts,
 ) -> std::process::ExitCode {
+    let config = &config_state.current;
     if debug_enabled() {
         eprintln!(
             "debug: config loaded: history={}, font.size={}",
-            config.terminal.history, config.font.size
+            config.history(),
+            config.font.size
         );
     }
     // N23b/N24b: the workspace owns all tabs; the window's first tab is
@@ -607,8 +667,12 @@ pub fn run_windowed(
         pressed_buttons: Vec::new(),
         clipboard: create_clipboard(),
         zoom: nora::config::ZOOM_DEFAULT,
-        palette: Palette::from_theme(&config.theme),
-        bindings: Bindings::default(),
+        palette: Palette::from_config(config),
+        bindings: Bindings::with_config(&config.binding_entries()),
+        scroll_lines: i32::from(config.scroll_multiplier()),
+        selection_color: selection_color(config),
+        notice: None,
+        config_state: config_state.clone(),
         last_motion_cell: None,
         pane_titles: std::collections::HashMap::new(),
         proxy: event_loop.create_proxy(),
@@ -1015,6 +1079,64 @@ impl WinApp {
         self.resize_all_panes();
     }
 
+    /// Re-read the configuration and apply it. Colors, bindings, the wheel
+    /// multiplier, the selection color and the cursor shape apply at once;
+    /// a font change reloads the fonts and resizes every pane; scrollback
+    /// applies to new panes; the window size only at startup. A config that
+    /// fails to load or validate leaves the current one in place.
+    fn reload_config(&mut self) {
+        let new_state = match self.config_state.reload() {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!("nora: config not reloaded, keeping the current one: {err}");
+                // The specific problem first: the first validation error,
+                // or the parse/read error line.
+                let detail = match &err {
+                    nora::config::ConfigError::Validation { errors, .. } => {
+                        errors.first().cloned().unwrap_or_default()
+                    }
+                    other => other.to_string().lines().next().unwrap_or("").to_string(),
+                };
+                self.notice = Some(format!("config error (not applied): {detail}"));
+                return;
+            }
+        };
+        let old = std::mem::replace(&mut self.config_state, new_state);
+        let config = self.config_state.current.clone();
+        self.palette = Palette::from_config(&config);
+        self.bindings = Bindings::with_config(&config.binding_entries());
+        self.scroll_lines = i32::from(config.scroll_multiplier());
+        self.selection_color = selection_color(&config);
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.set_selection_color(self.selection_color);
+        }
+        let _ = self.pump_commands.send(PumpMsg::Configure {
+            options: session_options(&config),
+        });
+        if old.current.font != config.font
+            && let Some(window) = self.window.clone()
+        {
+            let mut fonts = glyphs::Fonts::load(&config.font);
+            fonts.measure(window.scale_factor(), self.zoom);
+            let proxy = self.proxy.clone();
+            self.full_fonts = Some(fonts.spawn_full_system(move || {
+                let _ = proxy.send_event(AppEvent::FontsReady);
+            }));
+            self.fonts = Some(fonts);
+            if let Some(graphics) = self.graphics.as_mut() {
+                graphics.clear_glyph_cache();
+            }
+            self.resize_all_panes();
+        }
+        let path = self
+            .config_state
+            .path
+            .as_ref()
+            .map_or("built-in defaults".to_string(), |p| p.display().to_string());
+        eprintln!("nora: config reloaded from {path}");
+        self.notice = Some(format!("config reloaded from {path}"));
+    }
+
     /// Perform a bound UI action. `false` when the action had nothing to
     /// act on, so the key goes to the application instead.
     fn perform(&mut self, action: UiAction) -> bool {
@@ -1057,6 +1179,7 @@ impl WinApp {
                 return self.focus_pane_direction(dir);
             }
             UiAction::ToggleSearch => self.search.toggle(),
+            UiAction::ReloadConfig => self.reload_config(),
             UiAction::ZoomIn | UiAction::ZoomOut | UiAction::ZoomReset => {
                 self.zoom = match action {
                     UiAction::ZoomIn => nora::config::zoom_in(self.zoom),
@@ -1308,7 +1431,7 @@ impl WinApp {
                 let _ = pane;
             }
             // Handled in `user_event` before routing.
-            AppEvent::FontsReady => {}
+            AppEvent::FontsReady | AppEvent::ConfigChanged => {}
             AppEvent::Title { pane, title } => {
                 match title {
                     Some(title) => self.pane_titles.insert(pane, title),
@@ -1564,7 +1687,7 @@ impl WinApp {
                 let mut scene = Scene::default();
                 for (key, x, y, _, _, snap) in &panes {
                     if let Some(snap) = snap {
-                        let cursor = *key == active;
+                        let cursor = (*key == active).then(|| window.has_focus());
                         scene.add_pane(
                             snap,
                             u32::from(*x),
@@ -1625,6 +1748,15 @@ impl WinApp {
                             covered as f32 * layout.cell_w,
                             layout.cell_h,
                         ),
+                    );
+                }
+                if !self.search.visible
+                    && let Some(notice) = self.notice.as_deref()
+                {
+                    scene.add_search_bar(
+                        &format!(" {notice}"),
+                        u32::from(grid_rows.saturating_sub(1)),
+                        u32::from(grid_cols),
                     );
                 }
                 if self.search.visible {
@@ -1825,11 +1957,32 @@ impl ApplicationHandler<AppEvent> for WinApp {
         self.full_fonts = Some(fonts.spawn_full_system(move || {
             let _ = proxy.send_event(AppEvent::FontsReady);
         }));
+        graphics.set_selection_color(self.selection_color);
+        // Live reload when the config file changes (or first appears at
+        // the default location).
+        let watched = self.config_state.path.clone().or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config"))
+                })
+                .map(|dir| dir.join("nora").join("config.toml"))
+        });
+        if let Some(path) = watched {
+            watch_config(path, self.proxy.clone());
+        }
         self.graphics = Some(graphics);
         self.fonts = Some(fonts);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        if let AppEvent::ConfigChanged = event {
+            self.reload_config();
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            return;
+        }
         if let AppEvent::FontsReady = event {
             let full = self
                 .full_fonts
@@ -2041,6 +2194,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 if event.state != ElementState::Pressed || is_synthetic {
                     return;
                 }
+                // A notice (config reload result) is dismissed by any key.
+                if self.notice.take().is_some() {
+                    window.request_redraw();
+                }
                 if self.trace_latency && self.trace_key_at.is_none() {
                     self.trace_key_at = Some(std::time::Instant::now());
                 }
@@ -2160,7 +2317,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // the pump applies the delta to the engine on its next
                 // tick.
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * 3,
+                    MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * self.scroll_lines,
                     MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
                 };
                 // Alternate scroll (DECSET 1007): the alternate screen has

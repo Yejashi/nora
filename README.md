@@ -173,6 +173,7 @@ server available, the launch falls back to the headless session pump.
 | Split right / split below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
 | Focus pane | Ctrl+Shift+Arrow |
 | Close pane (tab, window) | Ctrl+Shift+W |
+| Reload config | Ctrl+Shift+F5 |
 | Search (visible screen) | Ctrl+Shift+F; Enter / Shift+Enter next / previous, Escape closes |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
@@ -189,9 +190,27 @@ passes its key through.
 ### Configuration
 
 Config lives at `~/.config/nora/config.toml` (or
-`$XDG_CONFIG_HOME/nora/config.toml`). Every key is optional; omitted values
-use nora's built-in defaults. See `resources/nora.example.toml` for a
-commented example. Precedence: CLI flags > config file > built-in defaults.
+`$XDG_CONFIG_HOME/nora/config.toml`); `--config PATH` picks another file.
+Every key is optional. The commented example in
+`resources/nora.example.toml` lists every section and key:
+
+| Section | Keys |
+| --- | --- |
+| `[font]` | `family`, `size` (points) |
+| `[colors]` | `foreground`, `background`, `cursor`, `selection_background`, `[colors.normal]` / `[colors.bright]` ANSI colors |
+| `[window]` | `columns`, `lines` (initial size in cells) |
+| `[cursor]` | `style` = `block`, `beam` or `underline` |
+| `[scrolling]` | `history` (lines, default 10000), `multiplier` (wheel lines) |
+| `[[keyboard.bindings]]` | `keys` = chord, `action` = action name or `none` |
+
+The file is watched: saving it applies the change to the running window,
+and Ctrl+Shift+F5 reloads by hand. Colors, cursor, bindings and fonts
+apply immediately, scrollback size applies to new panes, and window size
+at the next start. A file that fails to parse or validate keeps the
+current settings and shows the error on the bottom row. Precedence: CLI
+flags > config file > built-in defaults. The pre-0.2 sections
+`[terminal]`, `[theme]` and `[keys]` are still accepted; the new sections
+win when both are present.
 
 Validate a config without launching:
 

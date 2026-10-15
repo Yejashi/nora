@@ -5,6 +5,7 @@
 //! window. Coordinates are grid cells for cells and fills, physical
 //! pixels for [`PixelRect`]s.
 
+use alacritty_terminal::vte::ansi::CursorShape;
 use cosmic_text::UnderlineStyle;
 use nora::engine::Snapshot;
 use nora::render::style::{CellStyle, cell_style};
@@ -42,14 +43,15 @@ impl Scene {
     /// snapshot's colors must already be a full table (palette overlay).
     /// `frame_bg` is the color the frame is cleared to; a pane whose
     /// default background differs is filled with its own. The cursor is
-    /// drawn only when `cursor` is set (the active pane).
+    /// drawn when `cursor` is `Some(window_focused)` (the active pane);
+    /// an unfocused window shows it hollow.
     pub fn add_pane(
         &mut self,
         snap: &Snapshot,
         col0: u32,
         row0: u32,
         frame_bg: [u8; 3],
-        cursor: bool,
+        cursor: Option<bool>,
         layout: &TermLayout,
     ) {
         let bg = default_bg(snap);
@@ -97,21 +99,44 @@ impl Scene {
                 });
             }
         }
-        if cursor && let Some(block) = cursor_fill(snap, layout) {
+        if let Some(focused) = cursor
+            && let Some(block) = cursor_fill(snap, layout)
+        {
             let (row, col) = (row0 + block.row as u32, col0 + block.col as u32);
-            self.fills.push(CellFill {
-                row,
-                col,
-                span: block.span,
-                color: [block.color.r, block.color.g, block.color.b, 255],
-            });
-            // The glyph under the block is drawn in the cell background so
-            // it stays legible.
-            if let Some(cell) = self.cells[first_cell..]
-                .iter_mut()
-                .find(|cell| cell.row == row && cell.col == col)
-            {
-                cell.style.fg = cell.style.bg;
+            let color = [block.color.r, block.color.g, block.color.b, 255];
+            let (x, y) = (col as f32 * layout.cell_w, row as f32 * layout.cell_h);
+            let w = f32::from(block.span) * layout.cell_w;
+            let h = layout.cell_h;
+            // Bar thickness scales with the cell (2 px at 20 px fonts).
+            let t = (layout.cell_w / 6.0).round().max(1.0);
+            let rect = |x, y, w, h| PixelRect { x, y, w, h, color };
+            match (snap.cursor_shape, focused) {
+                (CursorShape::Hidden, _) => {}
+                // An unfocused window shows an outline, as other terminals do.
+                (_, false) | (CursorShape::HollowBlock, _) => {
+                    self.rects.push(rect(x, y, w, t));
+                    self.rects.push(rect(x, y + h - t, w, t));
+                    self.rects.push(rect(x, y, t, h));
+                    self.rects.push(rect(x + w - t, y, t, h));
+                }
+                (CursorShape::Beam, true) => self.rects.push(rect(x, y, t, h)),
+                (CursorShape::Underline, true) => self.rects.push(rect(x, y + h - t, w, t)),
+                (CursorShape::Block, true) => {
+                    self.fills.push(CellFill {
+                        row,
+                        col,
+                        span: block.span,
+                        color,
+                    });
+                    // The glyph under the block is drawn in the cell
+                    // background so it stays legible.
+                    if let Some(cell) = self.cells[first_cell..]
+                        .iter_mut()
+                        .find(|cell| cell.row == row && cell.col == col)
+                    {
+                        cell.style.fg = cell.style.bg;
+                    }
+                }
             }
         }
     }

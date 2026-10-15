@@ -28,18 +28,137 @@ pub const MAX_FONT_SIZE: f32 = 1000.0;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoraConfig {
-    /// Terminal settings.
-    #[serde(default)]
-    pub terminal: TerminalConfig,
     /// Font settings.
     #[serde(default)]
     pub font: FontConfig,
-    /// Theme/color settings.
+    /// Colors (overrides the legacy `[theme]`).
+    #[serde(default)]
+    pub colors: ColorsConfig,
+    /// Initial window size.
+    #[serde(default)]
+    pub window: WindowConfig,
+    /// Cursor shape.
+    #[serde(default)]
+    pub cursor: CursorConfig,
+    /// Scrollback and wheel.
+    #[serde(default)]
+    pub scrolling: ScrollingConfig,
+    /// Key bindings (override the legacy `[keys]`).
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
+    /// Legacy section (`history`); `[scrolling]` takes precedence.
+    #[serde(default)]
+    pub terminal: TerminalConfig,
+    /// Legacy section; `[colors]` takes precedence.
     #[serde(default)]
     pub theme: ThemeConfig,
-    /// Key bindings.
+    /// Legacy section; `[[keyboard.bindings]]` take precedence.
     #[serde(default)]
     pub keys: KeysConfig,
+}
+
+/// `[colors]`: `#RRGGBB` strings; unset entries keep the theme/built-in
+/// value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColorsConfig {
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub cursor: Option<String>,
+    pub selection_background: Option<String>,
+    #[serde(default)]
+    pub normal: AnsiColors,
+    #[serde(default)]
+    pub bright: AnsiColors,
+}
+
+/// The eight ANSI colors of `[colors.normal]` or `[colors.bright]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnsiColors {
+    pub black: Option<String>,
+    pub red: Option<String>,
+    pub green: Option<String>,
+    pub yellow: Option<String>,
+    pub blue: Option<String>,
+    pub magenta: Option<String>,
+    pub cyan: Option<String>,
+    pub white: Option<String>,
+}
+
+impl AnsiColors {
+    /// The colors in ANSI order (black, red, ..., white) with their names.
+    pub fn entries(&self) -> [(&'static str, &Option<String>); 8] {
+        [
+            ("black", &self.black),
+            ("red", &self.red),
+            ("green", &self.green),
+            ("yellow", &self.yellow),
+            ("blue", &self.blue),
+            ("magenta", &self.magenta),
+            ("cyan", &self.cyan),
+            ("white", &self.white),
+        ]
+    }
+}
+
+/// `[window]`: initial size in cells.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowConfig {
+    pub columns: Option<u16>,
+    pub lines: Option<u16>,
+}
+
+/// Default window size in cells.
+pub const DEFAULT_COLUMNS: u16 = 80;
+pub const DEFAULT_LINES: u16 = 24;
+
+/// Cursor shapes for `[cursor] style`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Beam,
+    Underline,
+}
+
+/// `[cursor]`: the shape used until an application sets one (DECSCUSR).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CursorConfig {
+    #[serde(default)]
+    pub style: CursorShape,
+}
+
+/// `[scrolling]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollingConfig {
+    /// Scrollback lines (0..=1_000_000); default 10 000.
+    pub history: Option<usize>,
+    /// Lines scrolled per mouse-wheel step (1..=100); default 3.
+    pub multiplier: Option<u8>,
+}
+
+/// One `[[keyboard.bindings]]` entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingConfig {
+    /// A chord such as `"ctrl+shift+c"`.
+    pub keys: String,
+    /// An action name (`copy`, `paste`, `new_tab`, ..., or `none` to free
+    /// a default chord).
+    pub action: String,
+}
+
+/// `[keyboard]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardConfig {
+    #[serde(default)]
+    pub bindings: Vec<BindingConfig>,
 }
 
 /// Terminal behavior settings.
@@ -63,12 +182,13 @@ impl Default for TerminalConfig {
     }
 }
 
+/// 10 000 lines, the product default.
 fn default_history() -> usize {
-    1000
+    10_000
 }
 
 /// Font settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FontConfig {
     /// Font family name.
@@ -148,6 +268,46 @@ pub struct KeysConfig {
 }
 
 impl NoraConfig {
+    /// Effective scrollback lines: `[scrolling] history`, else the legacy
+    /// `[terminal] history`.
+    pub fn history(&self) -> usize {
+        self.scrolling.history.unwrap_or(self.terminal.history)
+    }
+
+    /// Effective wheel lines per step.
+    pub fn scroll_multiplier(&self) -> u8 {
+        self.scrolling.multiplier.unwrap_or(3)
+    }
+
+    /// Effective initial window size in cells (columns, lines).
+    pub fn window_cells(&self) -> (u16, u16) {
+        (
+            self.window.columns.unwrap_or(DEFAULT_COLUMNS),
+            self.window.lines.unwrap_or(DEFAULT_LINES),
+        )
+    }
+
+    /// All configured key bindings, legacy `[keys]` first so that
+    /// `[[keyboard.bindings]]` entries override them.
+    pub fn binding_entries(&self) -> Vec<(String, String)> {
+        let mut legacy: Vec<(String, String)> = self
+            .keys
+            .bindings
+            .iter()
+            .map(|(k, a)| (k.clone(), a.clone()))
+            .collect();
+        legacy.sort();
+        legacy
+            .into_iter()
+            .chain(
+                self.keyboard
+                    .bindings
+                    .iter()
+                    .map(|b| (b.keys.clone(), b.action.clone())),
+            )
+            .collect()
+    }
+
     /// Validate the configuration and return a list of human-readable errors.
     ///
     /// An empty list means the config is valid. This is a pure check: it does
@@ -155,6 +315,61 @@ impl NoraConfig {
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
+        if let Some(history) = self.scrolling.history
+            && history > MAX_HISTORY
+        {
+            errors.push(format!(
+                "scrolling.history: {history} exceeds maximum of {MAX_HISTORY}"
+            ));
+        }
+        if let Some(m) = self.scrolling.multiplier
+            && !(1..=100).contains(&m)
+        {
+            errors.push(format!(
+                "scrolling.multiplier: {m} must be between 1 and 100"
+            ));
+        }
+        for (name, value) in [
+            ("columns", self.window.columns),
+            ("lines", self.window.lines),
+        ] {
+            if let Some(v) = value
+                && !(2..=1000).contains(&v)
+            {
+                errors.push(format!("window.{name}: {v} must be between 2 and 1000"));
+            }
+        }
+        let colors = &self.colors;
+        for (name, value) in [
+            ("colors.foreground", &colors.foreground),
+            ("colors.background", &colors.background),
+            ("colors.cursor", &colors.cursor),
+            ("colors.selection_background", &colors.selection_background),
+        ] {
+            if let Some(v) = value
+                && !is_valid_hex_color(v)
+            {
+                errors.push(format!("{name}: '{v}' is not a valid hex color (#RRGGBB)"));
+            }
+        }
+        for (group, ansi) in [("normal", &colors.normal), ("bright", &colors.bright)] {
+            for (name, value) in ansi.entries() {
+                if let Some(v) = value
+                    && !is_valid_hex_color(v)
+                {
+                    errors.push(format!(
+                        "colors.{group}.{name}: '{v}' is not a valid hex color (#RRGGBB)"
+                    ));
+                }
+            }
+        }
+        for (keys, action) in self.binding_entries() {
+            if let Err(message) = crate::input::bindings::parse_binding(&keys, &action) {
+                errors.push(format!(
+                    "keyboard.bindings: '{keys}' = '{action}': {message}"
+                ));
+            }
+        }
         // Validate history.
         if self.terminal.history > MAX_HISTORY {
             errors.push(format!(

@@ -121,6 +121,9 @@ pub enum AppEvent {
     /// The background font loader finished the full font system (sent by
     /// the window's own loader thread, not the pump).
     FontsReady,
+    /// The configuration file changed on disk (sent by the window's file
+    /// watcher, not the pump).
+    ConfigChanged,
     /// The session child for the pane exited (exit code, or None if the
     /// loop died without one).
     ChildExit { pane: PaneKey, status: Option<i32> },
@@ -203,6 +206,10 @@ pub enum PumpMsg {
     /// Reap (close) the session for the pane (N24b); the pump sends
     /// [`AppEvent::PaneGone`].
     ClosePane { pane: PaneKey },
+    /// New terminal options from a config reload: future panes use them,
+    /// running panes take the cursor shape (scrollback is fixed per
+    /// session).
+    Configure { options: super::pty::SessionOptions },
     /// Wake the pump: new PTY output, a child exit, or shutdown. Carries
     /// nothing; at most one is queued at a time (see [`pump_thread`]).
     Wake,
@@ -534,7 +541,9 @@ pub fn pump_thread(
     commands: mpsc::Receiver<PumpMsg>,
     wake_tx: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
+    options: super::pty::SessionOptions,
 ) {
+    let mut options = options;
     // Event-driven wakeup: each session's engine calls `waker` when the PTY
     // loop records output or a child exit; it queues one `PumpMsg::Wake`
     // unless one is already pending, so the queue never grows from wakes.
@@ -586,6 +595,18 @@ pub fn pump_thread(
                 // The wake only ended the wait; the tick above already
                 // picked up the new output.
                 PumpMsg::Wake => {}
+                PumpMsg::Configure { options: new } => {
+                    if new.cursor_shape != options.cursor_shape {
+                        for pane_pump in sessions.values_mut() {
+                            pane_pump
+                                .session
+                                .engine()
+                                .set_default_cursor_shape(new.cursor_shape);
+                            pane_pump.force_snapshot = true;
+                        }
+                    }
+                    options = new;
+                }
                 PumpMsg::NewPane {
                     pane,
                     rows,
@@ -595,7 +616,13 @@ pub fn pump_thread(
                     if debug_enabled() {
                         eprintln!("debug: pump: new pane {pane:?} {rows}x{cols}");
                     }
-                    match PtySession::spawn(spec.clone(), rows, cols, super::pty::DEFAULT_CAP) {
+                    match PtySession::spawn_configured(
+                        spec.clone(),
+                        rows,
+                        cols,
+                        super::pty::DEFAULT_CAP,
+                        &options,
+                    ) {
                         Ok(mut session) => {
                             session.engine().set_waker(waker.clone());
                             sessions.insert(pane, PanePump::new(session));

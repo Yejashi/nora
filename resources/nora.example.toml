@@ -1,40 +1,90 @@
-# nora example configuration (N30).
+# nora configuration example.
 #
-# Copy to ~/.config/nora/config.toml and edit. Every section and key is
-# optional; omitted values use nora's built-in defaults.
+# Copy to ~/.config/nora/config.toml (or $XDG_CONFIG_HOME/nora/config.toml)
+# and edit. Every section and key is optional; anything omitted uses the
+# built-in default shown here. Unknown keys are errors, so typos are caught.
 #
-# Validate without launching:
-#   nora --config ~/.config/nora/config.toml --check-config
-
-[terminal]
-# Scrollback lines (0..1000000).
-history = 1000
-# Enable mouse support by default.
-mouse = false
+# The file is watched: saving it applies the change to the running window
+# (Ctrl+Shift+F5 reloads by hand). A file that fails to load or validate
+# leaves the current settings in place and shows the error on screen.
+# Validate without launching:   nora --check-config
+#
+# What applies when:
+#   immediately       colors, cursor, key bindings, scrolling.multiplier
+#   immediately       font (fonts reload and every pane is resized)
+#   new panes/tabs    scrolling.history
+#   at startup        window
 
 [font]
-# Font family: a fontconfig family name (e.g. "JetBrains Mono",
-# "FiraCode Nerd Font Mono"), or "monospace" for nora's default chain
-# (Noto Sans Mono, DejaVu Sans Mono, fontconfig's monospace). Bold and
-# italic faces of the family are used when installed.
+# A fontconfig family name, e.g. "JetBrains Mono" or "FiraCode Nerd Font
+# Mono" (a Nerd Font gives prompt icons). "monospace" uses nora's default
+# chain: Noto Sans Mono, DejaVu Sans Mono, fontconfig's monospace. Bold and
+# italic faces of the family are used when installed; characters the font
+# lacks fall back to any installed font that has them.
 family = "monospace"
-# Size in points (0 < size <= 1000); 1 pt = 4/3 px at 96 DPI, scaled by
-# the display's scale factor. Ctrl+Shift+Plus/Minus/0 zoom from here.
+# Points (0 < size <= 1000). 1 pt = 4/3 px at 96 DPI, scaled by the
+# display scale factor. Ctrl+Shift+Plus/Minus/0 zoom from this size.
 size = 15.0
 
-[theme]
-# Colors are #RRGGBB.
-background = "#000000"
-foreground = "#ffffff"
-cursor = "#ffffff"
-# Optional: override the ANSI colors (1..16 entries, #RRGGBB).
-# colors = ["#000000", "#ff0000", "#00ff00", "#ffff00", "#0000ff",
-#           "#ff00ff", "#00ffff", "#ffffff", "#888888", "#ff5555",
-#           "#55ff55", "#ffff55", "#5555ff", "#ff55ff", "#55ffff",
-#           "#cccccc"]
+[colors]
+# #RRGGBB. Unset entries keep nora's xterm-style defaults. Applications can
+# still change colors at run time (OSC 4/10/11).
+# foreground = "#ffffff"
+# background = "#000000"
+# cursor = "#ffffff"
+# selection_background = "#335577"
 
-[keys]
-# Custom key bindings: key sequence -> action.
-[keys.bindings]
-# "ctrl+shift+c" = "copy"
-# "ctrl+shift+v" = "paste"
+[colors.normal]
+# black = "#000000"
+# red = "#cd0000"
+# green = "#00cd00"
+# yellow = "#cdcd00"
+# blue = "#0000ee"
+# magenta = "#cd00cd"
+# cyan = "#00cdcd"
+# white = "#e5e5e5"
+
+[colors.bright]
+# black = "#7f7f7f"
+# red = "#ff0000"
+# green = "#00ff00"
+# yellow = "#ffff00"
+# blue = "#5c5cff"
+# magenta = "#ff00ff"
+# cyan = "#00ffff"
+# white = "#ffffff"
+
+[window]
+# Initial size in cells (2..=1000).
+columns = 80
+lines = 24
+
+[cursor]
+# "block", "beam" or "underline": the shape until an application sets one.
+# An unfocused window shows a hollow block.
+style = "block"
+
+[scrolling]
+# Scrollback lines per pane (0..=1000000).
+history = 10000
+# Lines per mouse-wheel step (1..=100).
+multiplier = 3
+
+# Key bindings. Each entry binds a chord to an action, or frees a default
+# chord with action = "none" so the key reaches the application.
+# Modifiers: ctrl, shift, alt, super. Keys: a-z, 0-9, f1-f12, enter, tab,
+# space, escape, backspace, delete, insert, home, end, pageup, pagedown,
+# left, right, up, down, minus, equal (plus), backslash, slash, comma,
+# period, semicolon, bracketleft, bracketright.
+# Actions: copy, paste, new_tab, next_tab, previous_tab, close_pane,
+# split_right, split_down, focus_left, focus_right, focus_up, focus_down,
+# search, zoom_in, zoom_out, zoom_reset, scroll_page_up, scroll_page_down,
+# scroll_to_top, scroll_to_bottom, reload_config, none.
+#
+# [[keyboard.bindings]]
+# keys = "ctrl+shift+d"
+# action = "split_right"
+#
+# [[keyboard.bindings]]
+# keys = "ctrl+pageup"
+# action = "none"

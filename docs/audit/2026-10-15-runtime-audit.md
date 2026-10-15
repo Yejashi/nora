@@ -69,6 +69,8 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | IME (lower) | Preedit never drawn; IME cursor area never set (candidate window misplaced) | M2.4 implemented: preedit drawn underlined at the cursor, cursor area reported every frame. **Unverified with a real input method** (Xvfb has none); needs a manual check under fcitx5/ibus |
 | M3 found | Startup 1.16 s: all installed fonts scanned twice per launch (nora's style lookup and cosmic-text's `new_with_fonts`) | M3 (fontconfig lookups; background fallback system; first frame ~180 ms) |
 | M3 found | Pump snapshotted under the terminal lock on every wake while the window held an undrawn snapshot | M3 (backpressure; 56 MiB/s windowed) |
+| CFG (all) | Config parsed but nothing applied; no reload; scrollback 0 | M4 (schema v2, every key consumed, file watch + Ctrl+Shift+F5, scrollback 10 000 default) |
+| R10 | Cursor shape ignored; no hollow cursor when unfocused | M4 (block/beam/underline/hidden; hollow when unfocused) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

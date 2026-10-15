@@ -27,7 +27,7 @@ v0.1 does not claim full kitty compatibility. A usable single-pane development b
 | Behavior | Default |
 | --- | --- |
 | Shell | User's configured shell with a documented fallback; explicit `-- COMMAND ARG...` runs argv directly |
-| Configuration | `$XDG_CONFIG_HOME/nora/nora.toml`, fallback `~/.config/nora/nora.toml` |
+| Configuration | `$XDG_CONFIG_HOME/nora/config.toml`, fallback `~/.config/nora/config.toml`; watched for live reload |
 | Fonts | System monospace at 12 points; explicit fallback chain; diagnose missing fonts |
 | Window | 100 columns × 30 rows as an initial preference; actual geometry respects the desktop |
 | Scrollback | 10,000 rows, additionally constrained by the implemented memory policy |
@@ -39,7 +39,7 @@ v0.1 does not claim full kitty compatibility. A usable single-pane development b
 | Copy/paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Search | Ctrl+Shift+F; Escape closes the search UI |
 | Zoom | Ctrl+Shift+Plus / Minus; Ctrl+Shift+0 resets |
-| Reload config | Ctrl+Shift+F5; failed reload retains the previous valid configuration (planned, roadmap M4) |
+| Reload config | Ctrl+Shift+F5 (and automatically when the file changes); a failed reload keeps the previous valid configuration |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End (passed to the application in the alternate screen) |
 | Clipboard protocol | OSC 52 reads disabled; writes disabled until explicit opt-in |
 | Presentation | On-demand, vsync-capable default; optional low-latency mode based on supported surface modes |

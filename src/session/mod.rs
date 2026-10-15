@@ -32,6 +32,7 @@ pub mod pump;
 
 pub use pty::{
     DRAIN_TIMEOUT, LaunchSpec, Lifecycle, PtyError, PtySession, SessionEvent, SessionId,
+    SessionOptions,
 };
 
 /// Nominal headless cell width in pixels (no UI window exists yet, so

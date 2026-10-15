@@ -214,7 +214,7 @@ fn main() -> ExitCode {
     // N18b precedence: the CLI `--working-directory` (already in
     // `spec.cwd`) overrides any config value; the config overrides the
     // built-in defaults.
-    run_windowed(spec, explicit, hold, &config_state.current)
+    run_windowed(spec, explicit, hold, config_state)
 }
 
 /// Headless wait granularity: how often parser replies are forwarded
@@ -284,8 +284,9 @@ fn run_windowed(
     spec: LaunchSpec,
     explicit: bool,
     hold: bool,
-    config: &nora::config::NoraConfig,
+    config_state: nora::config::ConfigState,
 ) -> ExitCode {
+    let config = &config_state.current;
     let event_loop =
         match winit::event_loop::EventLoop::<nora::session::pump::AppEvent>::with_user_event()
             .build()
@@ -311,6 +312,12 @@ fn run_windowed(
     // ordering needs the window before `run_app`, so the deprecated
     // `EventLoop::create_window` wrapper is used here — it builds the
     // identical `platform_impl::Window`.
+    // Fonts first (they need no display): the initial window size is the
+    // configured cell grid ([window] columns x lines) in logical pixels.
+    let mut fonts = app::glyphs::Fonts::load(&config.font);
+    nora::trace::stage("fonts loaded");
+    let base = fonts.measure(1.0, nora::config::ZOOM_DEFAULT);
+    let (columns, lines) = config.window_cells();
     #[allow(deprecated)]
     let window = std::sync::Arc::new(
         event_loop
@@ -318,17 +325,15 @@ fn run_windowed(
                 winit::window::WindowAttributes::default()
                     .with_title("nora")
                     .with_inner_size(winit::dpi::LogicalSize::new(
-                        app::INITIAL_SIZE.0,
-                        app::INITIAL_SIZE.1,
+                        f64::from(columns) * f64::from(base.cell_w),
+                        f64::from(lines) * f64::from(base.cell_h),
                     )),
             )
             .expect("creating the nora window"),
     );
+    nora::trace::stage("window created");
     // Loaded once here (the first PTY needs the grid) and handed to the
     // window loop.
-    nora::trace::stage("window created");
-    let mut fonts = app::glyphs::Fonts::load(&config.font);
-    nora::trace::stage("fonts loaded");
     fonts.measure(window.scale_factor(), nora::config::ZOOM_DEFAULT);
     let (cols, rows) = app::window_grid(&window, &fonts);
     let (rows, cols) = if rows == 0 || cols == 0 {
@@ -340,7 +345,14 @@ fn run_windowed(
     // N23b: the pump spawns new-tab sessions from the same launch spec.
     let spec_for_pump = spec.clone();
     nora::trace::stage("cells measured");
-    let session = match PtySession::spawn(spec, rows as usize, cols as usize, DEFAULT_CAP) {
+    let options = app::session_options(config);
+    let session = match PtySession::spawn_configured(
+        spec,
+        rows as usize,
+        cols as usize,
+        DEFAULT_CAP,
+        &options,
+    ) {
         Ok(session) => session,
         Err(err) => {
             let message = match &err {
@@ -382,6 +394,7 @@ fn run_windowed(
             pump_commands_rx,
             pump_wake,
             pump_stop,
+            options,
         )
     });
     let code = app::run_windowed(
@@ -392,7 +405,7 @@ fn run_windowed(
         stop.clone(),
         explicit,
         hold,
-        config,
+        config_state.clone(),
         fonts,
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);

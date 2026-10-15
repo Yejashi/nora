@@ -55,7 +55,7 @@ fn write_config(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
 #[test]
 fn default_config() {
     let c = NoraConfig::default();
-    assert_eq!(c.terminal.history, 1000);
+    assert_eq!(c.terminal.history, 10_000);
     assert!(!c.terminal.mouse);
     assert_eq!(c.font.family, "monospace");
     assert_eq!(c.font.size, 15.0);
@@ -88,6 +88,7 @@ fn validate_valid_config() {
         keys: KeysConfig {
             bindings: HashMap::new(),
         },
+        ..Default::default()
     };
     assert!(c.validate().is_empty());
 }
@@ -225,7 +226,7 @@ fn load_config_defaults() {
     // No explicit path, no candidates -> built-in defaults, `path: None`.
     let loaded = load_config_with_candidates(None, &[]).expect("defaults should load");
     assert!(loaded.path.is_none());
-    assert_eq!(loaded.config.terminal.history, 1000);
+    assert_eq!(loaded.config.history(), 10_000);
     assert!(!loaded.config.terminal.mouse);
     assert_eq!(loaded.config.font.family, "monospace");
 }
@@ -295,7 +296,7 @@ fn config_state_new() {
     let state = ConfigState::new(loaded);
     assert_eq!(state.epoch, 0);
     assert!(state.path.is_none());
-    assert_eq!(state.current.terminal.history, 1000);
+    assert_eq!(state.current.history(), 10_000);
 }
 
 /// A reload from a still-valid path succeeds, increments the epoch, and
@@ -467,4 +468,68 @@ fn zoom_min() {
         z = nora::config::zoom_out(z);
     }
     assert_eq!(z, ZOOM_MIN);
+}
+
+/// M4: the `[colors]`, `[window]`, `[cursor]`, `[scrolling]` and
+/// `[[keyboard.bindings]]` sections parse, the new sections take
+/// precedence over the legacy ones, and invalid values are reported with
+/// their key path.
+#[test]
+fn schema_v2_parses_and_overrides_legacy_sections() {
+    let text = r##"
+[terminal]
+history = 500
+
+[scrolling]
+history = 20000
+multiplier = 5
+
+[window]
+columns = 100
+lines = 30
+
+[cursor]
+style = "beam"
+
+[colors]
+background = "#101010"
+selection_background = "#224466"
+[colors.normal]
+red = "#aa0000"
+
+[[keyboard.bindings]]
+keys = "ctrl+shift+c"
+action = "none"
+
+[[keyboard.bindings]]
+keys = "alt+t"
+action = "new_tab"
+"##;
+    let c = nora::config::parse_config(text).expect("valid v2 config");
+    assert_eq!(c.history(), 20_000, "[scrolling] beats [terminal]");
+    assert_eq!(c.scroll_multiplier(), 5);
+    assert_eq!(c.window_cells(), (100, 30));
+    assert_eq!(c.cursor.style, nora::config::CursorShape::Beam);
+    assert_eq!(c.colors.normal.red.as_deref(), Some("#aa0000"));
+    assert_eq!(c.binding_entries().len(), 2);
+}
+
+#[test]
+fn schema_v2_validation_names_the_key() {
+    let text = r##"
+[colors.bright]
+blue = "blue"
+
+[[keyboard.bindings]]
+keys = "ctrl+nope"
+action = "copy"
+
+[window]
+columns = 1
+"##;
+    let err = nora::config::parse_config(text).expect_err("invalid config");
+    let message = err.to_string();
+    for needle in ["colors.bright.blue", "unknown key 'nope'", "window.columns"] {
+        assert!(message.contains(needle), "missing {needle:?} in: {message}");
+    }
 }

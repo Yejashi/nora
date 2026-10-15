@@ -145,6 +145,26 @@ pub const DEFAULT_CAP: WriterConfig = WriterConfig {
     reserved_bytes: 64 * 1024,
 };
 
+/// Terminal options for a new session (from the configuration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionOptions {
+    /// Scrollback lines.
+    pub history: usize,
+    /// The cursor shape used until the application sets one.
+    pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
+}
+
+impl Default for SessionOptions {
+    /// No scrollback and a block cursor (the library default; the window
+    /// passes the configured values).
+    fn default() -> Self {
+        Self {
+            history: 0,
+            cursor_shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+        }
+    }
+}
+
 /// Launch parameters for a PTY child.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSpec {
@@ -313,6 +333,17 @@ impl PtySession {
         cols: usize,
         cap: WriterConfig,
     ) -> Result<Self, PtyError> {
+        Self::spawn_configured(spec, rows, cols, cap, &SessionOptions::default())
+    }
+
+    /// [`PtySession::spawn`] with terminal options from the configuration.
+    pub fn spawn_configured(
+        spec: LaunchSpec,
+        rows: usize,
+        cols: usize,
+        cap: WriterConfig,
+        options: &SessionOptions,
+    ) -> Result<Self, PtyError> {
         let id = SessionId::mint();
         let cwd = spec.cwd;
         if let Some(dir) = &cwd
@@ -321,7 +352,8 @@ impl PtySession {
             return Err(PtyError::BadCwd(dir.clone()));
         }
 
-        let engine = Engine::new(rows, cols);
+        let mut engine = Engine::with_history(rows, cols, options.history);
+        engine.set_default_cursor_shape(options.cursor_shape);
         let writer = BoundedWriter::new(cap);
         let ledger = ReplyLedger::new(cap.reserved_bytes.min(cap.max_bytes));
 

@@ -11,7 +11,7 @@
 use alacritty_terminal::term::color::{COUNT, Colors};
 use alacritty_terminal::vte::ansi::{NamedColor, Rgb};
 
-use crate::config::ThemeConfig;
+use crate::config::{NoraConfig, ThemeConfig};
 
 /// xterm's default 16 ANSI colors (normal 0-7, bright 8-15).
 const XTERM_16: [Rgb; 16] = [
@@ -108,6 +108,47 @@ impl Palette {
         slots[NamedColor::BrightForeground as usize] = fg;
         slots[NamedColor::DimForeground as usize] = dim(fg);
         Self { slots }
+    }
+
+    /// The palette for a whole config: the legacy `[theme]` first, then
+    /// `[colors]` on top (foreground, background, cursor, normal 0-7,
+    /// bright 8-15). Dim variants follow the final normal colors.
+    pub fn from_config(config: &NoraConfig) -> Self {
+        let mut palette = Self::from_theme(&config.theme);
+        let colors = &config.colors;
+        let set = |slots: &mut [Rgb; COUNT], index: usize, value: &Option<String>| {
+            if let Some(color) = value.as_deref().and_then(parse_hex) {
+                slots[index] = color;
+            }
+        };
+        set(
+            &mut palette.slots,
+            NamedColor::Foreground as usize,
+            &colors.foreground,
+        );
+        set(
+            &mut palette.slots,
+            NamedColor::Background as usize,
+            &colors.background,
+        );
+        set(
+            &mut palette.slots,
+            NamedColor::Cursor as usize,
+            &colors.cursor,
+        );
+        for (i, (_, value)) in colors.normal.entries().iter().enumerate() {
+            set(&mut palette.slots, i, value);
+        }
+        for (i, (_, value)) in colors.bright.entries().iter().enumerate() {
+            set(&mut palette.slots, 8 + i, value);
+        }
+        for i in 0..8 {
+            palette.slots[NamedColor::DimBlack as usize + i] = dim(palette.slots[i]);
+        }
+        let fg = palette.foreground();
+        palette.slots[NamedColor::BrightForeground as usize] = fg;
+        palette.slots[NamedColor::DimForeground as usize] = dim(fg);
+        palette
     }
 
     /// One slot's color.
@@ -213,6 +254,26 @@ mod tests {
         );
         assert_eq!(red.fg, [0xcd, 0, 0, 255]);
         assert_eq!(red.bg, [0, 0xff, 0, 255]);
+    }
+
+    #[test]
+    fn colors_section_overrides_the_legacy_theme() {
+        let mut config = NoraConfig::default();
+        config.theme.background = "#101010".into();
+        config.theme.colors = vec!["#111111".into()];
+        config.colors.background = Some("#202020".into());
+        config.colors.normal.red = Some("#aa0000".into());
+        config.colors.bright.blue = Some("#0000ff".into());
+        let p = Palette::from_config(&config);
+        assert_eq!(p.background(), rgb(0x20, 0x20, 0x20));
+        assert_eq!(
+            p.get(0),
+            rgb(0x11, 0x11, 0x11),
+            "theme still applies where colors is unset"
+        );
+        assert_eq!(p.get(1), rgb(0xaa, 0, 0));
+        assert_eq!(p.get(12), rgb(0, 0, 0xff));
+        assert_eq!(p.get(NamedColor::DimRed as usize), dim(rgb(0xaa, 0, 0)));
     }
 
     #[test]

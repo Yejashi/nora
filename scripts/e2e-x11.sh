@@ -439,6 +439,41 @@ scenario_search() {
     pass search
 }
 
+# Config: [window] size, [colors] and [scrolling] apply at startup; the
+# file is watched and a change applies live; an invalid edit keeps the
+# last good config.
+scenario_config() {
+    local dir="$OUT/config"; mkdir -p "$dir/home/.config/nora"
+    local cfg="$dir/home/.config/nora/config.toml"
+    printf '[window]\ncolumns = 50\nlines = 10\n[colors]\nbackground = "#202040"\n[cursor]\nstyle = "beam"\n' >"$cfg"
+    launch config bash --norc --noprofile || { fail config "no window"; return; }
+    xdotool type --delay 15 "stty size > $dir/size.txt; seq 1 300"; xdotool key Return
+    wait_file "$dir/size.txt" || { finish; fail config "no size"; return; }
+    sleep 0.5
+    shot "$dir/before.png"
+    xdotool key shift+Prior
+    shot "$dir/scrolled.png"
+    xdotool key shift+End
+    printf '[window]\ncolumns = 50\nlines = 10\n[colors]\nbackground = "#402020"\n' >"$cfg"
+    sleep 2.5
+    shot "$dir/reloaded.png"
+    printf '[colors]\nbackground = "nonsense"\n' >"$cfg"
+    sleep 2.5
+    shot "$dir/invalid.png"
+    finish
+    local before after scrolled_diff
+    before=$(count_color "$dir/before.png" '#202040')
+    after=$(count_color "$dir/reloaded.png" '#402020')
+    scrolled_diff=$("${IM_CONVERT[@]}" "$dir/before.png" "$dir/scrolled.png" -compose difference -composite -format '%[fx:round(mean*w*h*255)]' info:)
+    echo "  size: $(cat "$dir/size.txt"); bg px before=$before after reload=$after; scroll diff=$scrolled_diff"
+    [ "$(cat "$dir/size.txt")" = "10 50" ] || { fail config "window cells not applied"; return; }
+    [ "$before" -gt 10000 ] || { fail config "background color not applied"; return; }
+    [ "$scrolled_diff" -gt 0 ] || { fail config "no scrollback (Shift+PageUp changed nothing)"; return; }
+    [ "$after" -gt 10000 ] || { fail config "live reload did not apply"; return; }
+    [ "$(count_color "$dir/invalid.png" '#402020')" -gt 10000 ] || { fail config "invalid edit lost the last good config"; return; }
+    pass config
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -498,7 +533,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
