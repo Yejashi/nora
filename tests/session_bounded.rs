@@ -668,29 +668,28 @@ fn recorder_caps_at_256_records_dropping_oldest() {
     );
 }
 
-/// The byte cap (1 MiB of String-owned bytes) keeps a single over-cap
-/// record alone, and the byte counter resets on drain: after a >1 MiB
-/// title is drained, the next small records are accepted without
-/// spurious eviction (which would occur if the counter were stale).
+/// An OSC title longer than the 64 KiB frame cap (`MAX_OSC_BYTES`) never
+/// reaches the parser, so it records nothing, and later records are
+/// accepted normally. (The recorder's own 1 MiB byte cap is therefore no
+/// longer reachable through a single OSC frame.)
 #[test]
-fn recorder_byte_cap_and_counter_reset() {
+fn overlong_title_is_dropped_by_the_frame_cap() {
     let mut engine = Engine::new(24, 80);
-    let big = "x".repeat(1024 * 1024 + 1); // just over the 1 MiB cap
+    let big = "x".repeat(nora::prompt_marker::MAX_OSC_BYTES + 1);
     let osc = format!("\x1b]2;{big}\x07");
     engine.feed(osc.as_bytes());
-
-    // A single record alone over the cap is retained intact.
-    let drained = engine.drain_events();
-    assert_eq!(drained, vec![EventRecord::Title(big.clone())]);
-
-    engine.feed(b"\x1b[5n");
-    engine.feed(b"\x1b[5n");
-    let drained = engine.drain_events();
     assert_eq!(
-        drained.len(),
-        2,
-        "no spurious eviction after the >1 MiB drain"
+        engine.drain_events(),
+        Vec::new(),
+        "an overlong title is dropped"
     );
+
+    let ok = "y".repeat(1024);
+    engine.feed(format!("\x1b]2;{ok}\x07").as_bytes());
+    engine.feed(b"\x1b[5n");
+    let drained = engine.drain_events();
+    assert_eq!(drained.first(), Some(&EventRecord::Title(ok)));
+    assert_eq!(drained.len(), 2);
 }
 
 /// Titles coalesce to the latest before eviction: three title feeds
