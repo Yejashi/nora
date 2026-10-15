@@ -258,3 +258,154 @@ fn jump_to_previous_prompt_across_resize() {
         "resize must not invalidate the marker's line reference"
     );
 }
+
+/// N35c: with no markers stored, selecting the previous command is a clean
+/// no-op (returns `None` and leaves no selection).
+#[test]
+fn select_previous_command_empty() {
+    let engine = Engine::with_history(24, 80, 1000);
+    assert!(
+        engine.select_previous_command().is_none(),
+        "no markers: no selection"
+    );
+    assert!(engine.selection().is_none(), "no selection created");
+}
+
+/// N35c: a completed command (a `C` marker followed by its `D` marker) is
+/// selected from the command's first output line to its last. The `D`
+/// marker lands on the line after the last output, so the selection ends
+/// at `D - 1`.
+#[test]
+fn select_previous_command_selects_command_range() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+
+    // A prompt, a command, its two lines of output, then the command-end
+    // marker, all within the live screen (no scroll).
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'A', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"$ ");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'B', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"ls\n");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'C', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"total 8\n");
+    buf.extend_from_slice(b"file1\n");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'D', 0x1B, 0x5C,
+    ]);
+    engine.feed(&buf);
+    let _ = engine.drain_markers();
+
+    // The `C` marker is on line 1 (first output line) and the `D` marker on
+    // line 3 (after the two output lines). The selection must cover lines
+    // 1..2 (the output), not line 3 (the next prompt).
+    let sel = engine
+        .select_previous_command()
+        .expect("a completed command must be selectable");
+    assert_eq!(
+        sel.start,
+        (1, 0),
+        "selection starts at the command's first line"
+    );
+    assert_eq!(
+        sel.end,
+        (2, 79),
+        "selection ends at the command's last output line"
+    );
+}
+
+/// N35c: a command still running (its `C` marker has been emitted but not
+/// yet its `D`) is selected from its `C` line to the bottom of the screen.
+#[test]
+fn select_previous_command_in_progress_selects_to_bottom() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'A', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"$ ");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'B', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"long_running\n");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'C', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"partial output\n");
+    engine.feed(&buf);
+    let _ = engine.drain_markers();
+
+    // The `C` marker is on line 1; the command is still running, so the
+    // selection runs from line 1 to the bottom (line 23).
+    let sel = engine
+        .select_previous_command()
+        .expect("a running command must be selectable");
+    assert_eq!(
+        sel.start,
+        (1, 0),
+        "selection starts at the command's first line"
+    );
+    assert_eq!(
+        sel.end,
+        (23, 79),
+        "selection runs to the bottom of the screen"
+    );
+}
+
+/// N35c: a command that has scrolled into the history is still selected
+/// correctly — the viewport scrolls so the command's output is visible at
+/// the bottom of the viewport.
+#[test]
+fn select_previous_command_across_scroll() {
+    let mut engine = Engine::with_history(24, 80, 1000);
+
+    // 30 lines (7 into history), then a prompt + command + 2 output lines +
+    // the command-end marker, all in one chunk. Each output line scrolls the
+    // bottom, so the `C` and `D` markers are stored at the bottom row with
+    // increasing `total_scrolled` values (C at +8, D at +10).
+    let mut buf = Vec::new();
+    for _ in 0..30 {
+        buf.extend_from_slice(b"line\n");
+    }
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'A', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"$ ");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'B', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"ls\n");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'C', 0x1B, 0x5C,
+    ]);
+    buf.extend_from_slice(b"total 8\n");
+    buf.extend_from_slice(b"file1\n");
+    buf.extend_from_slice(&[
+        0x1B, 0x5D, b'1', b'3', b'3', b' ', b';', b' ', b'D', 0x1B, 0x5C,
+    ]);
+    engine.feed(&buf);
+    let _ = engine.drain_markers();
+
+    // The command's output is 2 lines (C is 2 lines above D). The selection
+    // covers those 2 lines, scrolled to the bottom of the viewport.
+    let sel = engine
+        .select_previous_command()
+        .expect("a scrolled command must be selectable");
+    assert_eq!(
+        sel.start,
+        (22, 0),
+        "selection starts 2 lines above the bottom"
+    );
+    assert_eq!(sel.end, (23, 79), "selection ends at the bottom row");
+    assert_eq!(
+        engine.display_offset(),
+        1,
+        "viewport scrolled so the command's output is visible"
+    );
+}

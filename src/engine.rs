@@ -684,6 +684,101 @@ impl Engine {
         Some(id)
     }
 
+    /// Select the previous command's text (N35c).
+    ///
+    /// A "command" is the range between a `C` marker (command start, emitted
+    /// by the shell integration before the command's output) and the `D`
+    /// marker that follows it (command end, emitted after the output). This
+    /// selects the most recent command: from its `C` line to its last output
+    /// line. If a command is still running (its `C` has been emitted but not
+    /// yet its `D`), the selection runs from that `C` line to the bottom of
+    /// the screen.
+    ///
+    /// The `D` marker lands on the line after the last output line when the
+    /// output ends with a newline (the common case), so the selection ends
+    /// at `D - 1`; when `D` shares the `C` line (no trailing newline) the
+    /// whole command is that one line.
+    ///
+    /// The viewport is scrolled so the selection's end is at the bottom of
+    /// the viewport. Returns the created [`Selection`], or `None` when no
+    /// `C` marker is stored (no integration) or the command has scrolled out
+    /// of the history (clean fallback).
+    pub fn select_previous_command(&self) -> Option<Selection> {
+        if self.rows == 0 || self.cols == 0 {
+            return None;
+        }
+        use crate::prompt_marker::MarkerKind;
+        // Find the latest `C` and the latest `D` marker (by ID).
+        let mut latest_c: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
+        let mut latest_d: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
+        for (id, entry) in self.marker_store.iter() {
+            match entry.event.kind {
+                MarkerKind::C if latest_c.as_ref().is_none_or(|(cid, _)| id > *cid) => {
+                    latest_c = Some((id, entry));
+                }
+                MarkerKind::D if latest_d.as_ref().is_none_or(|(did, _)| id > *did) => {
+                    latest_d = Some((id, entry));
+                }
+                _ => {}
+            }
+        }
+        let (c_id, c_entry) = latest_c?;
+        // The command's end line: the latest `D` that follows this `C` (a
+        // completed command), or the bottom row when the command is still
+        // running (no `D` yet).
+        let end_entry = latest_d.filter(|(d_id, _)| *d_id > c_id).map(|(_, e)| e);
+        let bottom = self.rows as i32 - 1;
+        let (scrolled, pulled, topmost) = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                grid.total_scrolled(),
+                grid.total_pulled(),
+                grid.topmost_line().0,
+            )
+        };
+        let end_line = match end_entry {
+            Some(e) => e.current_line(scrolled, pulled)?,
+            None => bottom,
+        };
+        let c_line = c_entry.current_line(scrolled, pulled)?;
+        // The command's end must still be in the grid (its start is at or
+        // above it, so one check suffices).
+        if end_line < topmost {
+            return None;
+        }
+        // The selection's end line. For a completed command, `D` lands on the
+        // line after the last output line when the output ends with a newline
+        // (the common case), so the selection ends at `D - 1`; when `D`
+        // shares the `C` line (no trailing newline) the whole command is
+        // that one line. For a command still running, select up to the
+        // bottom of the screen.
+        let end_grid = if end_entry.is_some() {
+            if end_line > c_line {
+                end_line - 1
+            } else {
+                end_line
+            }
+        } else {
+            end_line
+        };
+        // Scroll so the selection's end is at the bottom of the viewport,
+        // clamped to the history (a no-op when it is already visible).
+        let target = (bottom - end_grid).max(0) as usize;
+        let target = target.min(self.history_size());
+        if target != self.display_offset() {
+            let delta = target as i64 - self.display_offset() as i64;
+            self.scroll(Scroll::Delta(delta as i32));
+        }
+        let offset = self.display_offset();
+        let c_row = (c_line as i64 + offset as i64).max(0) as usize;
+        let end_row = (end_grid as i64 + offset as i64).max(0) as usize;
+        let start = (c_row.min(self.rows - 1), 0);
+        let end = (end_row.min(self.rows - 1), self.cols - 1);
+        self.select(start, end);
+        Some(Selection { start, end })
+    }
+
     /// A clone of the shared prompt-marker-queue handle (N35a): the PTY
     /// `EventLoop` filter pushes marker events into the same queue the
     /// headless [`Engine::feed`] path uses, so both paths feed one
