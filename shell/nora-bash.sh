@@ -26,7 +26,17 @@ __nora_prompt_start() {
 
 # Runs before each command executes (via the DEBUG trap).
 # Marks the command start (B) and the output start (C).
+#
+# bash fires the DEBUG trap for every simple command, including the
+# commands that make up PROMPT_COMMAND itself. Those are not user
+# commands, so skip any command whose text appears in PROMPT_COMMAND;
+# otherwise a spurious B/C pair lands on the prompt line between D and A,
+# and the engine's C-to-D previous-command selection (N35c) would select
+# the prompt line instead of the command.
 __nora_command_start() {
+    case "$PROMPT_COMMAND" in
+        *"$BASH_COMMAND"*) return ;;
+    esac
     __nora_osc133 B
     __nora_osc133 C
 }

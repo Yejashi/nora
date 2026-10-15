@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::term::TermMode;
 use nora::engine::Damage;
 use nora::input::{BindingTable, InputAction, encode};
+use nora::prompt_marker::MarkerKind;
 use nora::render::term::is_noop_damage;
 use nora::session::io::{WriterConfig, WriterError};
 use nora::session::pty::{
@@ -1198,4 +1199,148 @@ fn pty_graphics_apc_reaches_shared_queue() {
     );
 
     session.close();
+}
+
+/// N35: a PTY session whose child emits shell-integration frames (OSC 133
+/// A/B/C/D markers, an OSC 7 cwd, an OSC 8 hyperlink) produces the events
+/// in the shared state: the four markers in the marker queue in order, the
+/// decoded path in the shared cwd slot, and the URI in the hyperlink queue.
+/// The `PromptMarkerFilter` runs on the PTY reader thread *before* the
+/// parser, so by the time `OSC-DONE` is visible in the grid every event
+/// has already been queued.
+#[test]
+fn pty_shell_events_reach_shared_state() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["osc".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    // Wait for the OSC-DONE marker. By the time the marker is visible the
+    // frames have already been filtered (the filter runs before the parser
+    // in the same or an earlier `pty_read`), so the events are queued.
+    pump(&mut session, |text, _events| text.contains("OSC-DONE"))
+        .expect("OSC-DONE marker observed within the deadline");
+
+    let markers = session.engine().drain_markers();
+    let kinds: Vec<MarkerKind> = markers.iter().map(|marker| marker.event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![MarkerKind::A, MarkerKind::B, MarkerKind::C, MarkerKind::D],
+        "expected markers A, B, C, D in order; got {kinds:?}"
+    );
+
+    assert_eq!(
+        session.engine().cwd(),
+        Some("/tmp".to_string()),
+        "OSC 7 file:///tmp must land in the shared cwd slot"
+    );
+
+    let links = session.engine().drain_hyperlinks();
+    assert!(
+        links.iter().any(|link| link.uri == "https://example.com/x"),
+        "expected hyperlink https://example.com/x; got {links:?}"
+    );
+
+    session.close();
+}
+
+/// N35a: the opt-in `shell/nora-bash.sh` integration must produce a clean
+/// OSC 133 sequence for a real interactive bash session: `D A` around each
+/// prompt (from PROMPT_COMMAND) and `B C` before each user command (from
+/// the DEBUG trap) — and no spurious `B C` pair on the prompt line between
+/// `D` and `A`. bash fires the DEBUG trap for PROMPT_COMMAND entries too;
+/// the script must skip those, otherwise the engine's C-to-D
+/// previous-command selection (N35c) would select the prompt line instead
+/// of the command. For the two commands sent here the full sequence is
+/// `D A` (first prompt) `B C` (first command) `D A` (second prompt)
+/// `B C` (second command).
+#[test]
+fn pty_bash_shell_integration_marker_order() {
+    let script = std::env::current_dir()
+        .expect("test CWD is the package root")
+        .join("shell/nora-bash.sh");
+    let rc = std::env::temp_dir().join(format!("nora-bash-rc-{}", std::process::id()));
+    std::fs::write(&rc, format!("source {}\n", script.display())).expect("write the rcfile");
+
+    // bash is in the nix store on this cluster; fall back to PATH.
+    let bash = [
+        "/run/current-system/sw/bin/bash",
+        "/usr/bin/bash",
+        "/bin/bash",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).exists())
+    .map(|path| path.to_string())
+    .unwrap_or_else(|| "bash".to_string());
+
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: bash,
+            // `--rcfile` must precede `-i`: bash 5.3 rejects `--rcfile`
+            // after `-i` ("--: invalid option").
+            args: vec![
+                "--rcfile".to_string(),
+                rc.to_string_lossy().into_owned(),
+                "-i".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("bash spawns over a real PTY");
+
+    // Wait until the first prompt is visible before feeding, so the command
+    // is read as the first line after the first prompt rather than racing
+    // bash's startup (sourcing /etc/bashrc, drawing the prompt).
+    pump(&mut session, |text, _events| !text.trim().is_empty())
+        .expect("first prompt visible within the deadline");
+
+    // The rcfile sourced the integration before the first prompt, so the
+    // first prompt already carries the D A pair. Send one command, then
+    // exit.
+    session
+        .feed(b"echo marker-test-output\n")
+        .expect("feed the test command");
+    session.flush(256).expect("flush the test command to bash");
+    pump(&mut session, |text, _events| {
+        text.contains("marker-test-output")
+    })
+    .expect("test command output observed within the deadline");
+    session.feed(b"exit\n").expect("feed exit");
+    session.flush(256).expect("flush exit to bash");
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("bash exits cleanly within the deadline");
+
+    let markers = session.engine().drain_markers();
+    let kinds: Vec<MarkerKind> = markers.iter().map(|marker| marker.event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            MarkerKind::D,
+            MarkerKind::A,
+            MarkerKind::B,
+            MarkerKind::C,
+            MarkerKind::D,
+            MarkerKind::A,
+            MarkerKind::B,
+            MarkerKind::C
+        ],
+        "expected D A (first prompt), B C before the first command, D A \
+         (second prompt), B C before the second command — with no spurious \
+         B C pair between D and A; got {kinds:?}"
+    );
+
+    session.close();
+    let _ = std::fs::remove_file(&rc);
 }

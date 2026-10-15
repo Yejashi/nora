@@ -28,6 +28,9 @@
 //!   printing the verdict the child keeps reading stdin until EOF instead of
 //!   exiting, so a pump test can read the verdict from a non-terminated
 //!   tick's snapshot;
+//! - `osc`: print `READY`, wait 100 ms, then emit the OSC 133 A/B/C/D
+//!   marker frames, an OSC 7 cwd frame and an OSC 8 hyperlink frame (each
+//!   ST-terminated, 100 ms apart), print `OSC-DONE`, exit 0;
 //! - anything else: echo fallback.
 
 use std::io::{self, BufRead, Read, Write};
@@ -101,6 +104,31 @@ fn main() {
             // Let the APC reach the master before the marker.
             std::thread::sleep(std::time::Duration::from_millis(100));
             let _ = writeln!(out, "APC-DONE");
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        Some("osc") => {
+            ready(&mut out);
+            // Let READY reach the screen through the loop's normal master
+            // read before the OSC frames go out (N35).
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Shell-integration frames, each ST-terminated and spaced 100 ms
+            // apart so each frame reaches the master in its own read batch:
+            // OSC 133 A/B/C/D markers, an OSC 7 cwd, and an OSC 8 hyperlink.
+            let frames = [
+                "\x1b]133;A\x1b\\",
+                "\x1b]133;B\x1b\\",
+                "\x1b]133;C\x1b\\",
+                "\x1b]133;D\x1b\\",
+                "\x1b]7;file:///tmp\x1b\\",
+                "\x1b]8;;https://example.com/x\x1b\\",
+            ];
+            for frame in frames {
+                let _ = out.write_all(frame.as_bytes());
+                let _ = out.flush();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = writeln!(out, "OSC-DONE");
             let _ = out.flush();
             std::process::exit(0);
         }
