@@ -311,7 +311,27 @@ CHILD
     pass flood
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood)
+# Latency (measurement, not a pass/fail gate): key-to-present times for
+# 40 typed characters echoed by bash, from NORA_TRACE_LATENCY.
+scenario_latency() {
+    local dir="$OUT/latency"; mkdir -p "$dir"
+    NORA_TRACE_LATENCY=1 launch latency bash --norc --noprofile \
+        || { fail latency "no window"; return; }
+    xdotool type --delay 120 "abcdefghijklmnopqrstuvwxyzabcdefghijklmn"
+    sleep 1
+    finish
+    grep -o 'key-to-present [0-9.]*' "$OUT/latency/nora.log" | awk '{print $2}' \
+        | sort -n > "$dir/samples.txt"
+    local n med p95
+    n=$(wc -l < "$dir/samples.txt")
+    [ "$n" -ge 20 ] || { fail latency "only $n samples"; return; }
+    med=$(awk -v n="$n" 'NR==int((n+1)/2){print}' "$dir/samples.txt")
+    p95=$(awk -v n="$n" 'NR==int(n*0.95+0.5){print}' "$dir/samples.txt")
+    echo "  key-to-present ms: n=$n median=$med p95=$p95"
+    pass latency
+}
+
+ALL=(render tty resize keys mouse redraw selection zoom flood latency)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

@@ -408,6 +408,10 @@ struct WinApp {
     pane_last: std::collections::HashMap<PaneKey, Snapshot>,
     /// Set by the wgpu device-lost callback; the next render exits.
     device_lost: Arc<AtomicBool>,
+    /// `NORA_TRACE_LATENCY`: when the oldest key event not yet followed by
+    /// a presented frame arrived (key-to-present measurement).
+    trace_key_at: Option<std::time::Instant>,
+    trace_latency: bool,
     /// Base color table (built-in xterm palette + `[theme]`); each
     /// snapshot's runtime OSC overrides are overlaid on it before drawing.
     palette: Palette,
@@ -592,6 +596,8 @@ pub fn run_windowed(
         last_motion_cell: None,
         pane_last: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
+        trace_key_at: None,
+        trace_latency: std::env::var_os("NORA_TRACE_LATENCY").is_some(),
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -1430,6 +1436,12 @@ impl WinApp {
                 }
                 let suboptimal = frame.status == SurfaceStatus::Suboptimal;
                 graphics.present(frame);
+                if let Some(at) = self.trace_key_at.take() {
+                    eprintln!(
+                        "latency: key-to-present {:.3} ms",
+                        at.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 if suboptimal && let Err(message) = graphics.reconfigure() {
                     eprintln!("nora: surface reconfiguration failed: {message}");
                 }
@@ -1732,6 +1744,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // presses are synthetic duplicates.
                 if event.state != ElementState::Pressed || is_synthetic {
                     return;
+                }
+                if self.trace_latency && self.trace_key_at.is_none() {
+                    self.trace_key_at = Some(std::time::Instant::now());
                 }
                 // Local UI bindings (input::bindings). A bound chord whose
                 // action has nothing to act on falls through to the
