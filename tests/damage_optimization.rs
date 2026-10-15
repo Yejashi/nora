@@ -18,8 +18,10 @@ use glyphon::{Buffer, FontSystem, Metrics, fontdb};
 use nora::render::glyph::{GlyphCache, shape_cell};
 
 /// Candidate monospace faces, mirroring `tests/text_render.rs`.
-const MONO_CANDIDATES: [&str; 2] = [
+const MONO_CANDIDATES: [&str; 4] = [
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
     "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSansMono.ttf",
 ];
 

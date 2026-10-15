@@ -34,7 +34,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -49,7 +49,7 @@ jobs:
     name: release build (clean checkout)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -67,7 +67,7 @@ jobs:
     name: tests (headless + software GPU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -78,7 +78,9 @@ jobs:
           # Software Vulkan (lavapipe) so the offscreen GPU tests have a
           # real adapter in CI. A software GPU validates lifecycle and
           # rendering paths; it is not hardware performance evidence.
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          # The Noto fonts are the pinned test fonts (metrics are asserted).
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers \
+            fonts-noto-core fonts-noto-cjk
       - name: cargo test
         run: cargo test --no-fail-fast --locked
       - name: Headless launch smoke (no display server)
@@ -105,7 +107,7 @@ jobs:
           - name: Wayland only
             features: wayland
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -123,7 +125,7 @@ jobs:
     name: X11 display smoke (Xvfb)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -133,7 +135,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             xvfb xkb-data libxkbcommon0 libxkbcommon-x11-0 \
-            libvulkan1 mesa-vulkan-drivers
+            libvulkan1 mesa-vulkan-drivers fonts-noto-core fonts-noto-cjk
       - name: cargo build --release
         run: cargo build --release --locked
       - name: Windowed smoke under Xvfb
@@ -147,7 +149,7 @@ jobs:
     name: Wayland display smoke (Weston headless)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -157,31 +159,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             weston xkb-data libxkbcommon0 \
-            libvulkan1 mesa-vulkan-drivers
+            libvulkan1 mesa-vulkan-drivers fonts-noto-core fonts-noto-cjk
       - name: cargo build --release
         run: cargo build --release --locked
       - name: Windowed smoke under Weston headless
         env:
           DISPLAY: ""
+          # GitHub runners do not set XDG_RUNTIME_DIR; both weston and the
+          # Wayland client need it (the socket lives there).
+          XDG_RUNTIME_DIR: /tmp/nora-xdg-runtime
+          WESTON_SOCKET: nora-ci
         run: |
-          # Nested compositor: weston's headless backend creates
-          # /tmp/wayland-N (N = first free index, usually 0).
-          weston --backend=headless --log=weston.log &
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          # Nested compositor on a named socket so the wait below is exact.
+          weston --backend=headless --socket="$WESTON_SOCKET" \
+            --log=weston.log &
           WESTON_PID=$!
-          SOCKET=""
           for _ in $(seq 1 30); do
-            for cand in /tmp/wayland-0 /tmp/wayland-1 /tmp/wayland-2; do
-              if [ -S "$cand" ]; then SOCKET="$cand"; break; fi
-            done
-            [ -n "$SOCKET" ] && break
+            [ -S "$XDG_RUNTIME_DIR/$WESTON_SOCKET" ] && break
             sleep 1
           done
-          if [ -z "$SOCKET" ]; then
+          if [ ! -S "$XDG_RUNTIME_DIR/$WESTON_SOCKET" ]; then
             cat weston.log
             exit 1
           fi
           set +e
-          WAYLAND_DISPLAY="${SOCKET#/tmp/}" ./target/release/nora --smoke
+          WAYLAND_DISPLAY="$WESTON_SOCKET" ./target/release/nora --smoke
           STATUS=$?
           set -e
           kill "$WESTON_PID" 2>/dev/null || true

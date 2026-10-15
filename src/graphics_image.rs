@@ -103,8 +103,8 @@ pub fn convert_to_rgba(
         32 => out.extend_from_slice(data),
         24 => {
             // RGB: append alpha = 255.
-            for chunk in data.chunks_exact(3) {
-                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            for &[r, g, b] in data.as_chunks::<3>().0 {
+                out.extend_from_slice(&[r, g, b, 255]);
             }
         }
         _ => return Err(UploadError::UnsupportedFormat),

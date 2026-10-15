@@ -111,7 +111,7 @@ fn git_commit() -> String {
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(o) } else { None })
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().chars().take(12).collect())
         .unwrap_or_else(|| "unknown".into())

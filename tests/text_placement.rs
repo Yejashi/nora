@@ -57,6 +57,8 @@ fn mono_path() -> &'static str {
                 "NORA_TEST_FONT_MONO",
                 &[
                     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+                    "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
                     "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSansMono.ttf",
                 ],
             )
@@ -71,6 +73,8 @@ fn cjk_path() -> &'static str {
                 "NORA_TEST_FONT_CJK",
                 &[
                     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
                     "/nix/store/i0nxswc8ljllp6lnha7vpmr3w2l33khj-noto-fonts-cjk-sans-2.004/share/fonts/opentype/noto-cjk/NotoSansCJK-VF.otf.ttc",
                 ],
             )
@@ -85,6 +89,8 @@ fn ethiopic_path() -> &'static str {
                 "NORA_TEST_FONT_ETHIOPIC",
                 &[
                     "/usr/share/fonts/noto/NotoSerifEthiopic-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSerifEthiopic-Regular.ttf",
+                    "/usr/share/fonts/google-noto/NotoSerifEthiopic-Regular.ttf",
                     "/nix/store/8m9r3c9q6lx9rj9vffs5d53h0w0cs4a9-noto-fonts-2026.05.01/share/fonts/noto/NotoSerifEthiopic.ttf",
                 ],
             )

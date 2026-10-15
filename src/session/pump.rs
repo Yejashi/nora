@@ -601,7 +601,7 @@ pub fn pump_thread(
         // writer's app cap) and flush up to the app cap per tick. Draining
         // panes get no new input (the child is exiting), but are still
         // flushed to forward any final ledger replies.
-        for (_pane, pane_pump) in sessions.iter_mut() {
+        for pane_pump in sessions.values_mut() {
             if !pane_pump.draining {
                 feed_pending(
                     &mut pane_pump.session,
