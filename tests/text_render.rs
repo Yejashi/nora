@@ -516,7 +516,7 @@ fn offscreen_cell_grid_renders_without_drift() {
     let frame1_prepare = render_frame(grid, &mut warm);
     let frame1 = read_frame(&device, &queue, &texture, width, height, stride, &readback);
     write_ppm(
-        "/tmp/opencode/n02b_grid.ppm",
+        &format!("{}/n02b_grid.ppm", env!("CARGO_TARGET_TMPDIR")),
         &frame1,
         width,
         height,
