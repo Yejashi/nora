@@ -54,6 +54,17 @@ pub struct DrawCell {
     pub width: u16,
 }
 
+/// One solid rectangle under the text: a cell background or the block
+/// cursor, `span` cells wide at (`row`, `col`), drawn before the selection
+/// and search fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellFill {
+    pub row: u32,
+    pub col: u32,
+    pub span: u16,
+    pub color: [u8; 4],
+}
+
 /// One vertex for the N13c decoration fill pass: position in normalized
 /// device coordinates, two padding floats (the shader reads only the first
 /// 8 bytes of the 32-byte stride), and the resolved decoration RGBA.
@@ -486,6 +497,7 @@ impl Graphics {
         frame: &mut Frame,
         fonts: &mut glyphs::Fonts,
         cells: &[DrawCell],
+        fills: &[CellFill],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
         scale: f32,
@@ -563,6 +575,46 @@ impl Graphics {
         });
         // N14b: selection highlight — fill rectangles under the selected
         // cells, drawn before the glyphs so text composites on top.
+        // Cell backgrounds and the block cursor: solid rectangles drawn
+        // first, so selection, search and glyphs composite on top.
+        let mut fill_vertices: Vec<DecoVertex> = Vec::new();
+        if let Some(texture) = frame.texture.as_ref() {
+            let size = texture.texture.size();
+            let frame_w = size.width as f32;
+            let frame_h = size.height as f32;
+            for fill in fills {
+                let x0 = fill.col as f32 * cw;
+                let y0 = fill.row as f32 * glyphs::CELL_H;
+                let line = DecoLine {
+                    x0,
+                    x1: x0 + cw * fill.span.max(1) as f32,
+                    top: y0,
+                    bottom: y0 + glyphs::CELL_H,
+                    y: y0,
+                    thickness: glyphs::CELL_H,
+                    color: fill.color,
+                };
+                push_deco_rect(&mut fill_vertices, &line, frame_w, frame_h);
+            }
+        }
+        if !fill_vertices.is_empty() {
+            let mut bytes = Vec::with_capacity(fill_vertices.len() * 32);
+            for v in &fill_vertices {
+                for f in v.pos.iter().chain(v._pad.iter()).chain(v.color.iter()) {
+                    bytes.extend_from_slice(&f.to_bits().to_ne_bytes());
+                }
+            }
+            let buffer = self.device.create_buffer(&BufferDescriptor {
+                label: Some("nora cell fill vertices"),
+                size: bytes.len() as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &bytes);
+            pass.set_pipeline(&self.deco_pipeline);
+            pass.set_vertex_buffer(0, buffer.slice(0..));
+            pass.draw(0..fill_vertices.len() as u32, 0..1);
+        }
         let mut selection: Vec<DecoVertex> = Vec::new();
         if let Some(texture) = frame.texture.as_ref() {
             let size = texture.texture.size();
@@ -593,7 +645,8 @@ impl Graphics {
             let buffer = self.device.create_buffer(&BufferDescriptor {
                 label: Some("nora selection vertices"),
                 size: bytes.len() as u64,
-                usage: BufferUsages::VERTEX,
+                // Written with `Queue::write_buffer`, which requires COPY_DST.
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&buffer, 0, &bytes);
@@ -634,7 +687,8 @@ impl Graphics {
             let buffer = self.device.create_buffer(&BufferDescriptor {
                 label: Some("nora search vertices"),
                 size: bytes.len() as u64,
-                usage: BufferUsages::VERTEX,
+                // Written with `Queue::write_buffer`, which requires COPY_DST.
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&buffer, 0, &bytes);
@@ -726,7 +780,8 @@ impl Graphics {
             let buffer = self.device.create_buffer(&BufferDescriptor {
                 label: Some("nora decoration vertices"),
                 size: bytes.len() as u64,
-                usage: BufferUsages::VERTEX,
+                // Written with `Queue::write_buffer`, which requires COPY_DST.
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&buffer, 0, &bytes);

@@ -123,7 +123,7 @@ fn default_fg(snap: &Snapshot) -> Rgb {
 
 /// The snapshot's resolved default background (table slot
 /// `NamedColor::Background`, or black when unset).
-fn default_bg(snap: &Snapshot) -> Rgb {
+pub fn default_bg(snap: &Snapshot) -> Rgb {
     resolve_color(
         &snap.colors,
         &Color::Named(NamedColor::Background),

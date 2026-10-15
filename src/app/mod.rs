@@ -25,7 +25,7 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use self::graphics::{DrawCell, Graphics};
+use self::graphics::{CellFill, DrawCell, Graphics};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
@@ -40,6 +40,7 @@ use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
 use nora::render::policy::snapshot_is_stale;
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::style::cell_style;
+use nora::render::term::{TermLayout, cursor_fill, default_bg};
 use nora::session::pump::{AppEvent, PaneKey, PumpMsg};
 use nora::workspace::{TabId, Workspace};
 
@@ -287,6 +288,7 @@ impl ApplicationHandler for App {
                 if let Err(message) = graphics.draw_frame(
                     &mut frame,
                     &mut fonts,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -1195,6 +1197,11 @@ impl WinApp {
                 // shaped with its resolved style; spacers and concealed cells
                 // are skipped, wide chars advance by 2.
                 let mut draw_cells: Vec<DrawCell> = Vec::new();
+                // Cell backgrounds that differ from the default background
+                // (the frame is cleared to it), then the block cursor.
+                let default_bg = default_bg(&snap);
+                let default_bg = [default_bg.r, default_bg.g, default_bg.b];
+                let mut fills: Vec<CellFill> = Vec::new();
                 for row in 0..snap.rows {
                     for col in 0..snap.cols {
                         let cell = &snap.cells[row * snap.cols + col];
@@ -1202,11 +1209,19 @@ impl WinApp {
                         if cell.width() == 0 {
                             continue;
                         }
+                        let style = cell_style(cell.flags, cell.fg, cell.bg, &snap.colors);
+                        if style.bg[..3] != default_bg {
+                            fills.push(CellFill {
+                                row: row as u32,
+                                col: col as u32,
+                                span: cell.width(),
+                                color: style.bg,
+                            });
+                        }
                         // Spaces carry no content.
                         if cell.ch == ' ' {
                             continue;
                         }
-                        let style = cell_style(cell.flags, cell.fg, cell.bg, &snap.colors);
                         // Concealed cells are not drawn.
                         if style.conceal {
                             continue;
@@ -1228,6 +1243,30 @@ impl WinApp {
                         });
                     }
                 }
+                // Block cursor: `cursor_fill` applies the engine's
+                // `SHOW_CURSOR` mode and range rules and resolves the cursor
+                // color; the glyph under it is drawn in the cell background
+                // so it stays legible on the block.
+                let layout = TermLayout {
+                    cell_w: fonts.cell_w as f32,
+                    cell_h: glyphs::CELL_H,
+                    font_size: glyphs::zoomed_font_size(self.zoom),
+                };
+                if let Some(cursor) = cursor_fill(&snap, &layout) {
+                    let (row, col) = (cursor.row as u32, cursor.col as u32);
+                    fills.push(CellFill {
+                        row,
+                        col,
+                        span: cursor.span,
+                        color: [cursor.color.r, cursor.color.g, cursor.color.b, 255],
+                    });
+                    if let Some(cell) = draw_cells
+                        .iter_mut()
+                        .find(|cell| cell.row == row && cell.col == col)
+                    {
+                        cell.style.fg = cell.style.bg;
+                    }
+                }
                 // N14b: selection highlight — the grid cells covered by the
                 // current selection, drawn as fill rectangles under the text.
                 let mut selection_cells: Vec<(u32, u32)> = Vec::new();
@@ -1242,6 +1281,7 @@ impl WinApp {
                     &mut frame,
                     fonts,
                     &draw_cells,
+                    &fills,
                     &selection_cells,
                     &search_cells,
                     window.scale_factor() as f32,
@@ -1926,18 +1966,30 @@ impl ApplicationHandler<AppEvent> for WinApp {
             WindowEvent::Ime(ime_event) => match ime_event {
                 winit::event::Ime::Enabled => {
                     self.ime.start_composition();
-                    eprintln!("IME: composition started");
+                    if debug_enabled() {
+                        eprintln!("IME: composition started");
+                    }
                 }
                 winit::event::Ime::Preedit(text, _cursor_pos) => {
                     self.ime.update_preedit(&text);
-                    eprintln!("IME: preedit = {:?}", text);
+                    if debug_enabled() {
+                        eprintln!("IME: preedit = {text:?}");
+                    }
                 }
-                winit::event::Ime::Commit(_text) => {
-                    // The state machine is the single source of truth for
-                    // what commits; `commit()` returns the tracked preedit
-                    // exactly once and deactivates.
-                    if let Some(committed) = self.ime.commit() {
-                        eprintln!("IME: commit = {:?}", committed);
+                winit::event::Ime::Commit(text) => {
+                    // The platform text is authoritative: under Wayland
+                    // text-input (fcitx5, ibus) every ordinary keystroke is
+                    // delivered as a commit with no preceding preedit, and
+                    // the key itself never reaches `KeyboardInput`. The
+                    // tracked preedit is only a fallback for a platform that
+                    // commits an empty string; either way the state machine
+                    // deactivates exactly once.
+                    let tracked = self.ime.commit();
+                    let committed = if text.is_empty() { tracked } else { Some(text) };
+                    if let Some(committed) = committed.filter(|c| !c.is_empty()) {
+                        if debug_enabled() {
+                            eprintln!("IME: commit = {committed:?}");
+                        }
                         if let Some(pane) = self.active_pane_key() {
                             let _ = self.pump_commands.send(PumpMsg::Input {
                                 pane,
@@ -1948,7 +2000,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
                 winit::event::Ime::Disabled => {
                     self.ime.cancel();
-                    eprintln!("IME: composition cancelled");
+                    if debug_enabled() {
+                        eprintln!("IME: composition cancelled");
+                    }
                 }
             },
             WindowEvent::Focused(focused) => {
