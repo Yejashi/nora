@@ -115,3 +115,15 @@ actual terminal. The filter must run over the raw PTY bytes on **both** paths.
   truncated frame.
 - N33 (graphics-basics) builds on this hook: parse the payload, store the image
   in a bounded store, render it in the render pass.
+
+## Amendment (2026-10-15): deferred read errors in `pty_read`
+
+A second vendored change, unrelated to graphics: `EventLoop::pty_read`
+defers a read error (EIO when the child exits) that follows bytes already
+read, parses those bytes with a blocking lock, and only then returns the
+error. Upstream 0.26.0 returns immediately and drops the bytes whenever the
+previous `try_lock_unfair` failed, so a fast-exiting child's final output
+was lost under lock contention (CI flake in `cwd_is_honored`; deterministic
+reproduction in `tests/pty_session.rs`
+`output_of_exiting_child_survives_a_busy_terminal_lock`). Candidate for
+upstreaming.

@@ -162,6 +162,39 @@ fn argv_with_spaces_and_metacharacters_arrive_exact() {
     session.close();
 }
 
+/// Regression (vendored `pty_read`): a child that prints and exits while
+/// the terminal lock is held must not lose its output. The reader finds
+/// the lock busy, reads again, gets EIO from the closed slave, and used to
+/// return that error with the already-read bytes unparsed.
+#[test]
+fn output_of_exiting_child_survives_a_busy_terminal_lock() {
+    for round in 0..5 {
+        let mut session = PtySession::spawn(
+            LaunchSpec {
+                program: helper(),
+                args: vec!["argv".to_string(), format!("LOCKED-{round}")],
+                cwd: None,
+                env: Vec::new(),
+            },
+            24,
+            80,
+            cap(),
+        )
+        .expect("helper spawns over a real PTY");
+        let term = session.engine().term_handle();
+        {
+            // Hold the lock while the child writes and exits.
+            let _guard = term.lock();
+            thread::sleep(Duration::from_millis(300));
+        }
+        pump(&mut session, |text, events| {
+            text.contains(&format!("A:1 LOCKED-{round}")) && exited_with(events, 0)
+        })
+        .expect("output written under a held lock reaches the grid");
+        session.close();
+    }
+}
+
 #[test]
 fn cwd_is_honored() {
     let temp = std::env::temp_dir();

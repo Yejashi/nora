@@ -47,7 +47,8 @@ codegen-units = 1
 # the filter must run inside the pinned `EventLoop` (N32a already covers the
 # `Engine::feed` path). The vendored copy is byte-identical to the pinned
 # 0.26.0 except for: the `Filter` trait, the `EventLoop::filter` field,
-# `EventLoop::with_filter`, and the `pty_read` hook. See
+# `EventLoop::with_filter`, the `pty_read` hook, and deferring a `pty_read`
+# error until already-read bytes are parsed (no lost final output). See
 # docs/adr/ADR-011-graphics-apc-hook.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }

@@ -165,6 +165,12 @@ where
     {
         let mut unprocessed = 0;
         let mut processed = 0;
+        // nora: a read error after bytes were already read (typically EIO
+        // when the child exits and the slave closes) is deferred until
+        // those bytes are parsed. Upstream returns immediately and drops
+        // them whenever the lock was busy on the previous iteration, which
+        // loses a fast-exiting child's final output.
+        let mut deferred_err: Option<io::Error> = None;
 
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
@@ -183,6 +189,7 @@ where
                             break;
                         }
                     },
+                    _ if unprocessed > 0 => deferred_err = Some(err),
                     _ => return Err(err),
                 },
             }
@@ -192,7 +199,9 @@ where
                 Some(terminal) => terminal,
                 None => terminal.insert(match self.terminal.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
+                    None if unprocessed >= READ_BUFFER_SIZE || deferred_err.is_some() => {
+                        self.terminal.lock_unfair()
+                    },
                     None => continue,
                     Some(terminal) => terminal,
                 }),
@@ -241,7 +250,7 @@ where
             unprocessed = 0;
 
             // Assure we're not blocking the terminal too long unnecessarily.
-            if processed >= MAX_LOCKED_READ {
+            if processed >= MAX_LOCKED_READ || deferred_err.is_some() {
                 break;
             }
         }
@@ -251,7 +260,10 @@ where
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        match deferred_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     #[inline]
