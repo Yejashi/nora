@@ -82,7 +82,16 @@ jobs:
           sudo apt-get install -y libvulkan1 mesa-vulkan-drivers \
             fonts-noto-core fonts-noto-cjk
       - name: cargo test
-        run: cargo test --no-fail-fast --locked
+        run: |
+          set +e
+          cargo test --no-fail-fast --locked 2>&1 | tee test.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          # Surface failing test names and panic sites as annotations, so a
+          # failure is diagnosable from the public check-run API.
+          grep -E "^test .* FAILED$|panicked at|^test result: FAILED" test.log \
+            | sort -u | head -40 | sed 's/^/::error::/' || true
+          exit "$STATUS"
       - name: Headless launch smoke (no display server)
         run: |
           # With no display server the launch path falls back to the
