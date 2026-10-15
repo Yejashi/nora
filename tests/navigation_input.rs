@@ -245,46 +245,37 @@ fn edit_keys_mode_invariant() {
 /// Alt prefixes an `ESC` (the N09 Alt rule), leaving the base sequence
 /// unchanged; verified for a DECCKM-conditional key (Up) in both modes and
 /// for a mode-invariant key (Delete).
+/// A modified cursor or editing key carries xterm's modifier parameter
+/// (1 + Shift 1 + Alt 2 + Ctrl 4), and the form is the same with or
+/// without DECCKM: Alt+Up `CSI 1;3A`, Shift+Up `CSI 1;2A`, Ctrl+Up
+/// `CSI 1;5A`, Ctrl+Shift+Up `CSI 1;6A`, Alt+Delete `CSI 3;3~`.
 #[test]
-fn alt_prefixes_the_navigation_sequence() {
-    assert_eq!(
-        enc_named(NamedKey::ArrowUp, ModifiersState::ALT, NORMAL),
-        Some(send(vec![0x1b, 0x1b, b'[', b'A'])),
-        "Alt+Up normal"
-    );
-    assert_eq!(
-        enc_named(NamedKey::ArrowUp, ModifiersState::ALT, APP),
-        Some(send(vec![0x1b, 0x1b, b'O', b'A'])),
-        "Alt+Up app"
-    );
+fn modified_navigation_keys_carry_the_xterm_parameter() {
+    let rows = [
+        (ModifiersState::ALT, "\x1b[1;3A"),
+        (ModifiersState::SHIFT, "\x1b[1;2A"),
+        (ModifiersState::CONTROL, "\x1b[1;5A"),
+        (ModifiersState::SHIFT | ModifiersState::CONTROL, "\x1b[1;6A"),
+    ];
+    for (m, bytes) in rows {
+        for modes in [NORMAL, APP] {
+            assert_eq!(
+                enc_named(NamedKey::ArrowUp, m, modes),
+                Some(send(bytes.as_bytes().to_vec())),
+                "Up under {m:?} {modes:?}"
+            );
+        }
+    }
     assert_eq!(
         enc_named(NamedKey::Delete, ModifiersState::ALT, NORMAL),
-        Some(send(vec![0x1b, 0x1b, b'[', b'3', b'~'])),
+        Some(send(b"\x1b[3;3~".to_vec())),
         "Alt+Delete"
     );
-}
-
-/// Shift+ and Ctrl+ arrow send the plain sequence (no `1;N~` modifier
-/// encoding in v0.1); a combined Shift+Ctrl press is still plain.
-#[test]
-fn shift_and_ctrl_arrow_send_the_plain_sequence() {
-    let mods = [
-        ModifiersState::SHIFT,
-        ModifiersState::CONTROL,
-        ModifiersState::SHIFT | ModifiersState::CONTROL,
-    ];
-    for m in mods {
-        assert_eq!(
-            enc_named(NamedKey::ArrowUp, m, NORMAL),
-            Some(send(vec![0x1b, b'[', b'A'])),
-            "plain arrow under {m:?}"
-        );
-        assert_eq!(
-            enc_named(NamedKey::ArrowUp, m, APP),
-            Some(send(vec![0x1b, b'O', b'A'])),
-            "plain arrow under {m:?} (app)"
-        );
-    }
+    assert_eq!(
+        enc_named(NamedKey::End, ModifiersState::CONTROL, NORMAL),
+        Some(send(b"\x1b[1;5F".to_vec())),
+        "Ctrl+End"
+    );
 }
 
 /// Backspace is `0x7f` in both modes (the raw slave's kernel `erase`; the

@@ -33,6 +33,13 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | P1 | Resize never reached the child; resize injected `CSI 4;h;w t` as input | M1.2 (this commit series) |
 | P2 | Child started on a raw tty (no echo, ISIG, ONLCR, ICRNL) | M1.2 |
 | P7 | Headless run killed the child after 5 s; replies not forwarded while waiting | M1.2 |
+| I-F1 | Bare Ctrl+T/W/D/X/Tab/arrows and Ctrl+F hijacked from the shell | M1.3 |
+| I-F2 | Closing the last pane left a frozen window | M1.3 |
+| I-F5 | Kitty encoder emitted raw key codes | M1.3 (removed) |
+| I-F7 | Held shortcut chords leaked control bytes | M1.3 |
+| I-F14, F15 | Legacy encodings: modifiers, Shift+Tab, Alt prefixes, Ctrl C0 set, keypad DECKPAM | M1.3 |
+| I-F17 (keys) | Shift+PageUp/PageDown/Home/End did not scroll | M1.3 |
+| P-lost | Fast-exiting child's final output dropped under lock contention (vendored `pty_read`) | `18901e8` |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

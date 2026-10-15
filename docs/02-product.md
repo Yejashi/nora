@@ -32,14 +32,15 @@ v0.1 does not claim full kitty compatibility. A usable single-pane development b
 | Window | 100 columns × 30 rows as an initial preference; actual geometry respects the desktop |
 | Scrollback | 10,000 rows, additionally constrained by the implemented memory policy |
 | New tab | Ctrl+Shift+T |
-| Close pane | Ctrl+Shift+W; guard against closing active child work with a small UI confirmation |
-| Next/previous tab | Ctrl+PageDown / Ctrl+PageUp |
+| Close pane | Ctrl+Shift+W (closes the tab with its last pane, and the window with its last tab); a confirmation for running child work is not implemented |
+| Next/previous tab | Ctrl+PageDown / Ctrl+PageUp (passed to the application when only one tab exists) |
 | Split right / below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
-| Pane focus | Alt+arrow, configurable so users can free those keys for applications |
+| Pane focus | Ctrl+Shift+arrow (passed to the application when there is no pane in that direction). Alt+arrow was dropped: shells use it for word and directory movement |
 | Copy/paste | Ctrl+Shift+C / Ctrl+Shift+V |
 | Search | Ctrl+Shift+F; Escape closes the search UI |
 | Zoom | Ctrl+Shift+Plus / Minus; Ctrl+Shift+0 resets |
-| Reload config | Ctrl+Shift+F5; failed reload retains the previous valid configuration |
+| Reload config | Ctrl+Shift+F5; failed reload retains the previous valid configuration (planned, roadmap M4) |
+| Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End (passed to the application in the alternate screen) |
 | Clipboard protocol | OSC 52 reads disabled; writes disabled until explicit opt-in |
 | Presentation | On-demand, vsync-capable default; optional low-latency mode based on supported surface modes |
 

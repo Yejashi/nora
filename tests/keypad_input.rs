@@ -244,27 +244,41 @@ fn f13_stays_none() {
     }
 }
 
-/// Shift+ and Ctrl+ F5 send the plain CSI row (no `1;N~` modifier
-/// encoding in v0.1); a combined Shift+Ctrl press is still plain.
+/// Modified function keys carry xterm's modifier parameter
+/// (1 + Shift 1 + Alt 2 + Ctrl 4): Shift+F5 `CSI 15;2~`, Ctrl+F5
+/// `CSI 15;5~`, Ctrl+Shift+F5 `CSI 15;6~`, Ctrl+F1 `CSI 1;5P`.
 #[test]
-fn shift_and_ctrl_fkeys_send_the_plain_sequence() {
-    let mods = [
-        ModifiersState::SHIFT,
-        ModifiersState::CONTROL,
-        ModifiersState::SHIFT | ModifiersState::CONTROL,
+fn modified_fkeys_carry_the_xterm_parameter() {
+    let rows = [
+        (ModifiersState::SHIFT, "\x1b[15;2~"),
+        (ModifiersState::CONTROL, "\x1b[15;5~"),
+        (
+            ModifiersState::SHIFT | ModifiersState::CONTROL,
+            "\x1b[15;6~",
+        ),
     ];
-    for m in mods {
+    for (m, bytes) in rows {
         assert_eq!(
             enc(&Key::Named(NamedKey::F5), &plain_physical(), m, NORMAL),
-            Some(send(vec![0x1b, b'[', b'1', b'5', b'~'])),
-            "plain F5 under {m:?}"
+            Some(send(bytes.as_bytes().to_vec())),
+            "F5 under {m:?}"
         );
     }
+    assert_eq!(
+        enc(
+            &Key::Named(NamedKey::F1),
+            &plain_physical(),
+            ModifiersState::CONTROL,
+            NORMAL
+        ),
+        Some(send(b"\x1b[1;5P".to_vec())),
+        "Ctrl+F1"
+    );
 }
 
-/// Alt prefixes an `ESC`, leaving the base row unchanged (the N09 Alt
-/// rule): Alt+F1 → `\x1b\x1bOP`; Alt+Numpad5 under app mode →
-/// `\x1b\x1bOu`.
+/// Alt is a modifier parameter on keys that take one (Alt+F1 →
+/// `CSI 1;3P`, xterm) and an ESC prefix on keys that do not (Alt+Numpad5
+/// under the application keypad → `ESC ESC O u`).
 #[test]
 fn alt_prefixes_the_fkey_and_numpad_sequences() {
     assert_eq!(
@@ -274,7 +288,7 @@ fn alt_prefixes_the_fkey_and_numpad_sequences() {
             ModifiersState::ALT,
             NORMAL
         ),
-        Some(send(vec![0x1b, 0x1b, b'O', b'P'])),
+        Some(send(b"\x1b[1;3P".to_vec())),
         "Alt+F1"
     );
     let physical = PhysicalKey::Code(KeyCode::Numpad5);
@@ -353,8 +367,8 @@ fn numpad0_plain_digit_vs_ss3() {
             ModifiersState::empty(),
             TermMode::APP_CURSOR
         ),
-        Some(send(vec![0x1b, b'O', b'p'])),
-        "Numpad0 app (APP_CURSOR alone)"
+        Some(send(vec![0x30])),
+        "Numpad0 under DECCKM alone stays a digit (only DECKPAM selects SS3)"
     );
 }
 
@@ -462,7 +476,8 @@ fn numpad_special_keys_plain_vs_ss3() {
         Key::Character("/".into()),
         KeyCode::NumpadDivide,
         0x2f,
-        b'l',
+        // xterm KP_Divide is `SS3 o` (`SS3 l` is KP_Separator).
+        b'o',
     );
     numpad_row(Key::Character(",".into()), KeyCode::NumpadComma, 0x2c, b'l');
     numpad_row(Key::Character("=".into()), KeyCode::NumpadEqual, 0x3d, b'X');
@@ -471,49 +486,35 @@ fn numpad_special_keys_plain_vs_ss3() {
 /// Numpad Home/End (physicals `Numpad7`/`Numpad1`, winit-folds to
 /// `Home`/`End`) have no mode-invariant form: `None` in normal mode, the
 /// SS3 `H`/`F` in app mode.
+/// With NumLock off, keypad 7/1 arrive as Home/End and follow the cursor
+/// key rules (`CSI H`/`CSI F`; `SS3` only under DECCKM), as on the main
+/// block: the keypad application mode does not apply to navigation keys.
 #[test]
-fn numpad_home_end_are_app_only() {
+fn numpad_home_end_follow_the_cursor_key_rules() {
     let home = PhysicalKey::Code(KeyCode::Numpad7);
-    assert_eq!(
-        enc(
-            &Key::Named(NamedKey::Home),
-            &home,
-            ModifiersState::empty(),
-            NORMAL
-        ),
-        None,
-        "numpad Home normal"
-    );
-    assert_eq!(
-        enc(
-            &Key::Named(NamedKey::Home),
-            &home,
-            ModifiersState::empty(),
-            APP
-        ),
-        Some(send(vec![0x1b, b'O', b'H'])),
-        "numpad Home app"
-    );
     let end = PhysicalKey::Code(KeyCode::Numpad1);
+    let none = ModifiersState::empty();
+    for modes in [NORMAL, APP] {
+        assert_eq!(
+            enc(&Key::Named(NamedKey::Home), &home, none, modes),
+            Some(send(b"\x1b[H".to_vec())),
+            "numpad Home under {modes:?}"
+        );
+        assert_eq!(
+            enc(&Key::Named(NamedKey::End), &end, none, modes),
+            Some(send(b"\x1b[F".to_vec())),
+            "numpad End under {modes:?}"
+        );
+    }
     assert_eq!(
         enc(
-            &Key::Named(NamedKey::End),
-            &end,
-            ModifiersState::empty(),
-            NORMAL
+            &Key::Named(NamedKey::Home),
+            &home,
+            none,
+            TermMode::APP_CURSOR
         ),
-        None,
-        "numpad End normal"
-    );
-    assert_eq!(
-        enc(
-            &Key::Named(NamedKey::End),
-            &end,
-            ModifiersState::empty(),
-            APP
-        ),
-        Some(send(vec![0x1b, b'O', b'F'])),
-        "numpad End app"
+        Some(send(b"\x1bOH".to_vec())),
+        "numpad Home under DECCKM"
     );
 }
 

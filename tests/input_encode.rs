@@ -276,28 +276,31 @@ fn shift_sends_nothing_and_f1_encodes() {
     );
 }
 
+/// Ctrl+Q sends XON (0x11) by default, like every other terminal; the
+/// quit binding is opt-in (`ctrl_q_quit: true`).
 #[test]
-fn ctrl_q_default_binding_quits() {
-    // Without Ctrl, the same physical key is a plain letter press.
+fn ctrl_q_sends_xon_by_default() {
     assert_eq!(
         enc_char_mods("q", ModifiersState::empty()),
         Some(send(vec![0x71]))
     );
-    // With Ctrl, the physical-key binding fires for either case of the
-    // logical character.
     assert_eq!(
         enc(
             Key::Character("q".into()),
             PhysicalKey::Code(KeyCode::KeyQ),
             ModifiersState::CONTROL
         ),
-        Some(InputAction::Quit)
+        Some(send(vec![0x11]))
     );
+    let quit = BindingTable { ctrl_q_quit: true };
     assert_eq!(
-        enc(
-            Key::Character("Q".into()),
-            PhysicalKey::Code(KeyCode::KeyQ),
-            ModifiersState::CONTROL
+        encode(
+            &Key::Character("Q".into()),
+            &PhysicalKey::Code(KeyCode::KeyQ),
+            &ModifiersState::CONTROL,
+            false,
+            &quit,
+            MODES
         ),
         Some(InputAction::Quit)
     );
@@ -338,7 +341,7 @@ fn ctrl_q_disabled_falls_through_to_the_encoder() {
 #[test]
 fn ctrl_q_binding_precedes_layout_decoding() {
     // The binding keys on the physical key: even with no layout text at
-    // all, the press still quits under the default table.
+    // all, the press still quits when the opt-in binding is enabled.
     let logical = Key::Unidentified(NativeKey::Xkb(0));
     let physical = PhysicalKey::Code(KeyCode::KeyQ);
     assert_eq!(
@@ -347,9 +350,68 @@ fn ctrl_q_binding_precedes_layout_decoding() {
             &physical,
             &ModifiersState::CONTROL,
             false,
-            &BindingTable::default(),
+            &BindingTable { ctrl_q_quit: true },
             MODES
         ),
         Some(InputAction::Quit)
+    );
+}
+
+/// xterm/alacritty bytes for keys the original encoder got wrong or
+/// dropped (audit F14).
+#[test]
+fn xterm_legacy_keys_encode_exactly() {
+    let shift = ModifiersState::SHIFT;
+    let alt = ModifiersState::ALT;
+    let ctrl = ModifiersState::CONTROL;
+    let named = |k: NamedKey, m: ModifiersState| enc_named(k, m);
+    assert_eq!(
+        named(NamedKey::Tab, shift),
+        Some(send(b"\x1b[Z".to_vec())),
+        "Shift+Tab"
+    );
+    assert_eq!(
+        named(NamedKey::Backspace, alt),
+        Some(send(vec![0x1b, 0x7f])),
+        "Alt+Backspace"
+    );
+    assert_eq!(
+        named(NamedKey::Backspace, ctrl),
+        Some(send(vec![0x08])),
+        "Ctrl+Backspace"
+    );
+    assert_eq!(
+        named(NamedKey::Enter, alt),
+        Some(send(vec![0x1b, 0x0d])),
+        "Alt+Enter"
+    );
+    assert_eq!(
+        named(NamedKey::Escape, alt),
+        Some(send(vec![0x1b, 0x1b])),
+        "Alt+Escape"
+    );
+    for (c, byte) in [
+        ("[", 0x1b),
+        ("\\", 0x1c),
+        ("]", 0x1d),
+        ("^", 0x1e),
+        ("_", 0x1f),
+        ("/", 0x1f),
+        ("@", 0x00),
+        ("?", 0x7f),
+        ("2", 0x00),
+        ("6", 0x1e),
+    ] {
+        assert_eq!(enc_char_mods(c, ctrl), Some(send(vec![byte])), "Ctrl+{c}");
+    }
+    assert_eq!(
+        enc_char_mods("a", ctrl | alt),
+        Some(send(vec![0x1b, 0x01])),
+        "Ctrl+Alt+a keeps Alt as an ESC prefix"
+    );
+    assert_eq!(
+        enc_char_mods("1", ctrl),
+        Some(send(b"1".to_vec())),
+        "Ctrl+digit without a C0 mapping sends the digit"
     );
 }

@@ -13,7 +13,7 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | Screens/scrolling | Primary/alternate screens, margins, wrap, viewport/history | Engine integration and TUI runs |
 | Queries | Supported cursor/device/color/size replies routed to child | PTY tests with exact bytes/timeouts |
 | Legacy keyboard | Text, controls, navigation, keypad/application modes | Mode-dependent input tables |
-| Kitty keyboard | Negotiated behavior and supported flags; accurate responses | Key press/repeat/release fixtures |
+| Kitty keyboard | **Not supported.** nora does not advertise or implement the protocol; applications fall back to legacy encoding (audit F5 removed an invalid encoder) | — |
 | Paste | Bracketed and ordinary paste | Exact payload tests, slow child |
 | Mouse/focus | Selected modes, coordinates and focus reports | Input fixtures and real TUI |
 | Synchronized output | Verified engine behavior, finite recovery timeout | Start/end/missing-end tests |
@@ -58,13 +58,15 @@ Tested by `tests/navigation_input.rs` and `tests/keypad_input.rs` (pure table ro
 | Numpad Home/End (physicals `Numpad7`/`Numpad1`) | `None` normal; SS3 `H`/`F` app | app-only | pass — table rows both modes |
 | Backspace | `0x7f` (kernel `erase`) | mode-invariant | pass — table rows |
 | Numpad under `Key::Unidentified` | resolved by physical `Numpad*` scancode | as above | pass — table rows; winit 0.30.13 folds numpad logicals to `Character`/`Enter`/`Home`/`End` (registry `winit-0.30.13/src/keyboard.rs`) |
-| F-key modifier encoding | Shift/Ctrl send the plain row (no `1;N~`); Alt prefixes `ESC` | — | pass — table rows; **deferred**: DECFNK `1;N~` modifier encoding is N21-era (kitty/modern protocol work) |
+| Modified key encoding | xterm PC-style: `CSI 1;m X` for modified arrows/Home/End/F1-F4, `CSI n;m ~` for editing keys and F5-F12 (m = 1 + Shift 1 + Alt 2 + Ctrl 4 + Super 8); Alt prefixes ESC on keys without a parameter; Shift+Tab `CSI Z`; Ctrl maps the C0 set including `[ \\ ] ^ _ / @ ?`; keypad application form only under DECKPAM | `tests/input_encode.rs`, `tests/navigation_input.rs`, `tests/keypad_input.rs`, e2e `keys` | pass |
 
 Mode-drive citations: DECCKM (`APP_CURSOR`) is `CSI ? 1 h/l` (pinned alacritty_terminal 0.26.0 term/mod.rs:2001-2005, vte-0.15.0 private-mode 1 = `CursorKeys`, vte-0.15.0/src/ansi.rs:900); keypad application mode (`APP_KEYPAD`) is the DECKPAM escape pair `ESC =`/`ESC >` (pinned vte-0.15.0 escape-final dispatch, vte-0.15.0/src/ansi.rs:1816-1817; recorded by the pinned alacritty term at term/mod.rs:2180-2188). Note: `CSI ? 6 h` is **not** the keypad on this stack — the pinned `PrivateMode::new` maps 6 to `Origin` (vte-0.15.0/src/ansi.rs:902). SS3 letter assignments pinned from the xterm ctlseqs numeric and editing keypads [S18].
 
 Modern kitty keyboard behavior is negotiated by the application, with a legacy default. Implement only the flags actually supported end to end; verify stack/query/pop handling, modifiers, repeat/release and associated text. The engine exposes flags, but frontend encoding remains separate [S11, S23]. The Alacritty frontend keyboard implementation is a useful Apache-licensed reference [S30, S35]; record the exact revision/notice if adapting code.
 
-### Kitty keyboard protocol (N21a)
+### Kitty keyboard protocol (N21a, engine stack only)
+
+Status 2026-10-15: the frontend encoder was removed and the protocol is not advertised. The engine stack below is not fed by the parser; real support would use alacritty_terminal's own kitty mode tracking and is a later feature.
 
 The kitty keyboard protocol is negotiated by the application as a **push/pop mode stack** owned by the engine (`nora::engine::KittyKeyboardModes`, `KittyKeyboardFlags`). The default is **legacy mode** (protocol disabled, empty stack) — no kitty protocol until the application pushes a mode.
 

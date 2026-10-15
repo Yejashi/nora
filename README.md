@@ -161,6 +161,25 @@ With no command, the default shell (`$SHELL`, else `/bin/sh`) is launched.
 The process exit status reflects the launched command. With no display
 server available, the launch falls back to the headless session pump.
 
+### Key bindings
+
+| Action | Keys |
+| --- | --- |
+| Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
+| New tab | Ctrl+Shift+T |
+| Next / previous tab | Ctrl+PageDown / Ctrl+PageUp |
+| Split right / split below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
+| Focus pane | Ctrl+Shift+Arrow |
+| Close pane (tab, window) | Ctrl+Shift+W |
+| Search | Ctrl+Shift+F, Escape closes |
+| Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
+| Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
+
+Plain Ctrl+letter keys always reach the program in the terminal, so
+Ctrl+D, Ctrl+W, Ctrl+T, Ctrl+F and Ctrl+X behave as in any terminal. A
+binding with nothing to act on, such as tab switching with one tab, also
+passes its key through.
+
 ### Configuration
 
 Config lives at `~/.config/nora/config.toml` (or

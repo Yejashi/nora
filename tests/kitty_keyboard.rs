@@ -1,27 +1,15 @@
-//! N21a regression suite for the kitty keyboard protocol mode stack
-//! (`nora::engine`), and N21b regression suite for the frontend
-//! encoding (`nora::input::encode_kitty`).
+//! N21a regression suite for the engine-side kitty keyboard mode stack
+//! (`nora::engine`).
 //!
 //! Every test is headless: it drives a fresh [`Engine`] directly — no PTY,
-//! no display, no clocks. The kitty keyboard protocol is negotiated by the
-//! application as a push/pop mode stack; the engine owns the stack and the
-//! enabled flag, and the frontend encoding (N21b) reads the negotiated
-//! flags through [`Engine::kitty_mode`]. The default is legacy mode
-//! (protocol disabled, empty stack).
+//! no display, no clocks.
 //!
-//! Pinned N21b byte table (verified against `src/input.rs`):
-//! - key code (2 bytes, big-endian) — always;
-//! - event type (1 byte: 1 = down, 2 = repeat, 3 = up) — only when
-//!   `REPORT_EVENTS` is negotiated;
-//! - system modifiers (1 byte: shift = 1, ctrl = 2, alt = 4,
-//!   super/logo = 8) — only when `SYSTEM` is negotiated;
-//! - `KittyKeyboardFlags::NONE` (legacy mode) → `None` (the caller falls
-//!   back to the legacy encoder).
+//! The N21b frontend encoder was removed (audit F5): it emitted raw
+//! key-code bytes instead of the protocol's `CSI ... u` form, and this
+//! stack is not fed by the parser. nora does not advertise or implement
+//! the kitty keyboard protocol; see docs/06-compatibility.md.
 
-use alacritty_terminal::term::TermMode;
 use nora::engine::{Engine, KittyKeyboardFlags, KittyKeyboardModes, MAX_KITTY_STACK};
-use nora::input::{BindingTable, InputAction, encode, encode_kitty};
-use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 
 /// A fresh headless engine (24×80, no scrollback), in legacy mode.
 fn make_engine() -> Engine {
@@ -214,160 +202,3 @@ fn kitty_flags_bitwise() {
 }
 
 // ---------------------------------------------------------------------
-// N21b: frontend encoding (`nora::input::encode_kitty`).
-// ---------------------------------------------------------------------
-
-/// The big-endian 2-byte key code for physical `KeyCode::KeyA`, as the
-/// pinned N21b format emits it.
-fn key_a_code() -> [u8; 2] {
-    (KeyCode::KeyA as u16).to_be_bytes()
-}
-
-/// One plain (non-repeat) press of physical `KeyCode::KeyA` under the
-/// given flags, no modifiers.
-fn kitty_press(flags: KittyKeyboardFlags) -> Option<Vec<u8>> {
-    encode_kitty(
-        &Key::Character("a".into()),
-        &PhysicalKey::Code(KeyCode::KeyA),
-        &ModifiersState::empty(),
-        false,
-        flags,
-    )
-}
-
-#[test]
-fn encode_kitty_none() {
-    // Legacy mode (protocol disabled): no kitty encoding — the caller
-    // falls back to the legacy encoder.
-    assert_eq!(kitty_press(KittyKeyboardFlags::NONE), None);
-}
-
-#[test]
-fn encode_kitty_basic() {
-    // DISAMBIGUATE only: the key code alone (2 bytes, big-endian) — no
-    // event type, no system modifiers.
-    let code = key_a_code();
-    assert_eq!(
-        kitty_press(KittyKeyboardFlags::DISAMBIGUATE),
-        Some(vec![code[0], code[1]])
-    );
-}
-
-#[test]
-fn encode_kitty_modifiers() {
-    // REPORT_EVENTS | SYSTEM: key code, then event type, then system
-    // modifiers — in that order.
-    let code = key_a_code();
-    let down = encode_kitty(
-        &Key::Character("a".into()),
-        &PhysicalKey::Code(KeyCode::KeyA),
-        &ModifiersState::empty(),
-        false,
-        KittyKeyboardFlags::REPORT_EVENTS | KittyKeyboardFlags::SYSTEM,
-    );
-    assert_eq!(down, Some(vec![code[0], code[1], 1, 0])); // down, no mods
-
-    // Shift held: the system modifier byte carries the shift bit.
-    let shifted = encode_kitty(
-        &Key::Character("a".into()),
-        &PhysicalKey::Code(KeyCode::KeyA),
-        &ModifiersState::SHIFT,
-        false,
-        KittyKeyboardFlags::REPORT_EVENTS | KittyKeyboardFlags::SYSTEM,
-    );
-    assert_eq!(shifted, Some(vec![code[0], code[1], 1, 1]));
-}
-
-#[test]
-fn encode_kitty_repeat() {
-    // REPORT_EVENTS: a fresh press is event type 1 (down), an auto-
-    // repeat is event type 2 (repeat).
-    let code = key_a_code();
-    assert_eq!(
-        encode_kitty(
-            &Key::Character("a".into()),
-            &PhysicalKey::Code(KeyCode::KeyA),
-            &ModifiersState::empty(),
-            false,
-            KittyKeyboardFlags::REPORT_EVENTS,
-        ),
-        Some(vec![code[0], code[1], 1])
-    );
-    assert_eq!(
-        encode_kitty(
-            &Key::Character("a".into()),
-            &PhysicalKey::Code(KeyCode::KeyA),
-            &ModifiersState::empty(),
-            true,
-            KittyKeyboardFlags::REPORT_EVENTS,
-        ),
-        Some(vec![code[0], code[1], 2])
-    );
-}
-
-#[test]
-fn encode_kitty_system_mods() {
-    // SYSTEM: each modifier maps to its pinned bit (shift = 1, ctrl = 2,
-    // alt = 4, super/logo = 8); combinations OR together.
-    let code = key_a_code();
-    let sys = |mods: ModifiersState| {
-        encode_kitty(
-            &Key::Character("a".into()),
-            &PhysicalKey::Code(KeyCode::KeyA),
-            &mods,
-            false,
-            KittyKeyboardFlags::SYSTEM,
-        )
-        .expect("SYSTEM negotiation encodes the press")
-    };
-    assert_eq!(
-        sys(ModifiersState::empty()).as_slice(),
-        &[code[0], code[1], 0][..]
-    );
-    assert_eq!(
-        sys(ModifiersState::SHIFT).as_slice(),
-        &[code[0], code[1], 1][..]
-    );
-    assert_eq!(
-        sys(ModifiersState::CONTROL).as_slice(),
-        &[code[0], code[1], 2][..]
-    );
-    assert_eq!(
-        sys(ModifiersState::ALT).as_slice(),
-        &[code[0], code[1], 4][..]
-    );
-    assert_eq!(
-        sys(ModifiersState::SUPER).as_slice(),
-        &[code[0], code[1], 8][..]
-    );
-    assert_eq!(
-        sys(ModifiersState::SHIFT | ModifiersState::CONTROL).as_slice(),
-        &[code[0], code[1], 3][..]
-    );
-}
-
-#[test]
-fn encode_kitty_fallback() {
-    // Legacy mode: `encode_kitty` yields nothing and the legacy
-    // `encode` still produces the legacy bytes (the window's fallback
-    // path).
-    let logical = Key::Character("a".into());
-    let physical = PhysicalKey::Code(KeyCode::KeyA);
-    let mods = ModifiersState::empty();
-
-    assert_eq!(
-        encode_kitty(&logical, &physical, &mods, false, KittyKeyboardFlags::NONE),
-        None
-    );
-    assert_eq!(
-        encode(
-            &logical,
-            &physical,
-            &mods,
-            false,
-            &BindingTable::default(),
-            TermMode::SHOW_CURSOR,
-        ),
-        Some(InputAction::Send(vec![b'a']))
-    );
-}

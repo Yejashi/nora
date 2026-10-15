@@ -21,7 +21,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowAttributes, WindowId},
 };
 
@@ -30,12 +30,13 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
 use nora::engine::{KittyKeyboardFlags, Snapshot};
+use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
     MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event, logical_to_cell,
     mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions,
 };
-use nora::input::{BindingTable, InputAction, encode, encode_kitty};
+use nora::input::{BindingTable, InputAction, encode};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
 use nora::render::palette::Palette;
 use nora::render::policy::snapshot_is_stale;
@@ -410,6 +411,8 @@ fn first_non_space_line(snapshot: &Snapshot, max_chars: usize) -> String {
 /// the pump through [`AppEvent`] and [`PumpMsg`].
 struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
+    /// Local UI key bindings.
+    bindings: Bindings,
     /// Base color table (built-in xterm palette + `[theme]`); each
     /// snapshot's runtime OSC overrides are overlaid on it before drawing.
     palette: Palette,
@@ -589,6 +592,7 @@ pub fn run_windowed(
         clipboard: create_clipboard(),
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_theme(&config.theme),
+        bindings: Bindings::default(),
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -922,22 +926,112 @@ impl WinApp {
     /// Focus an adjacent pane (N24b): `dir` is Left/Right/Up/Down. The
     /// target is the sibling (or ancestor's sibling) in that direction,
     /// found by walking the active layout tree.
-    fn focus_pane_direction(&mut self, dir: FocusDir) {
-        let Some(tab) = self.active_tab_id() else {
+    /// Perform a bound UI action. `false` when the action had nothing to
+    /// act on, so the key goes to the application instead.
+    fn perform(&mut self, action: UiAction) -> bool {
+        use nora::workspace::TabCommand;
+        match action {
+            UiAction::Copy => {
+                if let Some(pane) = self.active_pane_key() {
+                    let _ = self.pump_commands.send(PumpMsg::Copy { pane });
+                }
+            }
+            UiAction::Paste => self.paste_clipboard(),
+            UiAction::NewTab => self.on_tab_command(TabCommand::New),
+            UiAction::NextTab | UiAction::PrevTab => {
+                if self.workspace.tab_count() < 2 {
+                    return false;
+                }
+                let cmd = if action == UiAction::NextTab {
+                    TabCommand::Next
+                } else {
+                    TabCommand::Prev
+                };
+                self.on_tab_command(cmd);
+            }
+            UiAction::ClosePane => {
+                if self.layout.pane_count() <= 1 {
+                    self.on_tab_command(TabCommand::Close);
+                } else {
+                    self.close_active_pane();
+                }
+            }
+            UiAction::SplitRight => self.split_active_pane(false),
+            UiAction::SplitDown => self.split_active_pane(true),
+            UiAction::FocusPane(direction) => {
+                let dir = match direction {
+                    Direction::Left => FocusDir::Left,
+                    Direction::Right => FocusDir::Right,
+                    Direction::Up => FocusDir::Up,
+                    Direction::Down => FocusDir::Down,
+                };
+                return self.focus_pane_direction(dir);
+            }
+            UiAction::ToggleSearch => self.search.toggle(),
+            UiAction::ZoomIn => self.zoom = nora::config::zoom_in(self.zoom),
+            UiAction::ZoomOut => self.zoom = nora::config::zoom_out(self.zoom),
+            UiAction::ZoomReset => self.zoom = nora::config::zoom_reset(),
+            UiAction::ScrollPageUp
+            | UiAction::ScrollPageDown
+            | UiAction::ScrollToTop
+            | UiAction::ScrollToBottom => {
+                // The alternate screen has no scrollback: the keys belong
+                // to the full-screen application.
+                if self.modes.contains(TermMode::ALT_SCREEN) {
+                    return false;
+                }
+                let scroll = match action {
+                    UiAction::ScrollPageUp => Scroll::PageUp,
+                    UiAction::ScrollPageDown => Scroll::PageDown,
+                    UiAction::ScrollToTop => Scroll::Top,
+                    _ => Scroll::Bottom,
+                };
+                if let Some(pane) = self.active_pane_key() {
+                    let _ = self.pump_commands.send(PumpMsg::Scroll { pane, scroll });
+                }
+            }
+        }
+        true
+    }
+
+    /// Paste the clipboard into the active pane (bracketed when the
+    /// application enabled DECSET 2004). The pump validates and streams
+    /// the text in order, bounded by the writer's app cap.
+    fn paste_clipboard(&mut self) {
+        let text = self.clipboard.as_ref().and_then(|cb| cb.get_text().ok());
+        let Some(text) = text else {
+            if debug_enabled() {
+                eprintln!("debug: paste: clipboard unavailable or empty");
+            }
             return;
+        };
+        let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
+        if let Some(pane) = self.active_pane_key() {
+            let _ = self.pump_commands.send(PumpMsg::Paste {
+                pane,
+                text,
+                bracketed,
+            });
+        }
+    }
+
+    fn focus_pane_direction(&mut self, dir: FocusDir) -> bool {
+        let Some(tab) = self.active_tab_id() else {
+            return false;
         };
         let active = self.layout.active_pane();
         let Some(target) = adjacent_pane(self.layout.root(), active, dir) else {
-            return;
+            return false;
         };
         if target == active {
-            return;
+            return false;
         }
         let prev_pane = PaneKey { tab, pane: active };
         self.layout.focus_pane(target);
         let next_pane = PaneKey { tab, pane: target };
         self.save_active_pane(prev_pane);
         self.load_active_pane(next_pane);
+        true
     }
 
     /// Whether `pane` is live: its tab exists and its pane is in that
@@ -1577,232 +1671,48 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 if event.state != ElementState::Pressed || is_synthetic {
                     return;
                 }
-                // N15: native clipboard UI bindings. These are local UI
-                // actions (not PTY escapes), so they are checked before
-                // `encode` and return early. Keyed on the physical key +
-                // modifier state (layout-independent), mirroring the N09
-                // Ctrl+Q idiom; auto-repeat is ignored (one action per key
-                // press).
-                if self.mods.control_key() && self.mods.shift_key() && !event.repeat {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => {
-                            // Ctrl+Shift+C: copy the selection; the pump
-                            // emits `AppEvent::Copied`, which writes the
-                            // native clipboard.
-                            if let Some(pane) = self.active_pane_key() {
-                                let _ = self.pump_commands.send(PumpMsg::Copy { pane });
-                            }
-                            return;
+                // Local UI bindings (input::bindings). A bound chord whose
+                // action has nothing to act on falls through to the
+                // application; a held non-repeating chord is swallowed so
+                // it never leaks control bytes.
+                if let Some(action) = self.bindings.lookup(&event.physical_key, self.mods) {
+                    if event.repeat && !action.repeats() {
+                        return;
+                    }
+                    if self.perform(action) {
+                        if self.workspace.tab_count() == 0 {
+                            // The last pane closed: the window goes too.
+                            self.stop.store(true, Ordering::Relaxed);
+                            event_loop.exit();
                         }
-                        PhysicalKey::Code(KeyCode::KeyV) => {
-                            // Ctrl+Shift+V: paste the clipboard into the
-                            // PTY (N17b). The pump validates the text
-                            // (size cap, newline normalization, bracketed
-                            // paste markers) and streams it to the PTY in
-                            // order, bounded by the writer's app cap.
-                            // `bracketed` reflects the engine's live
-                            // `TermMode::BRACKETED_PASTE` (set by
-                            // `CSI ? 2004 h`, cleared by `CSI ? 2004 l`).
-                            let text = self.clipboard.as_ref().and_then(|cb| cb.get_text().ok());
-                            match text {
-                                Some(text) => {
-                                    let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
-                                    if let Some(pane) = self.active_pane_key() {
-                                        let _ = self.pump_commands.send(PumpMsg::Paste {
-                                            pane,
-                                            text,
-                                            bracketed,
-                                        });
-                                    }
-                                }
-                                None => {
-                                    if debug_enabled() {
-                                        eprintln!("debug: paste: clipboard unavailable or empty");
-                                    }
-                                }
-                            }
-                            return;
-                        }
-                        _ => {}
+                        return;
                     }
                 }
-                // N19b: zoom controls. Local UI actions (not PTY escapes),
-                // so they are checked before `encode` and return early,
-                // mirroring the N15 idiom. Keyed on the physical key +
-                // Ctrl (layout-independent), so the shortcuts work on any
-                // layout.
-                if self.mods.control_key() {
-                    match event.physical_key {
-                        // Ctrl+= / Ctrl++: zoom in one step, capped at
-                        // 4.0x. The main-row `+` is the `Equal` key with
-                        // Shift; the numpad `+` is `NumpadAdd` (winit
-                        // 0.30.13 has no `Plus` code).
-                        PhysicalKey::Code(KeyCode::Equal)
-                        | PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                            self.zoom = nora::config::zoom_in(self.zoom);
-                            eprintln!("zoom: {:.1}x", self.zoom);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Minus) => {
-                            // Ctrl+-: zoom out one step, floored at 0.5x.
-                            self.zoom = nora::config::zoom_out(self.zoom);
-                            eprintln!("zoom: {:.1}x", self.zoom);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit0) => {
-                            // Ctrl+0: reset zoom to 100%.
-                            self.zoom = nora::config::zoom_reset();
-                            eprintln!("zoom: reset to {:.1}x", self.zoom);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // N20b: search bar. Local UI actions (not PTY escapes),
-                // checked before `encode` and returning early, mirroring
-                // the N15/N19b idiom. While the bar is visible the
-                // logical key drives the query (typed text is
-                // layout-dependent); the toggle is keyed on the
-                // physical `F` + Ctrl (layout-independent).
+                // While the search bar is open it owns text input.
                 if self.search.visible {
                     match &event.logical_key {
                         Key::Character(text) => {
                             self.search.input(text, &self.last_visible);
-                            eprintln!(
-                                "search: {} match(es) for '{}'",
-                                self.search.state.total, self.search.state.query
-                            );
                             return;
                         }
                         Key::Named(NamedKey::Enter) => {
-                            // Enter = next match, Shift+Enter = previous
-                            // (both wrap); the highlight span is
-                            // recomputed on the next presented frame.
                             if self.mods.shift_key() {
                                 self.search.prev();
                             } else {
                                 self.search.next();
                             }
-                            if let Some(m) = self.search.current_match() {
-                                eprintln!("search highlight: row={}, col={}", m.row, m.col);
-                            }
                             return;
                         }
                         Key::Named(NamedKey::Backspace) => {
                             self.search.backspace(&self.last_visible);
-                            eprintln!(
-                                "search: {} match(es) for '{}'",
-                                self.search.state.total, self.search.state.query
-                            );
                             return;
                         }
                         Key::Named(NamedKey::Escape) => {
                             self.search.close();
-                            eprintln!("search: hidden");
                             return;
                         }
                         _ => {}
                     }
-                }
-                if self.mods.control_key()
-                    && !event.repeat
-                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyF)
-                {
-                    self.search.toggle();
-                    eprintln!(
-                        "search: {}",
-                        if self.search.visible {
-                            "shown"
-                        } else {
-                            "hidden"
-                        }
-                    );
-                    return;
-                }
-                // N23b: tab shortcuts. Local UI actions (not PTY
-                // escapes), checked before `encode` and returning
-                // early, mirroring the N15/N19b/N20b idiom. Keyed on
-                // the physical key + Ctrl (layout-independent).
-                if self.mods.control_key() && !event.repeat {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyT) => {
-                            // Ctrl+T: new tab.
-                            self.on_tab_command(nora::workspace::TabCommand::New);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyW) => {
-                            // Ctrl+W: close the active tab.
-                            self.on_tab_command(nora::workspace::TabCommand::Close);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Tab) if self.mods.shift_key() => {
-                            // Ctrl+Shift+Tab: previous tab.
-                            self.on_tab_command(nora::workspace::TabCommand::Prev);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Tab) => {
-                            // Ctrl+Tab: next tab.
-                            self.on_tab_command(nora::workspace::TabCommand::Next);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyD) if self.mods.shift_key() => {
-                            // Ctrl+Shift+D: split vertically (new pane
-                            // below the active pane).
-                            self.split_active_pane(true);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyD) => {
-                            // Ctrl+D: split horizontally (new pane to the
-                            // right of the active pane).
-                            self.split_active_pane(false);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyX) => {
-                            // Ctrl+X: close the active pane.
-                            self.close_active_pane();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                            // Ctrl+Left: focus the pane to the left.
-                            self.focus_pane_direction(FocusDir::Left);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowRight) => {
-                            // Ctrl+Right: focus the pane to the right.
-                            self.focus_pane_direction(FocusDir::Right);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowUp) => {
-                            // Ctrl+Up: focus the pane above.
-                            self.focus_pane_direction(FocusDir::Up);
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowDown) => {
-                            // Ctrl+Down: focus the pane below.
-                            self.focus_pane_direction(FocusDir::Down);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // N21b: kitty keyboard protocol — when the application
-                // has negotiated the protocol (the engine's live flags
-                // are non-NONE), the key is encoded in the kitty byte
-                // format and sent to the PTY; the legacy `encode` is
-                // the fallback when the protocol is disabled. The
-                // window's initial `NONE` is corrected by the first
-                // pump tick's `AppEvent::KittyModes`.
-                if let Some(bytes) = encode_kitty(
-                    &event.logical_key,
-                    &event.physical_key,
-                    &self.mods,
-                    event.repeat,
-                    self.kitty_flags,
-                ) {
-                    if let Some(pane) = self.active_pane_key() {
-                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
-                    }
-                    return;
                 }
                 if let Some(action) = encode(
                     &event.logical_key,
