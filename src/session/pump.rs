@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use super::pty::{DRAIN_TIMEOUT, LaunchSpec, PtySession, SessionEvent};
@@ -290,6 +290,9 @@ pub fn feed_pending(
 /// reaches another pane (and never another tab).
 struct PanePump {
     session: PtySession,
+    /// Publish a snapshot on the next tick even without terminal damage:
+    /// selection changes are not damage, yet must reach the screen.
+    force_snapshot: bool,
     /// Pending input bytes for this pane (N09b/N17b).
     pending_input: Vec<u8>,
     /// The in-flight paste block within `pending_input`, as a half-open
@@ -313,6 +316,7 @@ impl PanePump {
     fn new(session: PtySession) -> Self {
         Self {
             session,
+            force_snapshot: false,
             pending_input: Vec::new(),
             paste_block: None,
             last_modes: None,
@@ -346,7 +350,7 @@ fn tick_pane(
             if !is_noop_damage(&damage, cursor) {
                 let snapshot = pane_pump.session.engine().snapshot();
                 let (rows, cols) = (snapshot.rows, snapshot.cols);
-                *slot.lock().unwrap() = Some(snapshot);
+                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
                 if debug_enabled() {
                     eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
                 }
@@ -386,9 +390,15 @@ fn tick_pane(
         return true;
     }
 
-    if let Some(snapshot) = outcome.snapshot {
+    let forced = std::mem::take(&mut pane_pump.force_snapshot);
+    let snapshot = match outcome.snapshot {
+        Some(snapshot) => Some(snapshot),
+        None if forced => Some(pane_pump.session.engine().snapshot()),
+        None => None,
+    };
+    if let Some(snapshot) = snapshot {
         let (rows, cols) = (snapshot.rows, snapshot.cols);
-        *slot.lock().unwrap() = Some(snapshot);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
         if debug_enabled() {
             eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
         }
@@ -537,6 +547,7 @@ pub fn pump_thread(
                             .session
                             .engine()
                             .select((start_row, start_col), (end_row, end_col));
+                        pane_pump.force_snapshot = true;
                     }
                 }
                 PumpMsg::ClearSelection { pane } => {
@@ -545,6 +556,7 @@ pub fn pump_thread(
                     }
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
                         pane_pump.session.engine().clear_selection();
+                        pane_pump.force_snapshot = true;
                     }
                 }
                 PumpMsg::Copy { pane } => {

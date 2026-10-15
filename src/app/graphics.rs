@@ -324,6 +324,9 @@ pub struct Frame {
 /// GPU side of a nora window: a surface and the device presenting to it, plus
 /// the glyph rasterization state for live frames (N08b2b).
 pub struct Graphics {
+    /// Kept to recreate the surface after `SurfaceError::Lost`.
+    instance: Instance,
+    window: Arc<Window>,
     adapter: Adapter,
     device: wgpu::Device,
     /// Submitted by the first render pass (N02 text adapter).
@@ -409,6 +412,8 @@ impl Graphics {
         let deco_pipeline = decoration_pipeline(&device, format);
 
         Ok(Self {
+            instance,
+            window: window.clone(),
             adapter,
             device,
             queue,
@@ -447,10 +452,33 @@ impl Graphics {
     /// Zero-sized surfaces are ignored: the last valid configuration remains
     /// until a non-zero size arrives.
     pub fn set_size(&mut self, size: PhysicalSize<u32>) -> Result<(), String> {
-        if size.width == 0 || size.height == 0 {
+        if self.configured_size == Some(size) {
             return Ok(());
         }
-        if self.configured_size == Some(size) {
+        self.configure(size)
+    }
+
+    /// Reconfigure the surface at the window's current size even when the
+    /// size is unchanged: the recovery for `Suboptimal` and `Outdated`
+    /// acquires, which `set_size` would skip.
+    pub fn reconfigure(&mut self) -> Result<(), String> {
+        let size = self.window.inner_size();
+        self.configure(size)
+    }
+
+    /// Replace a lost surface with a new one for the same window and
+    /// configure it (`SurfaceError::Lost` cannot be fixed by reconfiguring).
+    pub fn recreate_surface(&mut self) -> Result<(), String> {
+        self.surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .map_err(|err| format!("failed to recreate window surface: {err}"))?;
+        self.configured_size = None;
+        self.reconfigure()
+    }
+
+    fn configure(&mut self, size: PhysicalSize<u32>) -> Result<(), String> {
+        if size.width == 0 || size.height == 0 {
             return Ok(());
         }
         let mut config = self
@@ -850,12 +878,16 @@ impl Graphics {
     /// On a frame without a texture the (possibly empty) encoder is still
     /// finished and submitted, and dropping the frame releases the failed
     /// acquire before the caller reconfigures the surface.
-    pub fn present(&self, frame: Frame) {
+    pub fn present(&mut self, frame: Frame) {
         let cmd = frame.encoder.finish();
         self.queue.submit([cmd]);
         if let Some(st) = frame.texture {
             self.queue.present(st);
         }
+        // Release atlas space for glyphs this frame did not use; without
+        // it the atlas only grows until `prepare` fails with AtlasFull and
+        // text stops rendering (audit R8).
+        self.atlas.trim();
     }
 }
 

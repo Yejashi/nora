@@ -45,6 +45,11 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-F4, F12 | Mouse: SGR format, 1002/1003 swapped, 1000 lost releases, no legacy/UTF-8 encodings, wrong modifier bits, Back/Forward codes | M1.4 |
 | I-F16 | Click selection while the app reports the mouse; one-cell highlight stuck | M1.4 |
 | I-F17 (wheel) | No alternate scroll in the alternate screen | M1.4 |
+| I-F9 | No RedrawRequested handling: no frame on expose, zoom, search, tab/pane switch | M1.5 |
+| R7 | Surface recovery: Suboptimal loop, retry budget never reset, Lost not recreated, device loss only logged | M1.5 |
+| R8 | Glyph atlas never trimmed (unbounded growth) | M1.5 (trim per frame; soak test pending in M3) |
+| I-F16 (late) | Selection changes reached the screen only with the next output | M1.5 |
+| P13 | Poisoned-mutex unwraps on the snapshot slot | M1.5 |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit

@@ -416,6 +416,11 @@ struct WinApp {
     bindings: Bindings,
     /// The last cell a motion report was sent for (one report per cell).
     last_motion_cell: Option<(u16, u16)>,
+    /// Each pane's last rendered snapshot, redrawn on redraw requests that
+    /// bring no new output (bounded: one snapshot per live pane).
+    pane_last: std::collections::HashMap<PaneKey, Snapshot>,
+    /// Set by the wgpu device-lost callback; the next render exits.
+    device_lost: Arc<AtomicBool>,
     /// Base color table (built-in xterm palette + `[theme]`); each
     /// snapshot's runtime OSC overrides are overlaid on it before drawing.
     palette: Palette,
@@ -597,6 +602,8 @@ pub fn run_windowed(
         palette: Palette::from_theme(&config.theme),
         bindings: Bindings::default(),
         last_motion_cell: None,
+        pane_last: std::collections::HashMap::new(),
+        device_lost: Arc::new(AtomicBool::new(false)),
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -673,6 +680,7 @@ impl WinApp {
     /// Drop a pane's per-pane state (N24b); its session is reaped by the
     /// pump.
     fn drop_pane_state(&mut self, pane: PaneKey) {
+        self.pane_last.remove(&pane);
         self.pane_slots.remove(&pane);
         self.pane_grid.remove(&pane);
         self.pane_exit.remove(&pane);
@@ -1070,17 +1078,13 @@ impl WinApp {
                             on_event(self.state.clone(), RenderEvent::Dirty { non_noop: true });
                         self.state = state;
                         match action {
-                            Action::Render => {
-                                let window = self.window.as_ref().expect("the window exists");
-                                window.request_redraw(); // redraw SITE 1
-                                self.attempt_render(event_loop);
-                            }
+                            Action::Render => self.attempt_render(event_loop, false),
                             Action::Skip => {}
                             Action::ExitFail => {
                                 self.failed = true;
                                 event_loop.exit();
                             }
-                            Action::Reconfigure | Action::Close => {
+                            Action::Reconfigure | Action::Recreate | Action::Close => {
                                 // A dirty pulse never reconfigures or
                                 // closes; the resize / child-exit arms
                                 // own those.
@@ -1211,7 +1215,18 @@ impl WinApp {
 
     /// Render the pending snapshot through one acquire → fold → draw →
     /// present pass, following the pure machine's [`Action`].
-    fn attempt_render(&mut self, event_loop: &ActiveEventLoop) {
+    /// Render the active pane. A fresh snapshot from the pump wins; with
+    /// `retained` (a redraw request: expose, zoom, search, tab or pane
+    /// switch, surface reconfigure) the pane's last rendered snapshot is
+    /// redrawn when nothing new arrived.
+    fn attempt_render(&mut self, event_loop: &ActiveEventLoop, retained: bool) {
+        if self.device_lost.load(Ordering::Relaxed) {
+            eprintln!("nora: the GPU device was lost; exiting");
+            self.failed = true;
+            event_loop.exit();
+            return;
+        }
+        let active = self.active_pane_key();
         // N24b: read the active pane's slot first (before the graphics
         // borrow); the pump stores each pane's latest snapshot in its own
         // slot.
@@ -1236,7 +1251,12 @@ impl WinApp {
         self.state = state;
         match action {
             Action::Render => {
-                let snap = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let fresh = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let snap = match fresh {
+                    Some(snap) => Some(snap),
+                    None if retained => active.and_then(|pane| self.pane_last.remove(&pane)),
+                    None => None,
+                };
                 let Some(mut snap) = snap else {
                     // Coalesced pulse: the pump's single slot held one
                     // snapshot for two rapid pulses (e.g. the
@@ -1397,7 +1417,11 @@ impl WinApp {
                 ) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
+                let suboptimal = frame.status == SurfaceStatus::Suboptimal;
                 graphics.present(frame);
+                if suboptimal && let Err(message) = graphics.reconfigure() {
+                    eprintln!("nora: surface reconfiguration failed: {message}");
+                }
                 self.frames += 1;
                 if debug_enabled() {
                     eprintln!(
@@ -1405,18 +1429,27 @@ impl WinApp {
                         self.frames, snap.rows, snap.cols, line1
                     );
                 }
+                if let Some(pane) = active {
+                    self.pane_last.insert(pane, snap);
+                }
             }
             Action::Reconfigure => {
-                // Suboptimal: the frame carries a texture, so drop it
-                // before `set_size` (Surface::configure panics while a
-                // SurfaceTexture is alive). No present: no stale clear
-                // frame is needed; the next attempt re-acquires.
+                // Suboptimal/Outdated: the frame may carry a texture, so
+                // drop it before reconfiguring (Surface::configure panics
+                // while a SurfaceTexture is alive). Forced: Suboptimal
+                // keeps the size, which `set_size` would skip (audit R7).
                 drop(frame);
-                let size = window.inner_size();
-                if let Err(message) = graphics.set_size(size) {
+                if let Err(message) = graphics.reconfigure() {
                     eprintln!("nora: surface reconfiguration failed: {message}");
                 }
-                window.request_redraw(); // redraw SITE 3
+                window.request_redraw();
+            }
+            Action::Recreate => {
+                drop(frame);
+                if let Err(message) = graphics.recreate_surface() {
+                    eprintln!("nora: surface recreation failed: {message}");
+                }
+                window.request_redraw();
             }
             Action::ExitFail => {
                 self.failed = true;
@@ -1454,18 +1487,21 @@ impl ApplicationHandler<AppEvent> for WinApp {
         // sent to the PTY exactly once).
         window.set_ime_allowed(true);
 
-        let mut graphics =
-            match pollster::block_on(Graphics::new(event_loop, &window, |device, surface| {
-                eprintln!("nora: device lost: {device:?} {surface}");
-            })) {
-                Ok(graphics) => graphics,
-                Err(message) => {
-                    eprintln!("nora: {message}");
-                    self.failed = true;
-                    event_loop.exit();
-                    return;
-                }
-            };
+        let mut graphics = match pollster::block_on(Graphics::new(event_loop, &window, {
+            let device_lost = self.device_lost.clone();
+            move |reason, message| {
+                eprintln!("nora: device lost: {reason:?} {message}");
+                device_lost.store(true, Ordering::Relaxed);
+            }
+        })) {
+            Ok(graphics) => graphics,
+            Err(message) => {
+                eprintln!("nora: {message}");
+                self.failed = true;
+                event_loop.exit();
+                return;
+            }
+        };
 
         let fonts = glyphs::Fonts::load();
         let info = graphics.adapter_info();
@@ -1548,6 +1584,15 @@ impl ApplicationHandler<AppEvent> for WinApp {
         };
 
         match event {
+            // Expose, and every redraw this window requests (zoom, search,
+            // tab or pane switch, surface reconfigure): draw the newest
+            // snapshot, or redraw the retained one.
+            WindowEvent::RedrawRequested => {
+                if !self.state.zero_size {
+                    self.state.dirty = true;
+                    self.attempt_render(event_loop, true);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if size.width == 0 || size.height == 0 {
                     // No set_size, no PumpMsg, no redraw: just record.
@@ -1682,6 +1727,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         return;
                     }
                     if self.perform(action) {
+                        window.request_redraw();
                         if self.workspace.tab_count() == 0 {
                             // The last pane closed: the window goes too.
                             self.stop.store(true, Ordering::Relaxed);
@@ -1695,6 +1741,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     match &event.logical_key {
                         Key::Character(text) => {
                             self.search.input(text, &self.last_visible);
+                            window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::Enter) => {
@@ -1703,14 +1750,17 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             } else {
                                 self.search.next();
                             }
+                            window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::Backspace) => {
                             self.search.backspace(&self.last_visible);
+                            window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::Escape) => {
                             self.search.close();
+                            window.request_redraw();
                             return;
                         }
                         _ => {}

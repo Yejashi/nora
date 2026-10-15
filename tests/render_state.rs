@@ -27,32 +27,29 @@ fn idle_pulse_is_noop() {
     assert_eq!(state, default_state(), "idle must not touch state");
 }
 
-/// Retries 1 and 2 reconfigure and the following `Success` renders;
-/// retry 3 exits with `ExitFail`.
+/// The retry budget bounds *consecutive* surface failures: Lost recreates
+/// the surface, Outdated reconfigures, three failures in a row exit, and a
+/// successful acquire resets the streak (it used to be a session total, so
+/// three Outdated events over a whole session closed the window, audit R7).
 #[test]
-fn surface_retry_budget_exhausts_at_three() {
-    // Retry 1.
-    let (state, action) = on_event(
-        RenderState {
-            dirty: true,
-            ..default_state()
-        },
-        RenderEvent::SurfaceStatus(SurfaceStatus::Lost),
-    );
-    assert_eq!(action, Action::Reconfigure);
+fn surface_retry_budget_counts_consecutive_failures() {
+    let dirty = RenderState {
+        dirty: true,
+        ..default_state()
+    };
+    let (state, action) = on_event(dirty, RenderEvent::SurfaceStatus(SurfaceStatus::Lost));
+    assert_eq!(action, Action::Recreate);
     assert_eq!(state.surface_retry, 1);
 
-    // The attempt after reconfigure renders.
     let (state, action) = on_event(state, RenderEvent::SurfaceStatus(SurfaceStatus::Success));
     assert_eq!(action, Action::Render);
-    assert_eq!(state.surface_retry, 1, "success must not change the budget");
+    assert_eq!(state.surface_retry, 0, "success resets the streak");
 
-    // Retry 2.
-    let (state, action) = on_event(state, RenderEvent::SurfaceStatus(SurfaceStatus::Lost));
+    let (state, action) = on_event(state, RenderEvent::SurfaceStatus(SurfaceStatus::Outdated));
     assert_eq!(action, Action::Reconfigure);
+    let (state, action) = on_event(state, RenderEvent::SurfaceStatus(SurfaceStatus::Lost));
+    assert_eq!(action, Action::Recreate);
     assert_eq!(state.surface_retry, 2);
-
-    // Retry 3 exhausts the budget.
     let (state, action) = on_event(state, RenderEvent::SurfaceStatus(SurfaceStatus::Outdated));
     assert_eq!(action, Action::ExitFail);
     assert_eq!(state.surface_retry, 3);
@@ -104,9 +101,11 @@ fn resize_reconfigures_then_next_attempt_renders() {
     assert_eq!(action, Action::Render);
 }
 
-/// `Suboptimal` reconfigures (the next attempt renders).
+/// A `Suboptimal` frame is presentable: it renders when dirty (the caller
+/// reconfigures after presenting) and only reconfigures when idle; it never
+/// consumes the retry budget.
 #[test]
-fn suboptimal_reconfigures() {
+fn suboptimal_renders_then_reconfigures() {
     let (state, action) = on_event(
         RenderState {
             dirty: true,
@@ -114,11 +113,13 @@ fn suboptimal_reconfigures() {
         },
         RenderEvent::SurfaceStatus(SurfaceStatus::Suboptimal),
     );
-    assert_eq!(action, Action::Reconfigure);
-    assert_eq!(
-        state.surface_retry, 0,
-        "suboptimal must not consume the budget"
+    assert_eq!(action, Action::Render);
+    assert_eq!(state.surface_retry, 0);
+    let (_, action) = on_event(
+        default_state(),
+        RenderEvent::SurfaceStatus(SurfaceStatus::Suboptimal),
     );
+    assert_eq!(action, Action::Reconfigure);
 }
 
 /// A zero-sized surface skips the render even when dirty; a later

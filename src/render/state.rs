@@ -76,6 +76,9 @@ pub enum Action {
     /// Reconfigure the window/surface and try again (counts toward the
     /// retry budget only on `Outdated`/`Lost`/`Validation`).
     Reconfigure,
+    /// The surface is lost: create a new one for the window (counts
+    /// toward the retry budget).
+    Recreate,
     /// Retry budget exhausted: stop the loop with a failure.
     ExitFail,
     /// Shut down cleanly (child exited).
@@ -131,6 +134,9 @@ pub fn on_event(state: RenderState, ev: RenderEvent) -> (RenderState, Action) {
         }
         RenderEvent::SurfaceStatus(status) => match status {
             SurfaceStatus::Success => {
+                // A good acquire ends any recovery streak: the retry
+                // budget bounds consecutive failures, not a session total.
+                state.surface_retry = 0;
                 if state.dirty && !state.zero_size {
                     Action::Render
                 } else {
@@ -139,13 +145,26 @@ pub fn on_event(state: RenderState, ev: RenderEvent) -> (RenderState, Action) {
             }
             // The surface size no longer matches the window: reconfigure,
             // then the next attempt renders.
-            SurfaceStatus::Suboptimal => Action::Reconfigure,
+            // A suboptimal frame is still presentable: render it, and the
+            // caller reconfigures after presenting. Reconfiguring first and
+            // re-requesting a frame could loop while the compositor keeps
+            // reporting Suboptimal.
+            SurfaceStatus::Suboptimal => {
+                state.surface_retry = 0;
+                if state.dirty && !state.zero_size {
+                    Action::Render
+                } else {
+                    Action::Reconfigure
+                }
+            }
             // No retry budget: the frame is skipped until the next event.
             SurfaceStatus::Timeout | SurfaceStatus::Occluded => Action::Skip,
             SurfaceStatus::Outdated | SurfaceStatus::Lost | SurfaceStatus::Validation(_) => {
                 state.surface_retry += 1;
                 if state.surface_retry >= 3 {
                     Action::ExitFail
+                } else if status == SurfaceStatus::Lost {
+                    Action::Recreate
                 } else {
                     Action::Reconfigure
                 }

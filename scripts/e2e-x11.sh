@@ -219,7 +219,47 @@ CHILD
     pass mouse
 }
 
-ALL=(render tty resize keys mouse)
+# Redraw: after the window is unmapped and mapped again (expose), the
+# content is redrawn without any new output from the child.
+scenario_redraw() {
+    local dir="$OUT/redraw"; mkdir -p "$dir"
+    printf '#!/bin/sh\nprintf "REDRAW CHECK TEXT\\r\\n"\nsleep 30\n' >"$dir/child.sh"
+    chmod +x "$dir/child.sh"
+    launch redraw "$dir/child.sh" || { fail redraw "no window"; return; }
+    xdotool windowunmap --sync "$WIN"
+    sleep 0.5
+    xdotool windowmap --sync "$WIN"
+    shot "$dir/shot.png"
+    finish
+    local white
+    white=$(count_color "$dir/shot.png" '#FFFFFF')
+    echo "  white px after expose: $white"
+    [ "$white" -gt 200 ] || { fail redraw "content not redrawn after expose"; return; }
+    pass redraw
+}
+
+# Selection: a mouse drag highlights cells immediately (selection changes
+# are not terminal damage; the pump must still publish them).
+scenario_selection() {
+    local dir="$OUT/selection"; mkdir -p "$dir"
+    printf '#!/bin/sh\nprintf "SELECT ME PLEASE\\r\\n"\nsleep 30\n' >"$dir/child.sh"
+    chmod +x "$dir/child.sh"
+    launch selection "$dir/child.sh" || { fail selection "no window"; return; }
+    local cw ch
+    read -r cw ch <<<"$(sed -n 's/^fonts: cell \([0-9]*\)x\([0-9]*\).*/\1 \2/p' "$OUT/selection/nora.log" | head -1)"
+    xdotool mousemove --window "$WIN" $((cw / 2)) $((ch / 2)) mousedown 1
+    xdotool mousemove --window "$WIN" $((cw * 10)) $((ch / 2))
+    xdotool mousemove --window "$WIN" $((cw * 12)) $((ch / 2)) mouseup 1
+    shot "$dir/shot.png"
+    finish
+    local sel
+    sel=$(count_color "$dir/shot.png" '#335577')
+    echo "  selection px: $sel"
+    [ "$sel" -gt $((cw * ch * 4)) ] || { fail selection "no selection highlight"; return; }
+    pass selection
+}
+
+ALL=(render tty resize keys mouse redraw selection)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
