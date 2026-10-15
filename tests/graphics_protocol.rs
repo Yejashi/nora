@@ -194,3 +194,71 @@ fn handler_non_g_command() {
     let reply = handler.process(&event);
     assert!(reply.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Chunk assembly (m=1 / m=0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handler_chunked_upload_reassembles() {
+    let data = b64(&sample_rgba());
+    assert_eq!(data.len(), 24, "16-byte RGBA encodes to 24 base64 chars");
+    // Split into three chunks (each a multiple of 4 base64 chars).
+    let c1 = &data[0..12];
+    let c2 = &data[12..20];
+    let c3 = &data[20..24];
+    let mut handler = GraphicsHandler::new();
+    // First chunk: metadata (s/v/i) + m=1 + first data.
+    let first = parse_payload(format!("Gi=7,s=2,v=2,m=1;{c1}").as_bytes()).unwrap();
+    assert!(handler.process(&first).is_none(), "no reply on first chunk");
+    assert_eq!(handler.images.len(), 0, "not stored until final chunk");
+    // Second chunk: only m=1 + data.
+    let second = parse_payload(format!("Gm=1;{c2}").as_bytes()).unwrap();
+    assert!(
+        handler.process(&second).is_none(),
+        "no reply on middle chunk"
+    );
+    assert_eq!(handler.images.len(), 0, "not stored until final chunk");
+    // Third chunk: m=0 + last data.
+    let third = parse_payload(format!("Gm=0;{c3}").as_bytes()).unwrap();
+    let reply = handler.process(&third).expect("reply on final chunk");
+    assert_eq!(reply, "ESC _ G i=7;OK ST");
+    assert_eq!(handler.images.len(), 1, "stored on final chunk");
+    // The complete 16-byte payload was reassembled.
+    let img = handler.images.query(7).expect("image 7");
+    assert_eq!(img.pixels, sample_rgba());
+}
+
+#[test]
+fn handler_chunked_upload_quiet() {
+    let data = b64(&sample_rgba());
+    let mut handler = GraphicsHandler::new();
+    // First chunk (quiet) + final chunk: no reply, but the image is stored.
+    let first = parse_payload(format!("Gq=1,i=8,s=2,v=2,m=1;{}", &data[0..12]).as_bytes()).unwrap();
+    assert!(handler.process(&first).is_none());
+    let last = parse_payload(format!("Gm=0;{}", &data[12..24]).as_bytes()).unwrap();
+    assert!(handler.process(&last).is_none(), "q=1 suppresses the reply");
+    assert_eq!(handler.images.len(), 1, "stored despite quiet");
+}
+
+#[test]
+fn handler_chunked_malformed_final_without_first() {
+    // m=0 with no in-progress first chunk: treat as a single frame.
+    let data = b64(&sample_rgba());
+    let mut handler = GraphicsHandler::new();
+    let event = parse_payload(format!("Gi=9,s=2,v=2,m=0;{data}").as_bytes()).unwrap();
+    let reply = handler.process(&event).expect("reply");
+    assert_eq!(reply, "ESC _ G i=9;OK ST");
+    assert_eq!(handler.images.len(), 1);
+}
+
+#[test]
+fn handler_non_chunked_still_works() {
+    // A single-frame (no m) transmit is unaffected by the chunk state.
+    let data = b64(&sample_rgba());
+    let mut handler = GraphicsHandler::new();
+    let event = parse_payload(format!("Gi=10,s=2,v=2;{data}").as_bytes()).unwrap();
+    let reply = handler.process(&event).expect("reply");
+    assert_eq!(reply, "ESC _ G i=10;OK ST");
+    assert_eq!(handler.images.len(), 1);
+}

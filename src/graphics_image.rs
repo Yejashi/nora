@@ -464,11 +464,22 @@ pub fn clip(
 /// character: `ESC _ G <keys> ST`, where `<keys>` carries the image ID
 /// (`i`), the placement ID (`p`, for placement replies), the image
 /// dimensions (`s`/`v`, for query replies), and an `OK`/`ERR` status.
+///
+/// Chunked uploads (kitty spec): the first chunk carries the metadata plus
+/// `m=1`; subsequent chunks carry only `m=1` + data; the final chunk carries
+/// `m=0`. The handler accumulates the decoded data across chunks and
+/// processes the complete image only when the final chunk arrives.
 pub struct GraphicsHandler {
     /// The uploaded images.
     pub images: ImageStore,
     /// The placements (separate from image IDs).
     pub placements: PlacementStore,
+    /// In-progress chunked upload: the first chunk's event (metadata + first
+    /// data), with subsequent chunks' data appended to `data`. `None` when no
+    /// chunked upload is in flight. The client must finish a chunked upload
+    /// before sending other graphics escapes (kitty spec), so at most one is
+    /// in flight at a time.
+    in_progress: Option<crate::graphics_filter::GraphicsEvent>,
 }
 
 impl Default for GraphicsHandler {
@@ -483,11 +494,20 @@ impl GraphicsHandler {
         Self {
             images: ImageStore::new(),
             placements: PlacementStore::new(),
+            in_progress: None,
         }
     }
 
     /// Process a graphics event, returning the reply string (if a reply is
     /// due and not suppressed) or `None`.
+    ///
+    /// Chunked uploads (kitty spec): the first chunk carries the metadata
+    /// (`s`/`v`/`f`/`i`) plus `m=1`; subsequent chunks carry only `m=1` +
+    /// data; the final chunk carries `m=0`. The handler accumulates the
+    /// decoded data across chunks and processes the complete image only when
+    /// the final chunk (`m=0`) arrives (no reply before then). A `G` event
+    /// with no `m` key is a single (non-chunked) frame and is processed
+    /// immediately.
     pub fn process(&mut self, event: &GraphicsEvent) -> Option<String> {
         // The real protocol uses command 'G' with an 'a' action key.
         if event.command != b'G' {
@@ -495,6 +515,44 @@ impl GraphicsHandler {
         }
         // Quiet mode: q=1 suppresses replies.
         let quiet = event.get("q").is_some_and(|v| v == "1");
+        match event.get("m") {
+            Some("1") => {
+                // Chunked: first or subsequent chunk.
+                if self.in_progress.is_none() {
+                    // First chunk: start the accumulation (metadata + first data).
+                    self.in_progress = Some(event.clone());
+                } else if let Some(ref mut ip) = self.in_progress {
+                    // Subsequent chunk: append its data.
+                    ip.data.extend_from_slice(&event.data);
+                }
+                None // No reply until the final chunk (m=0).
+            }
+            Some("0") => {
+                // Final chunk: complete the accumulation and process.
+                let complete = if let Some(mut ip) = self.in_progress.take() {
+                    ip.data.extend_from_slice(&event.data);
+                    Some(ip)
+                } else {
+                    // Malformed (m=0 with no first chunk): treat as a single frame.
+                    Some(event.clone())
+                };
+                match complete {
+                    // The first chunk's parameters (including `q`) govern the
+                    // reply for the whole chunked upload.
+                    Some(ev) => {
+                        let quiet = ev.get("q").is_some_and(|v| v == "1");
+                        self.process_action(&ev, quiet)
+                    }
+                    None => None,
+                }
+            }
+            _ => self.process_action(event, quiet),
+        }
+    }
+
+    /// Dispatch a complete (non-chunked or fully-assembled) event to its
+    /// action handler.
+    fn process_action(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
         // The action key defaults to transmit (a=T) when absent.
         let action = event.get("a").unwrap_or("T");
         match action {
