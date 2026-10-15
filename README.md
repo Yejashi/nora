@@ -173,7 +173,7 @@ server available, the launch falls back to the headless session pump.
 | Split right / split below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
 | Focus pane | Ctrl+Shift+Arrow |
 | Close pane (tab, window) | Ctrl+Shift+W |
-| Search | Ctrl+Shift+F, Escape closes |
+| Search (visible screen) | Ctrl+Shift+F; Enter / Shift+Enter next / previous, Escape closes |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
 

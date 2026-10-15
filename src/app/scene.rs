@@ -191,6 +191,34 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// The search bar: `text` on grid row `row`, across `cols` columns, over
+    /// whatever the pane shows there.
+    pub fn add_search_bar(&mut self, text: &str, row: u32, cols: u32) {
+        self.cells.retain(|cell| cell.row != row);
+        self.fills.retain(|fill| fill.row != row);
+        self.fills.push(CellFill {
+            row,
+            col: 0,
+            span: cols.min(u32::from(u16::MAX)) as u16,
+            color: SEARCH_BAR_BG,
+        });
+        for (col, ch) in text.chars().take(cols as usize).enumerate() {
+            if ch != ' ' {
+                self.cells.push(DrawCell {
+                    row,
+                    col: col as u32,
+                    text: ch.to_string(),
+                    style: tab_style(TAB_ACTIVE_FG, SEARCH_BAR_BG, false),
+                    width: 1,
+                });
+            }
+        }
+    }
+}
+
+const SEARCH_BAR_BG: [u8; 4] = [0x3a, 0x2e, 0x10, 255];
+
 fn tab_style(fg: [u8; 4], bg: [u8; 4], bold: bool) -> CellStyle {
     CellStyle {
         fg,
@@ -216,6 +244,22 @@ mod tests {
         assert_eq!(text, "12vim");
         let active_fill = scene.fills.iter().find(|f| f.color == TAB_ACTIVE_BG);
         assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((4, 7)));
+    }
+
+    #[test]
+    fn search_bar_replaces_its_row() {
+        let mut scene = Scene::default();
+        scene.cells.push(DrawCell {
+            row: 3,
+            col: 0,
+            text: "x".into(),
+            style: tab_style(TAB_FG, TAB_BAR_BG, false),
+            width: 1,
+        });
+        scene.add_search_bar("Find: ab", 3, 20);
+        let text: String = scene.cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(text, "Find:ab");
+        assert_eq!(scene.fills.len(), 1);
     }
 
     #[test]

@@ -416,6 +416,29 @@ scenario_paneexit() {
     pass paneexit
 }
 
+# Search: the bar shows the query, and nothing typed into search (text,
+# Space, arrows, Tab) reaches the shell.
+scenario_search() {
+    local dir="$OUT/search"; mkdir -p "$dir"
+    launch search bash --norc --noprofile || { fail search "no window"; return; }
+    xdotool type --delay 15 "echo alpha beta alpha"; xdotool key Return
+    sleep 0.3
+    xdotool key ctrl+shift+f
+    xdotool type --delay 15 "zzz"
+    xdotool key space Up Down Left Tab
+    shot "$dir/bar.png"
+    xdotool key Escape
+    xdotool type --delay 15 "echo CLEAN > $dir/out.txt"; xdotool key Return
+    wait_file "$dir/out.txt" || { finish; fail search "command after search did not run"; return; }
+    finish
+    local bar
+    bar=$(count_color "$dir/bar.png" '#3A2E10')
+    echo "  search bar px: $bar, command output: $(cat "$dir/out.txt")"
+    [ "$bar" -gt 1000 ] || { fail search "no search bar drawn"; return; }
+    [ "$(cat "$dir/out.txt")" = "CLEAN" ] || { fail search "search keys leaked to the shell"; return; }
+    pass search
+}
+
 # Real applications. Each is skipped (not failed) when not installed.
 have() { command -v "$1" >/dev/null 2>&1 || { echo "SKIP $2: $1 not installed"; return 1; }; }
 
@@ -475,7 +498,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

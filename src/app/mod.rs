@@ -1582,6 +1582,25 @@ impl WinApp {
                     let index = tabs.iter().position(|t| *t == active.tab).unwrap_or(0);
                     scene.add_tab_bar(&labels, index, u32::from(grid_cols));
                 }
+                if self.search.visible {
+                    let state = &self.search.state;
+                    let status = if state.query.is_empty() {
+                        String::new()
+                    } else if state.total == 0 {
+                        "  no matches on screen".to_string()
+                    } else {
+                        format!("  {}/{}", state.current + 1, state.total)
+                    };
+                    let text = format!(
+                        " Find: {}{status}   (Enter next, Shift+Enter previous, Esc close)",
+                        state.query
+                    );
+                    scene.add_search_bar(
+                        &text,
+                        u32::from(grid_rows.saturating_sub(1)),
+                        u32::from(grid_cols),
+                    );
+                }
                 if panes.len() > 1 {
                     let tiles: Vec<(u32, u32, u32, u32)> = panes
                         .iter()
@@ -1976,7 +1995,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             window.request_redraw();
                             return;
                         }
-                        _ => {}
+                        Key::Named(NamedKey::Space) => {
+                            self.search.input(" ", &self.last_visible);
+                            window.request_redraw();
+                            return;
+                        }
+                        // Every other key is swallowed while searching: it
+                        // must not reach the application.
+                        _ => return,
                     }
                 }
                 if let Some(action) = encode(

@@ -65,6 +65,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | M2.1 found | A split lost the previous pane's snapshot slot (it stopped updating) | M2.1 |
 | M2.1 found | Tab bar row and tab open/close did not resize other tabs' panes | M2.1 |
 | I-F6 | A child exiting in one half of a split closed the whole window (stale tab layout); a dead pane otherwise stayed frozen | M2.2 (exited pane closes; window closes with the last pane of the last tab; `--hold` keeps panes) |
+| I-F10 | Search bar never drawn; Space/arrows leaked to the shell while searching | M2.3 (bar with query and n/m; all keys captured). Open: search covers the visible screen only, not scrollback |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit
