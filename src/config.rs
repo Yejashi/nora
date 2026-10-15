@@ -163,14 +163,21 @@ impl NoraConfig {
         }
 
         // Validate font size.
-        if self.font.size <= 0.0 || self.font.size > MAX_FONT_SIZE {
+        // `!(a && b)` also rejects NaN, for which every comparison is false.
+        if !(self.font.size > 0.0 && self.font.size <= MAX_FONT_SIZE) {
             errors.push(format!(
-                "font.size: {} must be between 0 and {}",
+                "font.size: {} must be greater than 0 and at most {}",
                 self.font.size, MAX_FONT_SIZE
             ));
         }
 
         // Validate the 16-color ANSI palette.
+        if self.theme.colors.len() > 16 {
+            errors.push(format!(
+                "theme.colors: {} entries given; at most 16 (ANSI 0-15) are allowed",
+                self.theme.colors.len()
+            ));
+        }
         for (i, color) in self.theme.colors.iter().enumerate() {
             if !is_valid_hex_color(color) {
                 errors.push(format!(

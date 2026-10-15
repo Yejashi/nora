@@ -5,6 +5,7 @@
 
 pub mod fallback;
 pub mod glyph;
+pub mod palette;
 pub mod policy;
 pub mod snapshot;
 pub mod state;

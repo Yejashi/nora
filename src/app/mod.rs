@@ -9,7 +9,7 @@ mod graphics;
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -37,6 +37,7 @@ use nora::input::mouse::{
 };
 use nora::input::{BindingTable, InputAction, encode, encode_kitty};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
+use nora::render::palette::Palette;
 use nora::render::policy::snapshot_is_stale;
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::style::cell_style;
@@ -289,6 +290,7 @@ impl ApplicationHandler for App {
                     &mut frame,
                     &mut fonts,
                     &[],
+                    [0, 0, 0, 255],
                     &[],
                     &[],
                     &[],
@@ -408,6 +410,9 @@ fn first_non_space_line(snapshot: &Snapshot, max_chars: usize) -> String {
 /// the pump through [`AppEvent`] and [`PumpMsg`].
 struct WinApp {
     slot: Arc<Mutex<Option<Snapshot>>>,
+    /// Base color table (built-in xterm palette + `[theme]`); each
+    /// snapshot's runtime OSC overrides are overlaid on it before drawing.
+    palette: Palette,
     pump_commands: mpsc::Sender<PumpMsg>,
     stop: Arc<AtomicBool>,
     state: RenderState,
@@ -581,6 +586,7 @@ pub fn run_windowed(
         pressed_buttons: Vec::new(),
         clipboard: create_clipboard(),
         zoom: nora::config::ZOOM_DEFAULT,
+        palette: Palette::from_theme(&config.theme),
         search: nora::search::SearchUi::new(),
         last_visible: Vec::new(),
         ime: nora::ime::ImeState::new(),
@@ -1132,8 +1138,8 @@ impl WinApp {
         self.state = state;
         match action {
             Action::Render => {
-                let snap = slot.lock().unwrap().take();
-                let Some(snap) = snap else {
+                let snap = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let Some(mut snap) = snap else {
                     // Coalesced pulse: the pump's single slot held one
                     // snapshot for two rapid pulses (e.g. the
                     // initial-state damage plus the first command's
@@ -1145,6 +1151,9 @@ impl WinApp {
                     }
                     return;
                 };
+                // Resolve against a full table: the engine keeps only the
+                // colors an application changed (OSC 4/10/11/12).
+                snap.colors = self.palette.overlay(&snap.colors);
                 // N11a stale-geometry rejection: the geometry pair is the
                 // staleness tag — never present old geometry to the new
                 // surface. Fonts are shared-borrowed here, then mutably
@@ -1281,6 +1290,7 @@ impl WinApp {
                     &mut frame,
                     fonts,
                     &draw_cells,
+                    [default_bg[0], default_bg[1], default_bg[2], 255],
                     &fills,
                     &selection_cells,
                     &search_cells,

@@ -65,9 +65,9 @@ pub struct CellFill {
     pub color: [u8; 4],
 }
 
-/// One vertex for the N13c decoration fill pass: position in normalized
-/// device coordinates, two padding floats (the shader reads only the first
-/// 8 bytes of the 32-byte stride), and the resolved decoration RGBA.
+/// One vertex for the fill/decoration pass: position in normalized device
+/// coordinates (location 0, offset 0), two padding floats, and the resolved
+/// sRGB-space RGBA (location 1, offset 16), in a 32-byte stride.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DecoVertex {
@@ -76,10 +76,9 @@ struct DecoVertex {
     color: [f32; 4],
 }
 
-/// Build the N13c decoration fill pipeline: a vertex-only pass that draws
-/// pre-clipped decoration rectangles (underline/strikethrough lines) in the
-/// surface format. Opaque RGBA8 fill, no blending, mirroring the glyphon
-/// text pass's output.
+/// Build the fill pipeline shared by cell backgrounds, the cursor, the
+/// selection/search highlights and underline/strikethrough lines: solid
+/// per-vertex-colored rectangles in the surface format, no blending.
 fn decoration_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
     let module = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("nora decoration shader"),
@@ -90,11 +89,32 @@ struct VSOut {
     @location(0) color: vec4f,
 };
 
+// Set when the render target is an `*Srgb` format: the hardware encodes
+// the fragment output linear -> sRGB on write, so the sRGB-space input
+// color is decoded to linear first (glyphon does the same for text).
+override SRGB_TARGET: bool = false;
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
 @vertex
-fn vs_main(@location(0) pos: vec2f) -> VSOut {
+fn vs_main(@location(0) pos: vec2f, @location(1) color: vec4f) -> VSOut {
     var out: VSOut;
     out.pos = vec4f(pos, 0.0, 1.0);
-    out.color = vec4f(1.0);
+    if SRGB_TARGET {
+        out.color = vec4f(
+            srgb_to_linear(color.r),
+            srgb_to_linear(color.g),
+            srgb_to_linear(color.b),
+            color.a,
+        );
+    } else {
+        out.color = color;
+    }
     return out;
 }
 
@@ -111,15 +131,26 @@ fn fs_main(@location(0) color: vec4f) -> @location(0) vec4f {
         vertex: VertexState {
             module: &module,
             entry_point: Some("vs_main"),
-            compilation_options: PipelineCompilationOptions::default(),
+            compilation_options: PipelineCompilationOptions {
+                constants: &[("SRGB_TARGET", if format.is_srgb() { 1.0 } else { 0.0 })],
+                ..PipelineCompilationOptions::default()
+            },
             buffers: &[Some(VertexBufferLayout {
                 array_stride: 32,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[VertexAttribute {
-                    shader_location: 0,
-                    offset: 0,
-                    format: VertexFormat::Float32x2,
-                }],
+                attributes: &[
+                    VertexAttribute {
+                        shader_location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    },
+                    // `DecoVertex::color`, after `pos` and the 8-byte pad.
+                    VertexAttribute {
+                        shader_location: 1,
+                        offset: 16,
+                        format: VertexFormat::Float32x4,
+                    },
+                ],
             })],
         },
         fragment: Some(FragmentState {
@@ -187,13 +218,27 @@ fn push_deco_rect(out: &mut Vec<DecoVertex>, line: &DecoLine, frame_w: f32, fram
     out.extend([v(a), v(b), v(d), v(a), v(d), v(e)]);
 }
 
-/// The background a live frame is cleared to (N02b pattern).
-const BG: wgpu::Color = wgpu::Color {
-    r: 0.0,
-    g: 0.0,
-    b: 0.0,
-    a: 1.0,
-};
+/// The frame clear color for an sRGB-space RGBA background: decoded to
+/// linear when the target is an `*Srgb` format (the hardware re-encodes on
+/// write), passed through otherwise.
+fn clear_color(rgba: [u8; 4], srgb_target: bool) -> wgpu::Color {
+    let channel = |v: u8| {
+        let c = f64::from(v) / 255.0;
+        if !srgb_target {
+            c
+        } else if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    wgpu::Color {
+        r: channel(rgba[0]),
+        g: channel(rgba[1]),
+        b: channel(rgba[2]),
+        a: f64::from(rgba[3]) / 255.0,
+    }
+}
 
 /// The selection highlight background (N14b), as resolved RGBA: a muted
 /// blue drawn under the selected cells before the glyphs.
@@ -497,6 +542,7 @@ impl Graphics {
         frame: &mut Frame,
         fonts: &mut glyphs::Fonts,
         cells: &[DrawCell],
+        background: [u8; 4],
         fills: &[CellFill],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
@@ -564,7 +610,10 @@ impl Graphics {
                 depth_slice: None,
                 resolve_target: None,
                 ops: Operations {
-                    load: LoadOp::Clear(BG),
+                    load: LoadOp::Clear(clear_color(
+                        background,
+                        self.format.is_some_and(|f| f.is_srgb()),
+                    )),
                     store: StoreOp::default(),
                 },
             })],
