@@ -36,7 +36,12 @@ for _ in $(seq 1 50); do xdotool getmouselocation >/dev/null 2>&1 && break; slee
 
 FAILED=0
 pass() { echo "PASS $1"; }
-fail() { echo "FAIL $1: $2"; FAILED=$((FAILED + 1)); }
+fail() {
+    echo "FAIL $1: $2"
+    # GitHub annotation, readable from the public check-run API.
+    [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error::e2e $1: $2"
+    FAILED=$((FAILED + 1))
+}
 
 # launch NAME CMD... : start nora on CMD with an isolated HOME, wait for
 # its window and focus it. Sets NORA_PID and WIN.
