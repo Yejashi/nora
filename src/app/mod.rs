@@ -515,6 +515,9 @@ struct WinApp {
     /// `NORA_TRACE_LATENCY`: when the oldest key event not yet followed by
     /// a presented frame arrived (key-to-present measurement).
     trace_key_at: Option<std::time::Instant>,
+    /// The same, until a frame with fresh pane content is presented
+    /// (key-to-fresh: view changes the pump applies, e.g. scrollback).
+    trace_fresh_key_at: Option<std::time::Instant>,
     trace_latency: bool,
     /// `NORA_TRACE_FRAMES`: log a per-phase timing line for every frame.
     trace_frames: bool,
@@ -712,6 +715,7 @@ pub fn run_windowed(
         pane_last: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
+        trace_fresh_key_at: None,
         trace_latency: std::env::var_os("NORA_TRACE_LATENCY").is_some(),
         trace_frames: std::env::var_os("NORA_TRACE_FRAMES").is_some(),
         search: nora::search::SearchUi::new(),
@@ -1916,6 +1920,12 @@ impl WinApp {
                         at.elapsed().as_secs_f64() * 1000.0
                     );
                 }
+                if fresh_any && let Some(at) = self.trace_fresh_key_at.take() {
+                    eprintln!(
+                        "latency: key-to-fresh {:.3} ms",
+                        at.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 if suboptimal && let Err(message) = graphics.reconfigure() {
                     eprintln!("nora: surface reconfiguration failed: {message}");
                 }
@@ -2279,8 +2289,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 if self.notice.take().is_some() {
                     window.request_redraw();
                 }
-                if self.trace_latency && self.trace_key_at.is_none() {
-                    self.trace_key_at = Some(std::time::Instant::now());
+                if self.trace_latency {
+                    let now = std::time::Instant::now();
+                    self.trace_key_at.get_or_insert(now);
+                    self.trace_fresh_key_at.get_or_insert(now);
                 }
                 // Local UI bindings (input::bindings). A bound chord whose
                 // action has nothing to act on falls through to the

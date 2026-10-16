@@ -76,6 +76,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
 | M3 regression | Redraw loop while scrolled back: empty damage with an off-screen cursor counted as damage, and the post-frame pump wake (M3) turned it into a frame per wake (1703 frames in a short idle run) | fixed (17 frames; e2e `idle` guards it) |
 | I-F10 (rest) | Search covered the visible screen only | fixed: pump searches scrollback + screen, scrolls to and selects the match; IME-committed text goes to the search query |
+| RV2 | View changes on an idle pane (scroll, search, prompt jump, selection, config) showed ~507 ms late: the pump ticked before applying commands, then slept its idle heartbeat | fixed (re-tick after any command; `NORA_TRACE_LATENCY` key-to-fresh trace; e2e `viewlat`: 507 ms before, 7-9 ms after) |
 | RV1 | Redraw loop while partly scrolled back (cursor on screen): the probe's cursor was in screen rows, the damage in viewport rows, so the always-damaged cursor never matched (2026 frames in 3 s idle) | fixed (viewport-mapped probe cursor; scrollback tests; e2e `idle` partly-scrolled leg, 0 frames) |
 | RV-OSC7 | `ESC]7;file:///%aé BEL` panicked the PTY reader (the pane died); a trailing `%XX` was never decoded | fixed (byte-level decoder; unit + filter tests) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
@@ -173,7 +174,6 @@ search and redraw-loop commits. Not yet fixed; ordered by severity.
 
 | ID | Sev | Finding | Fix direction |
 | --- | --- | --- | --- |
-| RV2 | high | View changes on an idle pane (search, prompt jump, selection, scroll, config) show up to 500 ms late: commands only set `force_snapshot`, the pump ticks before draining commands and `busy` ignores `force_snapshot` | Tick again after draining commands, or timeout 0 when any pane has a forced snapshot (`src/session/pump.rs`) |
 | RV3 | medium | `search_text` scans the whole scrollback under the terminal lock on every keystroke and every Enter (stalls the reader and the pump with a large history) | Copy lines in chunks releasing the lock, or cache hits per query |
 | RV4 | medium | With more than 10 000 hits, "newest match" is the 10 000th oldest | Scan bottom-up or keep the last N |
 | RV5 | medium | A config color change does not repaint idle panes (retained snapshots hold already-overlaid colors; `Configure` forces no snapshot) | Retain raw colors, or force a snapshot of every pane on `Configure` |

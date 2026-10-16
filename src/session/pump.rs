@@ -639,7 +639,9 @@ pub fn pump_thread(
         let pending = first
             .into_iter()
             .chain(std::iter::from_fn(|| commands.try_recv().ok()));
+        let mut commanded = false;
         for msg in pending {
+            commanded |= !matches!(msg, PumpMsg::Wake);
             match msg {
                 // The wake only ended the wait; the tick above already
                 // picked up the new output.
@@ -916,7 +918,14 @@ pub fn pump_thread(
         let busy = sessions
             .values()
             .any(|p| p.draining || !p.pending_input.is_empty() || p.session.outstanding() > 0);
-        timeout = if busy {
+        // A command in (2) may have changed the view (scroll, search,
+        // selection, config) after this pass's tick: tick again now
+        // rather than at the next wake (audit RV2: up to 500 ms late on
+        // an idle pane). The extra tick builds a snapshot only on damage
+        // or a forced view, and only into a free slot.
+        timeout = if commanded {
+            Duration::ZERO
+        } else if busy {
             Duration::from_millis(10)
         } else {
             Duration::from_millis(500)

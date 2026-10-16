@@ -24,3 +24,12 @@ previous loop woke at least 100 times per second by construction
 (`thread::sleep(10 ms)`). The lavapipe worker threads wake on their own
 (about 4 per second each) independent of nora; nora presented 2 frames in
 9 idle seconds.
+
+**View changes (2026-10-16).** Key-to-present times the first frame after
+a key, which for a view change the pump applies (scrollback paging) is the
+window's immediate redraw of the old content. `NORA_TRACE_LATENCY` also
+logs key-to-fresh: the first presented frame carrying a new pane
+snapshot. `scripts/e2e-x11.sh viewlat` (same setup; 8 Shift+PageUp/PageDown
+presses on an idle bash): 507.4 ms median / 507.5 ms max before (the pump
+applied the command after its tick, then slept the 500 ms heartbeat,
+audit RV2); 7.3 ms / 9.2 ms after (the pump ticks again after any command).

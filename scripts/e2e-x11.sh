@@ -331,6 +331,33 @@ scenario_latency() {
     pass latency
 }
 
+# View latency: a view change on an idle pane (scrollback paging, which
+# the pump applies) reaches the screen promptly. The pump once waited for
+# its 500 ms idle heartbeat before building the view (audit RV2).
+scenario_viewlat() {
+    local dir="$OUT/viewlat"; mkdir -p "$dir"
+    NORA_TRACE_LATENCY=1 launch viewlat bash --norc --noprofile \
+        || { fail viewlat "no window"; return; }
+    xdotool type --delay 15 "seq 1 500"; xdotool key Return
+    sleep 1
+    local mark
+    mark=$(grep -c 'key-to-fresh' "$OUT/viewlat/nora.log")
+    for _ in 1 2 3 4; do
+        xdotool key shift+Prior; sleep 0.8
+        xdotool key shift+Next; sleep 0.8
+    done
+    finish
+    grep -o 'key-to-fresh [0-9.]*' "$OUT/viewlat/nora.log" | tail -n +"$((mark + 1))" \
+        | awk '{print $2}' | sort -n > "$dir/samples.txt"
+    local n max
+    n=$(wc -l < "$dir/samples.txt")
+    [ "$n" -ge 6 ] || { fail viewlat "only $n samples"; return; }
+    max=$(tail -1 "$dir/samples.txt")
+    echo "  scroll key-to-fresh ms: n=$n median=$(awk -v n="$n" 'NR==int((n+1)/2)' "$dir/samples.txt") max=$max"
+    awk -v m="$max" 'BEGIN{exit !(m < 100)}' || { fail viewlat "slow view change: max $max ms"; return; }
+    pass viewlat
+}
+
 # Title: OSC 2 from the application becomes the window title.
 scenario_title() {
     local dir="$OUT/title"; mkdir -p "$dir"
@@ -621,7 +648,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency title panes paneexit search config reports hyperlink idle vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes paneexit search config reports hyperlink idle vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
