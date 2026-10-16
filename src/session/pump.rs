@@ -705,8 +705,12 @@ pub fn pump_thread(
                 }
                 PumpMsg::Configure { options: new } => {
                     let new = *new;
+                    // Every pane rebuilds its snapshot: the window keeps
+                    // idle panes' last snapshots with the old colors
+                    // already applied (audit RV5).
                     for pane_pump in sessions.values_mut() {
                         pane_pump.session.set_palette(new.palette);
+                        pane_pump.force_snapshot = true;
                     }
                     let new = super::pty::SessionOptions {
                         // The window's current cell size stays: only

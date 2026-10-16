@@ -478,14 +478,17 @@ scenario_config() {
     local cfg="$dir/home/.config/nora/config.toml"
     printf '[window]\ncolumns = 50\nlines = 10\n[colors]\nbackground = "#202040"\n[cursor]\nstyle = "beam"\n' >"$cfg"
     launch config bash --norc --noprofile || { fail config "no window"; return; }
-    xdotool type --delay 15 "stty size > $dir/size.txt; seq 1 300"; xdotool key Return
+    xdotool type --delay 15 "stty size > $dir/size.txt; seq 1 300; printf '\\033[41m%40s\\033[0m\\n' x"; xdotool key Return
     wait_file "$dir/size.txt" || { finish; fail config "no size"; return; }
     sleep 0.5
     shot "$dir/before.png"
     xdotool key shift+Prior
     shot "$dir/scrolled.png"
     xdotool key shift+End
-    printf '[window]\ncolumns = 50\nlines = 10\n[colors]\nbackground = "#402020"\n' >"$cfg"
+    # The reload also recolors ANSI red: the idle pane's red cells must
+    # repaint (audit RV5: retained snapshots kept the old colors). The
+    # cursor style stays, since a cursor change forced a repaint anyway.
+    printf '[window]\ncolumns = 50\nlines = 10\n[colors]\nbackground = "#402020"\n[colors.normal]\nred = "#00ff00"\n[cursor]\nstyle = "beam"\n' >"$cfg"
     sleep 2.5
     shot "$dir/reloaded.png"
     printf '[colors]\nbackground = "nonsense"\n' >"$cfg"
@@ -495,12 +498,15 @@ scenario_config() {
     local before after scrolled_diff
     before=$(count_color "$dir/before.png" '#202040')
     after=$(count_color "$dir/reloaded.png" '#402020')
-    scrolled_diff=$("${IM_CONVERT[@]}" "$dir/before.png" "$dir/scrolled.png" -compose difference -composite -format '%[fx:round(mean*w*h*255)]' info:)
-    echo "  size: $(cat "$dir/size.txt"); bg px before=$before after reload=$after; scroll diff=$scrolled_diff"
+    local green
+    green=$(count_color "$dir/reloaded.png" '#00ff00')
+    scrolled_diff=$("${IM_CONVERT[@]}" "$dir/before.png" "$dir/scrolled.png" -compose difference -composite -format '%[fx:round(mean*w*h*255)]' info: | xargs printf '%.0f')
+    echo "  size: $(cat "$dir/size.txt"); bg px before=$before after reload=$after; recolored red px=$green; scroll diff=$scrolled_diff"
     [ "$(cat "$dir/size.txt")" = "10 50" ] || { fail config "window cells not applied"; return; }
     [ "$before" -gt 10000 ] || { fail config "background color not applied"; return; }
     [ "$scrolled_diff" -gt 0 ] || { fail config "no scrollback (Shift+PageUp changed nothing)"; return; }
     [ "$after" -gt 10000 ] || { fail config "live reload did not apply"; return; }
+    [ "$green" -gt 1000 ] || { fail config "palette reload did not repaint the idle pane"; return; }
     [ "$(count_color "$dir/invalid.png" '#402020')" -gt 10000 ] || { fail config "invalid edit lost the last good config"; return; }
     pass config
 }
