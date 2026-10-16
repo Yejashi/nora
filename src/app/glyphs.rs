@@ -460,9 +460,45 @@ pub fn grid_size(width: u32, height: u32, cell_w: u32, cell_h: u32) -> (u16, u16
     )
 }
 
+/// Take the loaded value out of the pending loader slot, clearing the
+/// slot only when it held one. A ready notice from a superseded loader
+/// (a font reload started a new one) then finds the new slot still empty
+/// and leaves it pending, instead of dropping it and with it the new
+/// loader's fonts (audit RV7).
+pub fn take_loaded<T>(
+    pending: &mut Option<std::sync::Arc<std::sync::Mutex<Option<T>>>>,
+) -> Option<T> {
+    let loaded = pending
+        .as_ref()?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if loaded.is_some() {
+        *pending = None;
+    }
+    loaded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit RV7: loader 1 is superseded by a reload's loader 2; loader
+    /// 1's ready notice must not drop loader 2's pending slot.
+    #[test]
+    fn superseded_loader_notice_keeps_the_new_slot() {
+        use std::sync::{Arc, Mutex};
+        let new_slot = Arc::new(Mutex::new(None::<u32>));
+        let mut pending = Some(new_slot.clone());
+        // Loader 1's notice: the current (new) slot is still empty.
+        assert_eq!(take_loaded(&mut pending), None);
+        assert!(pending.is_some(), "the new loader stays pending");
+        // Loader 2 finishes.
+        *new_slot.lock().unwrap() = Some(7);
+        assert_eq!(take_loaded(&mut pending), Some(7));
+        assert!(pending.is_none());
+        assert_eq!(take_loaded(&mut pending), None);
+    }
 
     #[test]
     fn grid_size_fills_the_window() {

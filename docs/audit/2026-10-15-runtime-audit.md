@@ -76,6 +76,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
 | M3 regression | Redraw loop while scrolled back: empty damage with an off-screen cursor counted as damage, and the post-frame pump wake (M3) turned it into a frame per wake (1703 frames in a short idle run) | fixed (17 frames; e2e `idle` guards it) |
 | I-F10 (rest) | Search covered the visible screen only | fixed: pump searches scrollback + screen, scrolls to and selects the match; IME-committed text goes to the search query |
+| RV7 | A font reload while the background fallback loader ran dropped the new loader's fonts (the old loader's ready notice consumed the new, still-empty slot) | fixed (the slot is cleared only once it holds fonts; unit test of the race order) |
 | RV10 | A match ending in a wide char highlighted only its left half; a preedit left a wide glyph starting one column earlier drawn under it | fixed (hit end covers the wide char's second column; preedit removes every overlapping glyph; tests) |
 | RV8 | While searching, Ctrl+Shift+V pasted into the shell; unbound Ctrl/Alt chords appended their letter to the query | fixed (paste and IME text join the query as one clean line, max 256 chars; chords ignored; e2e `search` sends Ctrl/Alt chords: match lost before, shown after) |
 | RV5 | A config color change did not repaint idle panes (retained snapshots held the old colors; with an unchanged cursor style no snapshot was rebuilt) | fixed (Configure forces every pane's snapshot; e2e `config` checks background and ANSI red recolor: 0 px before, repainted after) |
@@ -181,7 +182,6 @@ search and redraw-loop commits. Not yet fixed; ordered by severity.
 | ID | Sev | Finding | Fix direction |
 | --- | --- | --- | --- |
 | RV6 | medium | Splitting a 1-row pane, or while minimized, gives a zero-size pane with no session; it shares the previous pane's slot; same for a new tab with no pane area | Always give the new pane a fresh slot; spawn its session when its size becomes non-zero |
-| RV7 | low | A font reload while the background fallback loader runs can drop the fallback fonts | Tag `FontsReady` with a generation |
 
 Also noted: a legacy `[keys]` binding with an unknown action now rejects
 the whole config (previously ignored).

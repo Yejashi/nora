@@ -2088,10 +2088,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
             return;
         }
         if let AppEvent::FontsReady = event {
-            let full = self
-                .full_fonts
-                .take()
-                .and_then(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).take());
+            let full = glyphs::take_loaded(&mut self.full_fonts);
             if let (Some(fs), Some(fonts)) = (full, self.fonts.as_mut()) {
                 fonts.install_full_system(fs);
                 if let Some(graphics) = self.graphics.as_mut() {
