@@ -300,6 +300,21 @@ fn filter_cwd_file_uri() {
     assert_eq!(events, vec![(0, ShellEvent::Cwd("/home/user".to_string()))]);
 }
 
+/// Audit RV-OSC7: a `%` followed by a multi-byte character used to panic
+/// the decoder (and with it the pane's PTY reader). The frame now decodes
+/// with the malformed escape kept literally.
+#[test]
+fn filter_cwd_percent_before_non_ascii_does_not_panic() {
+    let mut filter = PromptMarkerFilter::new();
+    let bytes = osc("7;file:///%a\u{e9}/caf%C3%A9");
+    let (forward, events) = filter.process(&bytes);
+    assert!(forward.is_empty());
+    assert_eq!(
+        events,
+        vec![(0, ShellEvent::Cwd("/%a\u{e9}/caf\u{e9}".to_string()))]
+    );
+}
+
 /// Feed `OSC 7 ; /relative/path ST` (no `file://` prefix); assert one
 /// `Cwd` event with the raw path.
 #[test]

@@ -811,11 +811,13 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let decoded = if bytes[i] == b'%' && i + 2 < bytes.len() {
-            u8::from_str_radix(&s[i + 1..i + 3], 16).ok()
-        } else {
-            None
-        };
+        // Decode on bytes: slicing the `str` could split a multi-byte
+        // character and panic (audit RV-OSC7).
+        let decoded = match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&hi), Some(&lo)) => hex_value(hi).zip(hex_value(lo)),
+            _ => None,
+        }
+        .map(|(hi, lo)| hi << 4 | lo);
         if let Some(v) = decoded {
             out.push(v);
             i += 3;
@@ -827,9 +829,26 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn hex_value(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|v| v as u8)
+}
+
 #[cfg(test)]
 mod osc_cap_tests {
     use super::*;
+
+    /// Audit RV-OSC7: a `%` before a multi-byte character used to slice
+    /// the `str` mid-character and panic the PTY reader; a trailing `%XX`
+    /// was never decoded.
+    #[test]
+    fn percent_decode_is_byte_safe_and_decodes_the_last_escape() {
+        assert_eq!(percent_decode("/%a\u{e9}"), "/%a\u{e9}");
+        assert_eq!(percent_decode("/%\u{e9}x"), "/%\u{e9}x");
+        assert_eq!(percent_decode("/a%20b%2F"), "/a b/");
+        assert_eq!(percent_decode("/x%2"), "/x%2");
+        assert_eq!(percent_decode("/x%"), "/x%");
+        assert_eq!(percent_decode("/caf%C3%A9"), "/caf\u{e9}");
+    }
 
     /// Audit P3: an unterminated OSC followed by endless output keeps the
     /// held frame at or below the cap, the overlong frame is never

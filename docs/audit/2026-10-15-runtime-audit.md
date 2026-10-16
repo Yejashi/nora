@@ -76,6 +76,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
 | M3 regression | Redraw loop while scrolled back: empty damage with an off-screen cursor counted as damage, and the post-frame pump wake (M3) turned it into a frame per wake (1703 frames in a short idle run) | fixed (17 frames; e2e `idle` guards it) |
 | I-F10 (rest) | Search covered the visible screen only | fixed: pump searches scrollback + screen, scrolls to and selects the match; IME-committed text goes to the search query |
+| RV-OSC7 | `ESC]7;file:///%aé BEL` panicked the PTY reader (the pane died); a trailing `%XX` was never decoded | fixed (byte-level decoder; unit + filter tests) |
 | X4 | CI never green: clippy 1.99 lints, Ubuntu font paths, Weston runtime dir, two machine-specific tests | `042621c`, `98f2af1` |
 
 ## Dependency audit
@@ -173,7 +174,6 @@ search and redraw-loop commits. Not yet fixed; ordered by severity.
 | --- | --- | --- | --- |
 | RV1 | high | Redraw loop remains for a *partly* scrolled view: `probe()` now returns the cursor in screen coordinates but alacritty's damage iterator reports lines shifted by `display_offset` (viewport coordinates), so the always-damaged cursor line never matches (e.g. `clear`, then wheel up 3 lines) | Return the viewport-mapped cursor (`line + display_offset`, `None` when off screen) and keep the empty-damage no-op (`src/engine.rs` probe, `src/render/term.rs`) |
 | RV2 | high | View changes on an idle pane (search, prompt jump, selection, scroll, config) show up to 500 ms late: commands only set `force_snapshot`, the pump ticks before draining commands and `busy` ignores `force_snapshot` | Tick again after draining commands, or timeout 0 when any pane has a forced snapshot (`src/session/pump.rs`) |
-| RV-OSC7 | high | Pre-existing: `percent_decode` in `src/prompt_marker.rs` slices a `str` at byte offsets; an OSC 7 like `ESC]7;file:///%aé BEL` panics the PTY reader thread (pane dies); a trailing `%XX` is never decoded | Decode on bytes; fix the bound |
 | RV3 | medium | `search_text` scans the whole scrollback under the terminal lock on every keystroke and every Enter (stalls the reader and the pump with a large history) | Copy lines in chunks releasing the lock, or cache hits per query |
 | RV4 | medium | With more than 10 000 hits, "newest match" is the 10 000th oldest | Scan bottom-up or keep the last N |
 | RV5 | medium | A config color change does not repaint idle panes (retained snapshots hold already-overlaid colors; `Configure` forces no snapshot) | Retain raw colors, or force a snapshot of every pane on `Configure` |
