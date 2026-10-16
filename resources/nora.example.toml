@@ -10,7 +10,8 @@
 # Validate without launching:   nora --check-config
 #
 # What applies when:
-#   immediately       colors, cursor, key bindings, scrolling.multiplier
+#   immediately       colors, cursor, key bindings, scrolling.multiplier,
+#                     autocomplete
 #   immediately       font (fonts reload and every pane is resized)
 #   new panes/tabs    scrolling.history
 #   at startup        window
@@ -70,6 +71,14 @@ history = 10000
 # Lines per mouse-wheel step (1..=100).
 multiplier = 3
 
+[autocomplete]
+# Inline suggestions while you type at a zsh prompt (needs
+# shell/nora-zsh.zsh). nora records the commands the shell reports in
+# $XDG_STATE_HOME/nora/history (default ~/.local/state/nora/history, mode
+# 0600); commands starting with a space are never recorded. false turns
+# suggestions off and nora neither reads nor writes the file.
+enabled = true
+
 # Key bindings. Each entry binds a chord to an action, or frees a default
 # chord with action = "none" so the key reaches the application.
 # Modifiers: ctrl, shift, alt, super. Keys: a-z, 0-9, f1-f12, enter, tab,
@@ -79,7 +88,8 @@ multiplier = 3
 # Actions: copy, paste, new_tab, next_tab, previous_tab, close_pane,
 # split_right, split_down, focus_left, focus_right, focus_up, focus_down,
 # search, zoom_in, zoom_out, zoom_reset, scroll_page_up, scroll_page_down,
-# scroll_to_top, scroll_to_bottom, reload_config, none.
+# scroll_to_top, scroll_to_bottom, reload_config, previous_prompt,
+# select_previous_command, accept_suggestion, accept_suggestion_word, none.
 #
 # [[keyboard.bindings]]
 # keys = "ctrl+shift+d"

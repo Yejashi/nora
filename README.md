@@ -1,312 +1,365 @@
 # nora
 
 [![CI](https://github.com/Yejashi/nora/actions/workflows/ci.yml/badge.svg)](https://github.com/Yejashi/nora/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
 
-A fast, efficient, maintainable Linux desktop terminal written in Rust,
-with native Wayland and X11 support.
+A GPU-accelerated terminal for Linux, written in Rust, with inline command suggestions.
 
-## Quick start
+![nora with two panes: zsh with a dim inline suggestion completing "cargo t" to "cargo test --workspace", and vim](docs/images/screenshot.png)
+
+nora is a desktop terminal emulator for native Wayland and X11. It aims to
+be correct first and fast second: every keystroke and byte of output goes
+through in order, memory and queues are bounded, the window sleeps when
+nothing changes, and every feature listed here has a test that drives a
+real window.
+
+Its distinctive feature is **shell-cooperative autocomplete**. Your shell
+reports what you are typing, and nora suggests the rest of the line from
+your own command history, ranked by frequency, recency, the current
+directory and past failures. The suggestion appears as dim text, and
+Right types it. Because the shell's line editor is the source of truth,
+suggestions stay correct through history recall, Tab completion and
+kill/yank, which a terminal that guesses from the screen gets wrong.
+
+> **Status: early (0.1, pre-release).** Linux is the supported platform.
+> macOS and Windows builds pass their tests in CI but have not been used
+> interactively. Expect rough edges; see [Limitations](#limitations).
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Shell integration and suggestions](#shell-integration-and-suggestions)
+- [Performance](#performance)
+- [Limitations](#limitations)
+- [Contributing](#contributing)
+- [Security](#security)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
+## Features
+
+- **Native Wayland and X11.** GPU rendering through wgpu (Vulkan, with a
+  GL fallback). Nothing is redrawn while idle, and only changed cells
+  are rebuilt.
+- **Tabs and splits.** A tab bar appears once there is more than one tab.
+  Panes are separated by a thin line, and clicking a pane focuses it.
+- **Scrollback and search.** 10 000 lines by default. Search covers the
+  scrollback and the screen.
+- **Inline suggestions** from your history, else an unambiguous path or
+  command-name completion (zsh; see
+  [below](#shell-integration-and-suggestions)).
+- **Shell integration.** Jump to the previous prompt, select the last
+  command's output, track the working directory, and Ctrl+click
+  hyperlinks (OSC 8).
+- **Compatible.** xterm key and mouse encodings, bracketed paste, focus
+  events, true color, wide characters with per-glyph font fallback, and a
+  `nora` terminfo entry that is a subset of `xterm-256color`. vim, tmux
+  and htop are exercised in CI.
+- **Live configuration.** One TOML file, validated, applied on save.
+  Covers fonts, colors, cursor, scrollback and key bindings.
+- **Bounded and safe by default.** Size caps on control sequences and
+  queues. OSC 52 clipboard access from programs is disabled. A clean
+  shutdown on SIGTERM, SIGHUP and SIGINT.
+
+## Install
+
+nora is built from source. No packages are published yet.
+
+### Requirements
+
+- Linux with a Wayland or X11 session.
+- Rust 1.95 or newer ([rustup](https://rustup.rs) installs the pinned
+  1.99.0 automatically).
+- A Vulkan driver. Any GPU with one works; Mesa's lavapipe software
+  driver works without a GPU.
+- A monospace font. nora prefers Noto Sans Mono and falls back to any
+  monospace font fontconfig knows. Noto CJK is optional, for wide scripts.
+
+| Distribution | Packages |
+| --- | --- |
+| Debian / Ubuntu | `build-essential libvulkan1 mesa-vulkan-drivers fonts-noto-core fonts-noto-cjk` |
+| Fedora | `gcc vulkan-loader mesa-vulkan-drivers google-noto-sans-mono-fonts google-noto-sans-cjk-fonts` |
+| Arch | `base-devel vulkan-icd-loader noto-fonts noto-fonts-cjk` plus your GPU's Vulkan driver |
+| NixOS | `noto-fonts noto-fonts-cjk-sans`; the install script handles libraries ([below](#nixos)) |
+
+### Build and install
 
 ```sh
 git clone https://github.com/Yejashi/nora.git
 cd nora
-./scripts/install.sh   # release build + per-user install, no root
-nora                   # launches your $SHELL in a new window
-```
-
-`nora --smoke` opens a window, renders one frame, resizes, minimizes and
-exits; it is the fastest way to check that the display and GPU path work
-on a machine. `nora -- htop` runs a specific command instead of the shell.
-
-## Status
-
-- **v0.1 is complete and accepted** (2026-10-14). See
-  [docs/13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) for the acceptance
-  assessment: application matrix, P01–P10 performance workloads, resource
-  limits and known limitations.
-- **Post-v0.1 extensions (N32–N36) are complete**: kitty-style terminal
-  graphics, shell integration (OSC 133/7/8), prompt navigation,
-  previous-command selection, working-directory tracking, hyperlink
-  activation, and the accessibility feasibility ADR (ADR-012).
-- The N00–N36 roadmap is closed. The next post-v0.1 increment is N37
-  (accessible terminal-text exposure), scoped in
-  [docs/tasks/N37-accessible-text.md](docs/tasks/N37-accessible-text.md).
-
-## Features
-
-**Terminal core (v0.1)**
-
-- Live PTY sessions with reliable child lifecycle, exit-status propagation
-  and bounded output queues
-- Tabs and splits with live configuration reload
-- Scrollback (default 1,000 lines, configurable to 1,000,000), selection and
-  scrollback search
-- Native clipboard (OSC 52 reads disabled; writes opt-in) and bracketed paste
-- Kitty keyboard protocol, IME, mouse reporting and focus events
-- UTF-8 with per-character font fallback (CJK wide text, box drawing)
-- GPU rendering (wgpu) with damage tracking and a pulse-gated render loop —
-  no continuous redraw while idle
-- Bounded resource use, audited in `docs/12-resource-limits.md`
-- `TERM=nora` terminfo identity (a strict subset of `xterm-256color`)
-
-**Terminal graphics (N32–N34)** — kitty-style protocol over the APC hook:
-
-- RGB (`f=24`) and RGBA (`f=32`) uploads, chunked uploads (`m=1`), query,
-  placement, delete, scroll and clipping
-- Budgets: 32 MiB per image, 128 MiB total, 1,024 image/placement IDs
-- PNG (`f=100`) is documented as a later slice
-
-**Shell integration (N35)** — opt-in via `shell/nora-bash.sh` or
-`shell/nora-zsh.zsh`:
-
-- OSC 133 prompt markers (A/B/C/D)
-- Jump to the previous prompt (Ctrl+Shift+Z) and select the previous
-  command's output (Ctrl+Shift+G)
-- Working-directory tracking (OSC 7)
-- zsh only: inline suggestions. The integration reports the executed
-  command line and exit status (`OSC 133;C;cmdline_url`, `OSC 133;D`) and
-  the line editor's buffer on every redraw (`OSC 6973`); nora suggests the
-  best match from your history (frequency, recency, current directory,
-  past failures), else an unambiguous path or command-name completion, as
-  dim text after the cursor. Right or End types it,
-  Alt+Right one word. Lines starting with a space are never recorded
-  ([ADR-013](docs/adr/ADR-013-autocomplete.md))
-- Hyperlinks (OSC 8): Ctrl+click opens http(s), mailto, file and ftp links
-  with the platform opener (`xdg-open`, `open`, `explorer`)
-
-## Requirements
-
-- Linux x86_64 with a native Wayland or X11 session. macOS and Windows
-  builds compile and pass the headless tests in CI but are untested
-  interactively; see [docs/15-platforms.md](docs/15-platforms.md).
-- Rust 1.95 or newer (`rust-version` in `Cargo.toml`). `rust-toolchain.toml`
-  pins 1.99.0 for rustup users and CI; a distribution toolchain at or above
-  1.95 builds the same tree.
-- A Vulkan loader and driver. Any GPU with a Vulkan driver works; CI and
-  GPU-less machines use Mesa's lavapipe software driver, which validates the
-  rendering path but is not hardware performance evidence.
-- Fonts: `font.family` in the config picks the face (any fontconfig family,
-  e.g. a Nerd Font for prompt icons); `font.size` is in points (default 15).
-  Without a configured family nora prefers **Noto Sans Mono** and falls back
-  to any monospace font fontconfig knows. Noto Sans CJK and Noto Serif Ethiopic are optional
-  script fallbacks (without them, wide and Ethiopic text renders as missing
-  glyphs). The GPU and text tests assert Noto metrics, so install Noto to
-  run the full test suite:
-
-  | Distribution | Packages |
-  | --- | --- |
-  | Debian / Ubuntu | `fonts-noto-core fonts-noto-cjk libvulkan1 mesa-vulkan-drivers` |
-  | Arch | `noto-fonts noto-fonts-cjk vulkan-icd-loader` + your GPU's Vulkan driver |
-  | Fedora | `google-noto-sans-mono-fonts google-noto-sans-cjk-fonts vulkan-loader` |
-  | NixOS | `noto-fonts noto-fonts-cjk-sans`; see the NixOS note under Installing |
-
-  `NORA_TEST_FONT_MONO`, `NORA_TEST_FONT_CJK` and `NORA_TEST_FONT_ETHIOPIC`
-  override the font files explicitly (app and tests).
-
-## Building
-
-```sh
-cargo build --release
-```
-
-Windowing backend configurations (winit):
-
-| Configuration | Command |
-| --- | --- |
-| Wayland + X11 (default) | `cargo build --release` |
-| X11 only | `cargo build --release --no-default-features --features x11` |
-| Wayland only | `cargo build --release --no-default-features --features wayland` |
-
-## Installing
-
-```sh
 ./scripts/install.sh
 ```
 
-No root required. Installs `~/.local/bin/nora`, the compiled `nora`
-terminfo entry, the desktop entry and icon, and copies
-`resources/nora.example.toml` to `~/.config/nora/config.toml` when no config
-exists (an existing config is never touched). `./scripts/uninstall.sh`
-removes the installed artifacts and preserves your config.
+The script builds a release binary and installs it for your user, without
+root. It installs:
 
-To install only the terminfo entry on another host (for SSH remote use):
+- `~/.local/bin/nora`;
+- the `nora` terminfo entry under `~/.terminfo`;
+- a desktop entry and icon;
+- an example config at `~/.config/nora/config.toml`, only if you have none.
+
+Make sure `~/.local/bin` is on your `PATH`. `./scripts/uninstall.sh`
+removes everything except your config.
+
+To build without installing, run `cargo build --release`. The binary is
+`target/release/nora`. To build a single windowing backend:
 
 ```sh
-tic -x terminfo/nora.terminfo
+cargo build --release --no-default-features --features x11      # X11 only
+cargo build --release --no-default-features --features wayland  # Wayland only
 ```
 
 ### NixOS
 
-NixOS has no global library path, and nora loads the Vulkan loader,
-libwayland, libxkbcommon and the X11 client libraries at runtime. On a
-NixOS host `scripts/install.sh` detects this (`/etc/NIXOS`), installs the
-binary under `~/.local/libexec/nora/` and writes a small launcher to
-`~/.local/bin/nora` that sets `LD_LIBRARY_PATH` from the nixpkgs store
-(fetched with `nix build`, cached outputs only). Everything else is the
-same. To run the GPU tests or the uninstalled binary from `target/`,
-export the same library path, for example:
+nora loads Vulkan, Wayland, xkbcommon and the X11 libraries at run time,
+and NixOS has no global library path. The install script detects NixOS
+and installs a small launcher that points at the right libraries from
+the Nix store.
+
+### Remote hosts
+
+Programs on a remote machine need the terminfo entry to know nora's
+capabilities. Copy `terminfo/nora.terminfo` there and run:
 
 ```sh
-export LD_LIBRARY_PATH=$(sed -n 's/^export LD_LIBRARY_PATH="\([^$]*\).*/\1/p' ~/.local/bin/nora)
-cargo test --workspace
+tic -x nora.terminfo
 ```
+
+Without it, set `TERM=xterm-256color` for that session.
 
 ## Usage
 
-```
-usage: nora [OPTIONS] [-- COMMAND ARG...]
-
-Options:
-  -h, --help                   Print this help message
-  -V, --version                Print nora's name and version
-      --smoke                  Run one automated window smoke cycle and exit
-      --config PATH            Use an explicit config file
-      --check-config           Validate the config and exit (no display
-                               or GPU needed)
-      --reload                 Re-read the config from disk before launch;
-                               a failed reload keeps the last valid config
-      --working-directory PATH Start the command in PATH
-      --hold                   Keep the window open after the child
-                               exits (windowed; headless ignores it)
-      --                       Remainder is the command argv (no shell
-                               interpolation)
+```sh
+nora                         # your login shell in a new window
+nora -- htop                 # run a program instead (no shell involved)
+nora --working-directory ~/src
+nora --hold -- make test     # keep the window open after the program exits
+nora --smoke                 # open, draw one frame, resize and exit: checks your GPU setup
 ```
 
-With no command, the default shell (`$SHELL`, else `/bin/sh`) is launched.
-The process exit status reflects the launched command. With no display
-server available, the launch falls back to the headless session pump.
+Run `nora --help` for all options. nora exits with the status of the
+program it ran.
 
 ### Key bindings
 
 | Action | Keys |
 | --- | --- |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V |
-| New tab | Ctrl+Shift+T |
-| Next / previous tab | Ctrl+PageDown / Ctrl+PageUp |
-| Split right / split below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
-| Focus pane | Ctrl+Shift+Arrow |
-| Close pane (tab, window) | Ctrl+Shift+W |
-| Reload config | Ctrl+Shift+F5 |
-| Previous prompt / select last output | Ctrl+Shift+Z / Ctrl+Shift+G (shell integration) |
-| Accept inline suggestion / its next word | Right or End / Alt+Right (zsh integration; otherwise the key goes to the shell) |
-| Search (scrollback and screen) | Ctrl+Shift+F; Enter older match, Shift+Enter newer, Escape closes |
+| New tab / next / previous | Ctrl+Shift+T / Ctrl+PageDown / Ctrl+PageUp |
+| Split right / below | Ctrl+Shift+Enter / Ctrl+Shift+Backslash |
+| Focus a pane | Ctrl+Shift+Arrow, or click it |
+| Close pane | Ctrl+Shift+W |
+| Search | Ctrl+Shift+F, then Enter for the next older match, Shift+Enter for newer, Escape to close |
+| Scroll | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End, mouse wheel |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
-| Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
+| Previous prompt / select last output | Ctrl+Shift+Z / Ctrl+Shift+G (with shell integration) |
+| Accept suggestion / one word | Right or End / Alt+Right (when a suggestion is shown) |
+| Open a hyperlink | Ctrl+click |
+| Reload config | Ctrl+Shift+F5 |
 
-With more than one tab a tab bar on the top row shows each tab's number
-and title. Splits are separated by a thin line, and clicking a pane
-focuses it.
+Plain Ctrl+letter keys always reach the program, so Ctrl+C, Ctrl+D,
+Ctrl+W and the rest behave as usual. A binding with nothing to act on,
+such as Right with no suggestion shown, passes its key through too. Every
+binding can be changed or removed in the config.
 
-Plain Ctrl+letter keys always reach the program in the terminal, so
-Ctrl+D, Ctrl+W, Ctrl+T, Ctrl+F and Ctrl+X behave as in any terminal. A
-binding with nothing to act on, such as tab switching with one tab, also
-passes its key through.
+## Configuration
 
-### Configuration
+nora reads `~/.config/nora/config.toml` (or
+`$XDG_CONFIG_HOME/nora/config.toml`; `--config PATH` picks another). Every
+key is optional, and unknown keys are reported as errors so typos are
+caught. A small example:
 
-Config lives at `~/.config/nora/config.toml` (or
-`$XDG_CONFIG_HOME/nora/config.toml`); `--config PATH` picks another file.
-Every key is optional. The commented example in
-`resources/nora.example.toml` lists every section and key:
+```toml
+[font]
+family = "JetBrains Mono"
+size = 13.0
+
+[colors]
+foreground = "#d8dee9"
+background = "#1e222a"
+
+[cursor]
+style = "beam"
+
+[[keyboard.bindings]]
+keys = "ctrl+shift+d"
+action = "split_right"
+```
 
 | Section | Keys |
 | --- | --- |
-| `[font]` | `family`, `size` (points) |
-| `[colors]` | `foreground`, `background`, `cursor`, `selection_background`, `[colors.normal]` / `[colors.bright]` ANSI colors |
-| `[window]` | `columns`, `lines` (initial size in cells) |
-| `[cursor]` | `style` = `block`, `beam` or `underline` |
-| `[scrolling]` | `history` (lines, default 10000), `multiplier` (wheel lines) |
-| `[autocomplete]` | `enabled` (default true): inline suggestions from your command history, kept in `$XDG_STATE_HOME/nora/history` |
-| `[[keyboard.bindings]]` | `keys` = chord, `action` = action name or `none` |
+| `[font]` | `family` (any fontconfig family), `size` (points, default 15) |
+| `[colors]` | `foreground`, `background`, `cursor`, `selection_background`; `[colors.normal]` and `[colors.bright]` for the 16 ANSI colors |
+| `[window]` | `columns`, `lines`: the initial size in cells |
+| `[cursor]` | `style`: `block`, `beam` or `underline` |
+| `[scrolling]` | `history` (lines, default 10 000), `multiplier` (lines per wheel step) |
+| `[autocomplete]` | `enabled` (default `true`) |
+| `[[keyboard.bindings]]` | `keys` (a chord such as `"ctrl+shift+d"`), `action` (an action name, or `"none"` to free a default) |
 
-The file is watched: saving it applies the change to the running window,
-and Ctrl+Shift+F5 reloads by hand. Colors, cursor, bindings and fonts
-apply immediately, scrollback size applies to new panes, and window size
-at the next start. A file that fails to parse or validate keeps the
-current settings and shows the error on the bottom row. Precedence: CLI
-flags > config file > built-in defaults. The pre-0.2 sections
-`[terminal]`, `[theme]` and `[keys]` are still accepted; the new sections
-win when both are present.
+[`resources/nora.example.toml`](resources/nora.example.toml) documents
+every key, its default and every action name.
 
-Validate a config without launching:
+The file is watched. Saving it applies colors, fonts, the cursor and
+bindings to the running window at once; scrollback size applies to new
+panes, and window size at the next start. A file with an error keeps the
+current settings and shows the error at the bottom of the window. To
+check a file without opening a window:
 
 ```sh
-nora --config ~/.config/nora/config.toml --check-config
+nora --check-config
 ```
 
-### Shell integration
+## Shell integration and suggestions
 
-Source `shell/nora-bash.sh` from your `.bashrc` to enable OSC 133 prompt
-markers. This unlocks prompt navigation (jump to previous prompt),
-previous-command selection, working-directory tracking and hyperlinks.
-The hook coexists with other `PROMPT_COMMAND`/DEBUG-trap shell
-integrations (e.g. starship).
+Shell integration is opt-in. Add one line to your shell's startup file:
 
-For zsh, source `shell/nora-zsh.zsh` from your `.zshrc`. It adds the same
-markers and directory tracking through `precmd`/`preexec`, and reports
-the editor buffer through `zle-line-pre-redraw` (pure zsh, no process per
-keystroke; unchanged buffers are not re-sent). Other terminals ignore the
-reports.
+```sh
+# ~/.zshrc: markers, directory tracking and inline suggestions
+source /path/to/nora/shell/nora-zsh.zsh
 
-## Development
+# ~/.bashrc: markers and directory tracking (no suggestions)
+source /path/to/nora/shell/nora-bash.sh
+```
 
-Check set (what CI runs; see `.github/workflows/ci.yml`):
+| Capability | zsh | bash |
+| --- | --- | --- |
+| Previous prompt, select last output (OSC 133) | yes | yes |
+| Working directory (OSC 7) | yes | yes |
+| Inline suggestions | yes | no: plain bash has no per-keystroke hook |
+
+**How suggestions work.** On every redraw of the command line, the zsh
+script sends nora the line and the cursor position in an escape sequence
+(`OSC 6973`), and when a command runs, the command line and its exit
+status. nora suggests from the history of commands you ran. It scores
+each one by frequency and recency, triples the score for commands run in
+the current directory, and lowers it for commands that failed. With no
+match, it completes the last word as a path or command name, but only
+when the completion is unambiguous. The suggestion appears only with the
+cursor at the end of the line, never in full-screen programs or during a
+paste. The encoding runs inside zsh with no process per keystroke, and
+other terminals ignore the sequences.
+
+**Privacy.** Everything stays on your machine. The history lives in
+`~/.local/state/nora/history` (or `$XDG_STATE_HOME/nora/history`),
+readable only by you, capped at 5 000 commands. Commands that start with a
+space are never recorded, the same convention as `HIST_IGNORE_SPACE`.
+Neither are multi-line commands. Set `enabled = false` under
+`[autocomplete]` to turn it off; nora then neither reads nor writes the
+file.
+
+The design and its alternatives are in
+[ADR-013](docs/adr/ADR-013-autocomplete.md).
+
+## Performance
+
+These figures come from one machine (x86_64, AMD RX 6750 XT with RADV,
+GNOME Wayland) unless noted. They are evidence, not guarantees.
+
+| Measure | Result |
+| --- | --- |
+| Start to first frame | about 180 ms (`nora -- true`: 204–214 ms wall time) |
+| Key press to frame presented | about 1 ms median (Xvfb, software GPU) |
+| Key press to suggestion on screen | 1.4 ms median, 3.5 ms max (Xvfb, software GPU) |
+| Output throughput, 32 MiB with colors | about 56 MiB/s in the window |
+| Idle | no frames drawn; the I/O thread wakes twice a second |
+
+Method and raw numbers are in [docs/performance/](docs/performance/).
+
+## Limitations
+
+- **macOS and Windows are previews.** They build and pass their automated
+  tests, but no one has used the window on them yet, and there are no
+  installers. See [docs/15-platforms.md](docs/15-platforms.md).
+- **Not supported yet:**
+  - the kitty keyboard protocol (programs get legacy xterm key encodings);
+  - drawing images from the kitty graphics protocol (it is parsed, not
+    displayed);
+  - font ligatures.
+- **Input methods.** Composition (fcitx5, ibus) is implemented but has
+  not been checked with a real input method.
+- **Wayland clipboard.** The clipboard goes through XWayland, so it
+  needs XWayland running.
+- **Suggestions** need zsh with the integration script.
+
+## Contributing
+
+Issues and pull requests are welcome. For a larger change, please open an
+issue first to agree on the approach.
+
+Before sending a pull request, run what CI runs:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo build --release
 ```
 
-CI additionally builds the X11-only and Wayland-only configurations and
-runs `nora --smoke` under Xvfb and under Weston's headless backend with
-the lavapipe software GPU. Tests that need a GPU adapter fail with
-`a GPU adapter must be available` when no Vulkan driver is loadable; the
-PTY tests have 10 s deadlines and can flake on a heavily loaded machine
-(they pass when re-run alone).
+Two more checks:
 
-Repository layout:
+- **GPU tests** need a Vulkan driver. Mesa's lavapipe is enough; on
+  Debian and Ubuntu, select it with
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
+- **Window tests.** `scripts/e2e-x11.sh` drives a real nora window under
+  Xvfb, with real key and mouse events. It needs Xvfb, xdotool and
+  ImageMagick (zsh, vim, tmux and htop for some scenarios). Run one
+  scenario with `scripts/e2e-x11.sh search`.
 
-| Path | Purpose |
+Guidelines:
+
+- **Behavior changes** come with a test. A bug fix should have a test that
+  fails without it.
+- **Terminal behavior** comes from [`alacritty_terminal`](https://crates.io/crates/alacritty_terminal),
+  vendored in `vendor/` with a small documented patch set; nora does not
+  parse escape sequences itself.
+- **Design decisions** are recorded as ADRs in [docs/adr/](docs/adr/).
+  Architecture, compatibility and resource limits are in
+  [docs/](docs/).
+
+| Path | What it holds |
 | --- | --- |
-| `src/` | Library: engine, session, input, render, config, protocol filters |
-| `src/app/` | Windowed application: CLI, window, workspace, render loop |
-| `src/bin/` | `nora_child` test helper, `nora_bench` benchmark tool |
-| `tests/` | Integration tests (one target per feature area) |
-| `vendor/alacritty_terminal/` | Vendored terminal engine (path dependency) |
-| `shell/` | Shell integration scripts (bash, zsh) |
-| `terminfo/` | `nora` terminfo entry source |
-| `resources/` | Desktop entry, icon, example config |
-| `scripts/` | Clean build, install, uninstall |
-| `docs/` | Product, architecture, compatibility, task cards, ADRs, status |
+| `src/engine.rs`, `src/session/` | Terminal engine adapter, PTY sessions, the I/O thread |
+| `src/app/` | Window, input, rendering, panes and tabs |
+| `src/input/`, `src/render/`, `src/config.rs` | Key and mouse encoding, colors, configuration |
+| `src/suggest.rs`, `src/shell_input.rs`, `shell/` | Suggestions and shell integration |
+| `tests/`, `scripts/e2e-x11.sh` | Integration tests and window tests |
 
-### Documentation
+## Security
 
-| Document | Purpose |
-| --- | --- |
-| [AGENTS.md](AGENTS.md) | Rules for agents implementing nora |
-| [01-research.md](docs/01-research.md) | Evidence, alternatives, recommended approach |
-| [02-product.md](docs/02-product.md) | What nora ships and what it defers |
-| [03-architecture.md](docs/03-architecture.md) | Module ownership, concurrency, snapshots, resource limits |
-| [04-performance.md](docs/04-performance.md) | Metrics, goals and benchmark design |
-| [05-rendering.md](docs/05-rendering.md) | Fixed-cell fonts, caching, damage and GPU lifecycle |
-| [06-compatibility.md](docs/06-compatibility.md) | Protocol contract and input behavior |
-| [07-build-release.md](docs/07-build-release.md) | Dependencies, build, CI and packaging |
-| [08-agent-workflow.md](docs/08-agent-workflow.md) | Small-context workflow and commit/push requirements |
-| [09-validation.md](docs/09-validation.md) | Correctness and integration tests |
-| [10-roadmap.md](docs/10-roadmap.md) | Ordered feature cards and release gates |
-| [11-risks.md](docs/11-risks.md) | Failure modes and decision triggers |
-| [12-resource-limits.md](docs/12-resource-limits.md) | Measured resource-limit evidence |
-| [12-sources.md](docs/12-sources.md) | Primary-source links and evidence boundaries |
-| [13-extensions.md](docs/13-extensions.md) | Graphics, shell integration and later features |
-| [13-v0.1-acceptance.md](docs/13-v0.1-acceptance.md) | v0.1 acceptance assessment |
-| [status/PROGRESS.md](docs/status/PROGRESS.md) | Durable implementation state |
-| [status/HANDOFF_TEMPLATE.md](docs/status/HANDOFF_TEMPLATE.md) | Short recovery checkpoint |
+Please report security problems privately through
+[GitHub security advisories](https://github.com/Yejashi/nora/security/advisories/new),
+not in a public issue.
 
-Work proceeds in small increments against the task cards in `docs/tasks/`;
-`docs/status/PROGRESS.md` is the resume index.
+Programs running in nora are treated as untrusted:
+
+- they cannot read the clipboard (OSC 52 is disabled);
+- control sequences are size-capped;
+- hyperlinks open only for `http`, `https`, `mailto`, `file` and `ftp`,
+  only on Ctrl+click, and through the platform opener with no shell
+  involved.
+
+## Acknowledgements
+
+- [Alacritty](https://github.com/alacritty/alacritty)'s `alacritty_terminal`
+  (Apache-2.0) is nora's terminal engine: escape-sequence parsing, the
+  screen model and the PTY layer.
+- [wgpu](https://wgpu.rs), [winit](https://github.com/rust-windowing/winit),
+  [glyphon](https://github.com/grovesNL/glyphon) and
+  [cosmic-text](https://github.com/pop-os/cosmic-text) provide rendering,
+  windowing and text shaping.
+- The suggestion design draws on
+  [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions),
+  fish's autosuggestions and kitty's
+  [shell integration](https://sw.kovidgoyal.net/kitty/shell-integration/)
+  protocol.
 
 ## License
 
-MIT (per the `Cargo.toml` manifest).
+nora is released under the [MIT License](LICENSE), © 2026 Yejashi.
+
+The vendored `alacritty_terminal` in
+[`vendor/alacritty_terminal`](vendor/alacritty_terminal) remains under the
+Apache License 2.0 ([its license](vendor/alacritty_terminal/LICENSE-APACHE)).

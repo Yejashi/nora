@@ -3,7 +3,7 @@ name = "nora"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "A fast, efficient, maintainable Linux desktop terminal"
+description = "A GPU-accelerated terminal for Linux, written in Rust, with inline command suggestions"
 license = "MIT"
 
 # Explicit windowing backend configurations (N30). winit's default

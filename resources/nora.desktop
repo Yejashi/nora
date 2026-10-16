@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Nora
 GenericName=Terminal
-Comment=A fast, efficient, maintainable Linux desktop terminal
+Comment=GPU-accelerated terminal with inline command suggestions
 Exec=nora
 Icon=nora
 Terminal=false

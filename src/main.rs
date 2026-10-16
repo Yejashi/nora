@@ -29,7 +29,7 @@ const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage: nora [OPTIONS] [-- COMMAND ARG...]\n\n\
-A fast, efficient, maintainable Linux desktop terminal.\n\
+A GPU-accelerated terminal for Linux, with inline command suggestions.\n\
 \n\
 Options:\n\
   -h, --help                   Print this help message\n\
