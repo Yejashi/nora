@@ -177,3 +177,21 @@ fn unquote_shell_handles_bash_and_zsh_quoting() {
     assert_eq!(unquote_shell("open 'quote"), None);
     assert_eq!(unquote_shell("trailing\\"), None);
 }
+
+/// An integration that sends a bare `D` (no status, like nora-bash.sh):
+/// the command is finished once the next prompt starts, without a status.
+#[test]
+fn bare_d_completes_at_the_next_prompt() {
+    let mut state = ShellInput::new();
+    state.apply(&ShellEvent::CommandLine("make".to_string()), Some("/p"));
+    state.apply(&marker(MarkerKind::C), None);
+    assert!(state.take_executed().is_empty(), "still running");
+    state.apply(&marker(MarkerKind::D), None);
+    state.apply(&marker(MarkerKind::A), None);
+    let taken = state.take_executed();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].exit, None);
+    // A late status does not attach to the finished command.
+    state.apply(&ShellEvent::CommandExit(3), None);
+    assert!(state.take_executed().is_empty());
+}

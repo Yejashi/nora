@@ -258,6 +258,35 @@ impl Scene {
         fg: [u8; 4],
         bg: [u8; 4],
     ) -> u32 {
+        self.add_overlay_text(text, row, col, cols, fg, bg, true)
+    }
+
+    /// An inline suggestion (ADR-013) at grid cell (`row`, `col`): `fg`
+    /// (dim) over an opaque `bg`, never written into the grid; clipped at
+    /// `cols`. Returns the columns it covers.
+    pub fn add_ghost_text(
+        &mut self,
+        text: &str,
+        row: u32,
+        col: u32,
+        cols: u32,
+        fg: [u8; 4],
+        bg: [u8; 4],
+    ) -> u32 {
+        self.add_overlay_text(text, row, col, cols, fg, bg, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_overlay_text(
+        &mut self,
+        text: &str,
+        row: u32,
+        col: u32,
+        cols: u32,
+        fg: [u8; 4],
+        bg: [u8; 4],
+        underline: bool,
+    ) -> u32 {
         use unicode_width::UnicodeWidthChar;
         let mut at = col;
         for ch in text.chars() {
@@ -280,7 +309,9 @@ impl Scene {
                 color: bg,
             });
             let mut style = tab_style(fg, bg, false);
-            style.underline = UnderlineStyle::Single;
+            if underline {
+                style.underline = UnderlineStyle::Single;
+            }
             self.cells.push(DrawCell {
                 row,
                 col: at,

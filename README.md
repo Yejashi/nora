@@ -63,10 +63,13 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
 - Jump to the previous prompt (Ctrl+Shift+Z) and select the previous
   command's output (Ctrl+Shift+G)
 - Working-directory tracking (OSC 7)
-- zsh only: the executed command line and exit status (`OSC 133;C;cmdline_url`,
-  `OSC 133;D;<status>`) and the line editor's buffer on every redraw
-  (`OSC 6973`), the groundwork for inline suggestions
-  ([ADR-013](docs/adr/ADR-013-autocomplete.md), in progress)
+- zsh only: inline suggestions. The integration reports the executed
+  command line and exit status (`OSC 133;C;cmdline_url`, `OSC 133;D`) and
+  the line editor's buffer on every redraw (`OSC 6973`); nora suggests the
+  best match from your history (frequency, recency, current directory,
+  past failures) as dim text after the cursor. Right or End types it,
+  Alt+Right one word. Lines starting with a space are never recorded
+  ([ADR-013](docs/adr/ADR-013-autocomplete.md))
 - Hyperlinks (OSC 8): Ctrl+click opens http(s), mailto, file and ftp links
   with the platform opener (`xdg-open`, `open`, `explorer`)
 
@@ -184,6 +187,7 @@ server available, the launch falls back to the headless session pump.
 | Close pane (tab, window) | Ctrl+Shift+W |
 | Reload config | Ctrl+Shift+F5 |
 | Previous prompt / select last output | Ctrl+Shift+Z / Ctrl+Shift+G (shell integration) |
+| Accept inline suggestion / its next word | Right or End / Alt+Right (zsh integration; otherwise the key goes to the shell) |
 | Search (scrollback and screen) | Ctrl+Shift+F; Enter older match, Shift+Enter newer, Escape closes |
 | Zoom in / out / reset | Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0 |
 | Scrollback | Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End |
@@ -211,6 +215,7 @@ Every key is optional. The commented example in
 | `[window]` | `columns`, `lines` (initial size in cells) |
 | `[cursor]` | `style` = `block`, `beam` or `underline` |
 | `[scrolling]` | `history` (lines, default 10000), `multiplier` (wheel lines) |
+| `[autocomplete]` | `enabled` (default true): inline suggestions from your command history, kept in `$XDG_STATE_HOME/nora/history` |
 | `[[keyboard.bindings]]` | `keys` = chord, `action` = action name or `none` |
 
 The file is watched: saving it applies the change to the running window,

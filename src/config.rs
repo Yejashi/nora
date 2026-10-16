@@ -46,6 +46,9 @@ pub struct NoraConfig {
     /// Key bindings (override the legacy `[keys]`).
     #[serde(default)]
     pub keyboard: KeyboardConfig,
+    /// Inline suggestions from the shell integration (ADR-013).
+    #[serde(default)]
+    pub autocomplete: AutocompleteConfig,
     /// Legacy section (`history`); `[scrolling]` takes precedence.
     #[serde(default)]
     pub terminal: TerminalConfig,
@@ -130,6 +133,15 @@ pub enum CursorShape {
 pub struct CursorConfig {
     #[serde(default)]
     pub style: CursorShape,
+}
+
+/// `[autocomplete]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutocompleteConfig {
+    /// Suggest and record command lines; default true. Off, nora neither
+    /// reads nor writes its history file.
+    pub enabled: Option<bool>,
 }
 
 /// `[scrolling]`.
@@ -275,6 +287,11 @@ impl NoraConfig {
     }
 
     /// Effective wheel lines per step.
+    /// Whether inline suggestions are on (`[autocomplete] enabled`).
+    pub fn autocomplete_enabled(&self) -> bool {
+        self.autocomplete.enabled.unwrap_or(true)
+    }
+
     pub fn scroll_multiplier(&self) -> u8 {
         self.scrolling.multiplier.unwrap_or(3)
     }

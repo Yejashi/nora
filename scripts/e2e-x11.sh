@@ -684,6 +684,46 @@ RC
     pass zshell
 }
 
+# Inline suggestions (ADR-013 step 4): a command run once is suggested
+# (dim ghost text) for a prefix; Right types it, and the shell runs
+# exactly the suggestion. The history is saved under the state directory.
+scenario_suggest() {
+    have zsh suggest || return
+    local dir="$OUT/suggest"; mkdir -p "$dir/zdot"
+    cat >"$dir/zdot/.zshrc" <<RC
+PROMPT='%% '
+bindkey -e
+source "$ROOT/shell/nora-zsh.zsh"
+RC
+    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch suggest zsh -d -i \
+        || { fail suggest "no window"; return; }
+    for _ in $(seq 1 100); do
+        grep -q '^shell: buffer "" cursor 0' "$OUT/suggest/nora.log" && break
+        sleep 0.1
+    done
+    xdotool type --delay 30 "echo ghost-alpha-1 >> $dir/out.txt"; xdotool key Return; sleep 0.5
+    shot "$dir/plain.png"
+    xdotool type --delay 30 "echo gho"; sleep 0.7
+    shot "$dir/ghost.png"
+    xdotool key Right; sleep 0.3
+    xdotool key Return
+    wait_lines() { [ "$(wc -l <"$dir/out.txt" 2>/dev/null)" -ge 2 ]; }
+    for _ in $(seq 1 30); do wait_lines && break; sleep 0.1; done
+    # Exit the shell: the window closes and nora saves its history.
+    xdotool type --delay 30 "exit"; xdotool key Return
+    for _ in $(seq 1 50); do kill -0 "$NORA_PID" 2>/dev/null || break; sleep 0.1; done
+    finish
+    local ghost plain hist="$OUT/suggest/home/.local/state/nora/history"
+    ghost=$(count_color "$dir/ghost.png" '#666666')
+    plain=$(count_color "$dir/plain.png" '#666666')
+    echo "  ghost px: $ghost (before: $plain); out: $(tr '\n' '|' <"$dir/out.txt")"
+    [ "$ghost" -gt $((plain + 50)) ] || { fail suggest "no ghost text drawn"; return; }
+    [ "$(cat "$dir/out.txt")" = "$(printf 'ghost-alpha-1\nghost-alpha-1')" ] \
+        || { fail suggest "accepted command differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
+    grep -q "echo ghost-alpha-1" "$hist" 2>/dev/null || { fail suggest "history not saved at $hist"; return; }
+    pass suggest
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -720,7 +760,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell suggest vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

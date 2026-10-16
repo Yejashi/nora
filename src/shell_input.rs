@@ -57,6 +57,10 @@ pub struct ShellInput {
     buffer: Option<LineBuffer>,
     executed: VecDeque<ExecutedCommand>,
     executed_bytes: usize,
+    /// `executed[..complete]` are finished: their exit status arrived, or
+    /// the next prompt started without one (an integration that sends a
+    /// bare `D`).
+    complete: usize,
     generation: u64,
 }
 
@@ -72,6 +76,9 @@ impl ShellInput {
         match event {
             ShellEvent::Marker(marker) => {
                 self.phase = Some(marker.kind);
+                if marker.kind == MarkerKind::A {
+                    self.complete = self.executed.len();
+                }
                 // A buffer belongs to one prompt's input phase.
                 if marker.kind != MarkerKind::B {
                     self.buffer = None;
@@ -95,16 +102,20 @@ impl ShellInput {
                 while self.executed.len() > MAX_EXECUTED || self.executed_bytes > MAX_EXECUTED_BYTES
                 {
                     match self.executed.pop_front() {
-                        Some(old) => self.executed_bytes -= old.cmdline.len(),
+                        Some(old) => {
+                            self.executed_bytes -= old.cmdline.len();
+                            self.complete = self.complete.saturating_sub(1);
+                        }
                         None => break,
                     }
                 }
             }
             ShellEvent::CommandExit(status) => {
-                if let Some(last) = self.executed.back_mut()
-                    && last.exit.is_none()
+                if self.complete < self.executed.len()
+                    && let Some(last) = self.executed.back_mut()
                 {
                     last.exit = Some(*status);
+                    self.complete = self.executed.len();
                 }
             }
             ShellEvent::Cwd(_) | ShellEvent::Hyperlink(_) => return,
@@ -121,16 +132,12 @@ impl ShellInput {
         }
     }
 
-    /// Take the executed commands recorded so far, oldest first. A
-    /// command whose exit status has not arrived yet stays, so its status
-    /// is not lost.
+    /// Take the finished commands recorded so far, oldest first. A
+    /// command still running stays until its exit status arrives (or the
+    /// next prompt starts), so its status is not lost.
     pub fn take_executed(&mut self) -> Vec<ExecutedCommand> {
-        let done = self
-            .executed
-            .iter()
-            .position(|c| c.exit.is_none())
-            .unwrap_or(self.executed.len());
-        let taken: Vec<ExecutedCommand> = self.executed.drain(..done).collect();
+        let taken: Vec<ExecutedCommand> = self.executed.drain(..self.complete).collect();
+        self.complete = 0;
         self.executed_bytes -= taken.iter().map(|c| c.cmdline.len()).sum::<usize>();
         taken
     }

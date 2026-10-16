@@ -533,3 +533,16 @@ columns = 1
         assert!(message.contains(needle), "missing {needle:?} in: {message}");
     }
 }
+
+/// ADR-013: `[autocomplete] enabled` defaults to on and can be turned off;
+/// unknown keys in the section are rejected like everywhere else.
+#[test]
+fn autocomplete_section() {
+    assert!(parse_config("").unwrap().autocomplete_enabled());
+    assert!(
+        !parse_config("[autocomplete]\nenabled = false\n")
+            .unwrap()
+            .autocomplete_enabled()
+    );
+    assert!(parse_config("[autocomplete]\nenable = false\n").is_err());
+}

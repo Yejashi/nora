@@ -174,6 +174,10 @@ pub struct SessionOptions {
     /// CSI 14 t / 16 t).
     pub cell_width: u16,
     pub cell_height: u16,
+    /// Inline suggestions (ADR-013): record executed commands and suggest
+    /// from them. Off by default for library users; the window passes the
+    /// configured value.
+    pub autocomplete: bool,
 }
 
 impl Default for SessionOptions {
@@ -186,6 +190,7 @@ impl Default for SessionOptions {
             palette: crate::render::palette::Palette::default(),
             cell_width: NOMINAL_CELL_WIDTH,
             cell_height: NOMINAL_CELL_HEIGHT,
+            autocomplete: false,
         }
     }
 }

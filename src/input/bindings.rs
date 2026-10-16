@@ -48,6 +48,11 @@ pub enum Action {
     PreviousPrompt,
     /// Select the previous command's output (needs shell integration).
     SelectPreviousCommand,
+    /// Type the whole inline suggestion (ADR-013); the key goes to the
+    /// application when there is none.
+    AcceptSuggestion,
+    /// Type the suggestion's next word.
+    AcceptSuggestionWord,
 }
 
 impl Action {
@@ -57,7 +62,14 @@ impl Action {
     pub fn repeats(self) -> bool {
         matches!(
             self,
-            Action::ZoomIn | Action::ZoomOut | Action::ScrollPageUp | Action::ScrollPageDown
+            Action::ZoomIn
+                | Action::ZoomOut
+                | Action::ScrollPageUp
+                | Action::ScrollPageDown
+                // Plain Right/End: a held key must keep reaching the
+                // application when there is no suggestion.
+                | Action::AcceptSuggestion
+                | Action::AcceptSuggestionWord
         )
     }
 }
@@ -117,6 +129,9 @@ impl Default for Bindings {
             (K::F5, cs, ReloadConfig),
             (K::KeyZ, cs, PreviousPrompt),
             (K::KeyG, cs, SelectPreviousCommand),
+            (K::ArrowRight, ModifiersState::empty(), AcceptSuggestion),
+            (K::End, ModifiersState::empty(), AcceptSuggestion),
+            (K::ArrowRight, ModifiersState::ALT, AcceptSuggestionWord),
         ];
         Self {
             entries: table
@@ -293,6 +308,8 @@ fn action_named(name: &str) -> Option<Action> {
         "reload_config" => Action::ReloadConfig,
         "previous_prompt" => Action::PreviousPrompt,
         "select_previous_command" => Action::SelectPreviousCommand,
+        "accept_suggestion" => Action::AcceptSuggestion,
+        "accept_suggestion_word" => Action::AcceptSuggestionWord,
         _ => return None,
     })
 }
@@ -375,6 +392,38 @@ mod tests {
                 "Ctrl+{code:?} must reach the app"
             );
         }
+    }
+
+    /// ADR-013: plain Right and End accept a suggestion, Alt+Right one
+    /// word; they repeat, so a held arrow keeps reaching the application
+    /// when there is no suggestion (the window falls through then).
+    #[test]
+    fn suggestion_keys_are_bound_and_repeat() {
+        let b = Bindings::default();
+        let none = ModifiersState::empty();
+        assert_eq!(
+            b.lookup(&key(KeyCode::ArrowRight), none),
+            Some(Action::AcceptSuggestion)
+        );
+        assert_eq!(
+            b.lookup(&key(KeyCode::End), none),
+            Some(Action::AcceptSuggestion)
+        );
+        assert_eq!(
+            b.lookup(&key(KeyCode::ArrowRight), ModifiersState::ALT),
+            Some(Action::AcceptSuggestionWord)
+        );
+        assert_eq!(b.lookup(&key(KeyCode::ArrowLeft), none), None);
+        assert!(Action::AcceptSuggestion.repeats());
+        assert!(Action::AcceptSuggestionWord.repeats());
+        assert_eq!(
+            action_named("accept_suggestion"),
+            Some(Action::AcceptSuggestion)
+        );
+        assert_eq!(
+            action_named("accept_suggestion_word"),
+            Some(Action::AcceptSuggestionWord)
+        );
     }
 
     #[test]

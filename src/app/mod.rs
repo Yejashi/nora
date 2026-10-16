@@ -184,6 +184,7 @@ pub(crate) fn session_options(
         palette: Palette::from_config(config),
         cell_width: u16::try_from(cell.0).unwrap_or(u16::MAX),
         cell_height: u16::try_from(cell.1).unwrap_or(u16::MAX),
+        autocomplete: config.autocomplete_enabled(),
     }
 }
 
@@ -510,6 +511,9 @@ struct WinApp {
     /// Each pane's last rendered snapshot, redrawn on redraw requests that
     /// bring no new output (bounded: one snapshot per live pane).
     pane_last: std::collections::HashMap<PaneKey, Snapshot>,
+    /// Each pane's inline suggestion (ADR-013): the text after the cursor
+    /// the pump computed for the shell's last reported buffer.
+    suggestions: std::collections::HashMap<PaneKey, String>,
     /// Set by the wgpu device-lost callback; the next render exits.
     device_lost: Arc<AtomicBool>,
     /// `NORA_TRACE_LATENCY`: when the oldest key event not yet followed by
@@ -718,6 +722,7 @@ pub fn run_windowed(
         proxy: event_loop.create_proxy(),
         full_fonts: None,
         pane_last: std::collections::HashMap::new(),
+        suggestions: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
         trace_fresh_key_at: None,
@@ -801,6 +806,7 @@ impl WinApp {
     /// pump.
     fn drop_pane_state(&mut self, pane: PaneKey) {
         self.pane_last.remove(&pane);
+        self.suggestions.remove(&pane);
         self.pane_titles.remove(&pane);
         self.pane_slots.remove(&pane);
         self.pane_spawned.remove(&pane);
@@ -1251,6 +1257,8 @@ impl WinApp {
                 }
             }
             UiAction::ReloadConfig => self.reload_config(),
+            UiAction::AcceptSuggestion => return self.accept_suggestion(false),
+            UiAction::AcceptSuggestionWord => return self.accept_suggestion(true),
             UiAction::PreviousPrompt | UiAction::SelectPreviousCommand => {
                 if let Some(pane) = self.active_pane_key() {
                     let msg = if action == UiAction::PreviousPrompt {
@@ -1292,6 +1300,28 @@ impl WinApp {
         true
     }
 
+    /// Type the active pane's inline suggestion (ADR-013), all of it or
+    /// its next word, as ordinary input: the shell's editor inserts it.
+    /// `false` (the key goes to the application) when there is none to
+    /// accept.
+    fn accept_suggestion(&mut self, word: bool) -> bool {
+        if self.search.visible || !self.ime.preedit().is_empty() {
+            return false;
+        }
+        let Some(pane) = self.active_pane_key() else {
+            return false;
+        };
+        let Some(suffix) = self.suggestions.remove(&pane) else {
+            return false;
+        };
+        let text = if word { next_word(&suffix) } else { &suffix };
+        let _ = self.pump_commands.send(PumpMsg::Input {
+            pane,
+            bytes: text.as_bytes().to_vec(),
+        });
+        true
+    }
+
     /// Paste the clipboard into the active pane (bracketed when the
     /// application enabled DECSET 2004). The pump validates and streams
     /// the text in order, bounded by the writer's app cap.
@@ -1318,6 +1348,7 @@ impl WinApp {
         }
         let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
         if let Some(pane) = self.active_pane_key() {
+            self.suggestions.remove(&pane);
             let _ = self.pump_commands.send(PumpMsg::Paste {
                 pane,
                 text,
@@ -1535,6 +1566,18 @@ impl WinApp {
             }
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged => {}
+            AppEvent::Suggestion { pane, suffix } => {
+                let changed = match suffix {
+                    Some(suffix) => self.suggestions.insert(pane, suffix.clone()) != Some(suffix),
+                    None => self.suggestions.remove(&pane).is_some(),
+                };
+                if changed
+                    && self.active_pane_key() == Some(pane)
+                    && let Some(window) = self.window.as_ref()
+                {
+                    window.request_redraw();
+                }
+            }
             AppEvent::SearchStatus {
                 pane,
                 current,
@@ -1838,12 +1881,22 @@ impl WinApp {
                     let (row, col) = (u32::from(y) + row as u32, u32::from(x) + col as u32);
                     let preedit = self.ime.preedit();
                     let mut covered = 1;
+                    let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
+                    let right = u32::from(x) + u32::from(w);
                     if !preedit.is_empty() {
                         let fg = self.palette.foreground();
                         let fg = [fg.r, fg.g, fg.b, 255];
-                        let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
-                        let right = u32::from(x) + u32::from(w);
                         covered = scene.add_preedit(preedit, row, col, right, fg, bg).max(1);
+                    } else if let Some(ghost) = self.suggestions.get(&active)
+                        && !self.search.visible
+                        && window.has_focus()
+                    {
+                        // Dim: the foreground two fifths of the way from
+                        // the background.
+                        let fg = self.palette.foreground();
+                        let mix = |f: u8, b: u8| ((u16::from(f) * 2 + u16::from(b) * 3) / 5) as u8;
+                        let fg = [mix(fg.r, bg[0]), mix(fg.g, bg[1]), mix(fg.b, bg[2]), 255];
+                        scene.add_ghost_text(ghost, row, col, right, fg, bg);
                     }
                     window.set_ime_cursor_area(
                         winit::dpi::PhysicalPosition::new(
@@ -2383,6 +2436,10 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     match action {
                         InputAction::Send(bytes) => {
                             if let Some(pane) = self.active_pane_key() {
+                                // The buffer is about to change: a stale
+                                // suggestion must not be accepted before
+                                // the shell reports the new one.
+                                self.suggestions.remove(&pane);
                                 let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
                             }
                         }
@@ -2624,6 +2681,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             return;
                         }
                         if let Some(pane) = self.active_pane_key() {
+                            self.suggestions.remove(&pane);
                             let _ = self.pump_commands.send(PumpMsg::Input {
                                 pane,
                                 bytes: committed.into_bytes(),
@@ -2656,5 +2714,26 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
             _ => {}
         }
+    }
+}
+
+/// The next word of an inline suggestion: leading spaces, then up to the
+/// next space (`"atus --short"` -> `"atus"`, `" --short"` -> `" --short"`).
+fn next_word(suffix: &str) -> &str {
+    let start = suffix.len() - suffix.trim_start().len();
+    let end = suffix[start..]
+        .find(char::is_whitespace)
+        .map_or(suffix.len(), |i| start + i);
+    &suffix[..end]
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    #[test]
+    fn next_word_takes_leading_space_and_one_word() {
+        assert_eq!(super::next_word("atus --short"), "atus");
+        assert_eq!(super::next_word(" --short"), " --short");
+        assert_eq!(super::next_word("  a b"), "  a");
+        assert_eq!(super::next_word("x"), "x");
     }
 }

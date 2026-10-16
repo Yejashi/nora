@@ -131,6 +131,20 @@ Option 4, with these parts:
    previously run command, Right accepts it, and the command executed is
    exactly the suggestion; no suggestion in vim, at a `read -s` prompt, or
    during IME composition.
+   **Done 2026-10-16:** the pump owns the history (loaded at start; saved
+   when changed, at most every 30 s, and at shutdown), records each pane's
+   finished commands, and sends `AppEvent::Suggestion` on every buffer
+   change. The window draws it through the preedit path (foreground 2/5
+   of the way from the background) and drops it as soon as other input
+   goes to the shell, so a stale suggestion is never typed. Bindings
+   `accept_suggestion` (Right, End) and `accept_suggestion_word`
+   (Alt+Right) fall through when there is none. e2e `suggest`: ghost
+   drawn, Right then Enter runs exactly the suggested command, history
+   saved. vim and `read -s` are excluded by construction (no buffer report
+   outside the input phase); the alternate screen and an in-flight paste
+   are checked too. **Open:** the ECHO-off check (the PTY master is owned
+   by the event loop); the IME case is unverified with a real input
+   method; SIGTERM ends nora without saving (no signal handling yet).
 5. Measure keystroke-to-ghost-text latency and the cost of the zsh hook.
 
 ## Gate

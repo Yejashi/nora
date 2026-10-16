@@ -124,6 +124,13 @@ pub enum AppEvent {
     },
     /// The pane's application rang the bell.
     Bell { pane: PaneKey },
+    /// The inline suggestion for the pane's shell editor buffer (ADR-013):
+    /// the text to show after the cursor, or `None` for none. Sent on every
+    /// buffer change.
+    Suggestion {
+        pane: PaneKey,
+        suffix: Option<String>,
+    },
     /// The pane's search position: match `current` (1-based; 0 = none)
     /// of `total`.
     SearchStatus {
@@ -455,6 +462,99 @@ impl PanePump {
 /// pulse a snapshot on non-noop damage, and publish its modes/kitty flags on
 /// change. Returns `false` when the pane's session has been fully drained
 /// and closed (the caller removes it).
+/// Seconds since the Unix epoch (0 if the clock is before it).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The suggestion history and where it is saved (ADR-013).
+struct Suggestions {
+    history: crate::suggest::History,
+    path: Option<std::path::PathBuf>,
+    last_save: Instant,
+}
+
+impl Suggestions {
+    /// Load the user's history (an unreadable file starts empty, with a
+    /// message; it is not overwritten until something is recorded).
+    fn load() -> Self {
+        let path = crate::suggest::History::default_path();
+        let history = match &path {
+            Some(path) => crate::suggest::History::load(path).unwrap_or_else(|error| {
+                eprintln!("nora: history {}: {error}", path.display());
+                crate::suggest::History::new()
+            }),
+            None => crate::suggest::History::new(),
+        };
+        Self {
+            history,
+            path,
+            last_save: Instant::now(),
+        }
+    }
+
+    /// Save when changed, at most every `interval`.
+    fn save_if_due(&mut self, interval: Duration) {
+        if !self.history.is_dirty() || self.last_save.elapsed() < interval {
+            return;
+        }
+        self.last_save = Instant::now();
+        if let Some(path) = &self.path
+            && let Err(error) = self.history.save(path)
+        {
+            eprintln!("nora: saving history {}: {error}", path.display());
+        }
+    }
+}
+
+/// ADR-013: fold the pane's executed commands into the history and, when
+/// its editor buffer changed, send the window the suggestion for it. No
+/// suggestion with the cursor before the end of the buffer, on the
+/// alternate screen, or while a paste is being delivered.
+fn update_suggestion(
+    pane: PaneKey,
+    pane_pump: &mut PanePump,
+    suggestions: &mut Option<Suggestions>,
+    events: &winit::event_loop::EventLoopProxy<AppEvent>,
+) {
+    let now = unix_now();
+    let engine = pane_pump.session.engine();
+    let executed = engine.take_executed();
+    if let Some(s) = suggestions.as_mut() {
+        for command in &executed {
+            s.history
+                .record(&command.cmdline, command.cwd.as_deref(), command.exit, now);
+        }
+    }
+    let buffer = engine.shell_buffer();
+    if buffer == pane_pump.shell_buffer {
+        return;
+    }
+    let suffix = match (&buffer, suggestions.as_ref()) {
+        (Some(b), Some(s))
+            if b.cursor_at_end()
+                && !engine.modes().contains(TermMode::ALT_SCREEN)
+                && pane_pump.paste_block.is_none() =>
+        {
+            s.history
+                .suggest(&b.text, engine.cwd().as_deref(), now)
+                .map(|full| full[b.text.len()..].to_string())
+        }
+        _ => None,
+    };
+    if trace_shell() {
+        match &buffer {
+            Some(b) => eprintln!("shell: buffer {:?} cursor {}", b.text, b.cursor),
+            None => eprintln!("shell: buffer none"),
+        }
+        eprintln!("shell: suggestion {suffix:?}");
+    }
+    pane_pump.shell_buffer = buffer;
+    let _ = events.send_event(AppEvent::Suggestion { pane, suffix });
+}
+
 fn tick_pane(
     pane: PaneKey,
     pane_pump: &mut PanePump,
@@ -535,19 +635,6 @@ fn tick_pane(
             eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
         }
         let _ = events.send_event(AppEvent::DirtyPulse { pane });
-    }
-
-    // The shell's editor buffer (ADR-013). `NORA_TRACE_SHELL` logs each
-    // change, the evidence the e2e shell checks read.
-    let buffer = pane_pump.session.engine().shell_buffer();
-    if buffer != pane_pump.shell_buffer {
-        if trace_shell() {
-            match &buffer {
-                Some(b) => eprintln!("shell: buffer {:?} cursor {}", b.text, b.cursor),
-                None => eprintln!("shell: buffer none"),
-            }
-        }
-        pane_pump.shell_buffer = buffer;
     }
 
     // Publish title changes and bells for the window.
@@ -634,6 +721,7 @@ pub fn pump_thread(
     sessions.insert(first_pane, PanePump::new(first_session));
     slots.insert(first_pane, first_slot);
 
+    let mut suggestions = options.autocomplete.then(Suggestions::load);
     let mut timeout = Duration::ZERO;
     loop {
         // (0) Block until a command, a wake (PTY output, child exit), or
@@ -649,6 +737,8 @@ pub fn pump_thread(
             for (pane, pane_pump) in sessions.iter_mut() {
                 if !tick_pane(*pane, pane_pump, &slots[pane], &events) {
                     removed.push(*pane);
+                } else {
+                    update_suggestion(*pane, pane_pump, &mut suggestions, &events);
                 }
             }
         }
@@ -742,6 +832,12 @@ pub fn pump_thread(
                         cell_height: options.cell_height,
                         ..new
                     };
+                    if new.autocomplete != options.autocomplete {
+                        if let Some(s) = suggestions.as_mut() {
+                            s.save_if_due(Duration::ZERO);
+                        }
+                        suggestions = new.autocomplete.then(Suggestions::load);
+                    }
                     if new.cursor_shape != options.cursor_shape {
                         for pane_pump in sessions.values_mut() {
                             pane_pump
@@ -923,7 +1019,13 @@ pub fn pump_thread(
             let _ = pane_pump.session.flush(1024 * 1024);
         }
 
+        if let Some(s) = suggestions.as_mut() {
+            s.save_if_due(Duration::from_secs(30));
+        }
         if stop.load(Ordering::Relaxed) {
+            if let Some(s) = suggestions.as_mut() {
+                s.save_if_due(Duration::ZERO);
+            }
             // N12a: close before break — the pinned loop panics in
             // `PeekableReceiver::recv` when its sender is dropped
             // without `Msg::Shutdown` (alacritty_terminal 0.26.0
