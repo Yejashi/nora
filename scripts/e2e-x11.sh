@@ -655,8 +655,15 @@ bindkey -e
 cd "$dir/work"
 source "$ROOT/shell/nora-zsh.zsh"
 RC
-    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch zshell zsh -i \
+    # -d: no global rc files (a distribution's /etc/zsh may run compinit
+    # or the new-user wizard, which ask questions).
+    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch zshell zsh -d -i \
         || { fail zshell "no window"; return; }
+    # Type only once the editor is up (its first, empty buffer report).
+    for _ in $(seq 1 100); do
+        grep -q '^shell: buffer "" cursor 0' "$OUT/zshell/nora.log" && break
+        sleep 0.1
+    done
     xdotool type --delay 40 "echo one"; xdotool key Return; sleep 0.5
     xdotool type --delay 40 "cat uniq"; xdotool key Tab; sleep 0.5
     xdotool key ctrl+u; sleep 0.3
@@ -673,7 +680,7 @@ RC
     while IFS= read -r line; do
         [ "$i" -lt ${#expect[@]} ] && [ "$line" = "${expect[$i]}" ] && i=$((i + 1))
     done <"$dir/buffers.txt"
-    [ "$i" -eq ${#expect[@]} ] || { fail zshell "buffer reports diverged at step $((i + 1)) (${expect[$i]}); see $dir/buffers.txt"; return; }
+    [ "$i" -eq ${#expect[@]} ] || { fail zshell "buffer reports diverged at step $((i + 1)) (${expect[$i]}); got: $(tr '\n' '|' <"$dir/buffers.txt" | cut -c1-400)"; return; }
     pass zshell
 }
 
