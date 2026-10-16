@@ -198,6 +198,33 @@ fn output_of_exiting_child_survives_a_busy_terminal_lock() {
     }
 }
 
+/// A child that prints and exits at once never loses its output, over
+/// many runs (macOS dropped it intermittently: `cwd_is_honored` saw an
+/// empty grid in CI).
+#[test]
+fn fast_exit_output_survives_repeatedly() {
+    for round in 0..20 {
+        let marker = format!("FAST-{round}");
+        let mut session = PtySession::spawn(
+            LaunchSpec {
+                program: helper(),
+                args: vec!["argv".to_string(), marker.clone()],
+                cwd: None,
+                env: Vec::new(),
+            },
+            24,
+            80,
+            cap(),
+        )
+        .expect("helper spawns over a real PTY");
+        pump(&mut session, |text, events| {
+            text.contains(&format!("A:1 {marker}")) && exited_with(events, 0)
+        })
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        session.close();
+    }
+}
+
 #[test]
 fn cwd_is_honored() {
     // Canonical: macOS's temp dir is behind a symlink (/var -> /private/var)
