@@ -443,6 +443,26 @@ scenario_paneexit() {
     pass paneexit
 }
 
+# Split with no room (audit RV6): splitting a two-row window twice gives
+# the newest pane no rows. It must get its own session once the window grows, not
+# stay dead or share the old pane's snapshot slot.
+scenario_tinysplit() {
+    local dir="$OUT/tinysplit"; mkdir -p "$dir/home/.config/nora"
+    printf '[window]\ncolumns = 60\nlines = 2\n' >"$dir/home/.config/nora/config.toml"
+    launch tinysplit bash --norc --noprofile || { fail tinysplit "no window"; return; }
+    xdotool type --delay 15 "stty size > $dir/first.txt"; xdotool key Return
+    wait_file "$dir/first.txt" || { finish; fail tinysplit "no initial size"; return; }
+    xdotool key ctrl+shift+backslash; sleep 0.5
+    xdotool key ctrl+shift+backslash; sleep 1
+    xdotool windowsize --sync "$WIN" 700 500 2>/dev/null
+    sleep 1.5
+    xdotool type --delay 15 "stty size > $dir/new.txt"; xdotool key Return
+    wait_file "$dir/new.txt" || { finish; fail tinysplit "the new pane has no session after growing"; return; }
+    finish
+    echo "  first pane: $(cat "$dir/first.txt"); new pane after growing: $(cat "$dir/new.txt")"
+    pass tinysplit
+}
+
 # Search: the bar shows the query and position, matches in the scrollback
 # are found and scrolled into view (marked with the selection color), and
 # nothing typed into search (text, Space, arrows, Tab) reaches the shell.
@@ -657,7 +677,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes paneexit search config reports hyperlink idle vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

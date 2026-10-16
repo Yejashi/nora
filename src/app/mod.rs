@@ -593,7 +593,12 @@ struct WinApp {
     tab_layouts: std::collections::HashMap<TabId, nora::layout::Layout>,
     /// N24b: one snapshot slot per pane; the pump stores each pane's latest
     /// snapshot here; `attempt_render` reads the active pane's slot.
+    /// Every pane, the active one included, has its own entry.
     pane_slots: std::collections::HashMap<PaneKey, Arc<Mutex<Option<Snapshot>>>>,
+    /// Panes whose session the pump has been asked to spawn. A pane laid
+    /// out with no room (a split of a one-row pane, a new tab while
+    /// minimized) spawns once it has a non-zero size (audit RV6).
+    pane_spawned: std::collections::HashSet<PaneKey>,
     /// N24b: the last grid sent to the pump as `PumpMsg::Resize` for that
     /// pane; `(0, 0)` = never sent.
     pane_grid: std::collections::HashMap<PaneKey, (u16, u16)>,
@@ -725,6 +730,7 @@ pub fn run_windowed(
         layout,
         tab_layouts,
         pane_slots,
+        pane_spawned: std::collections::HashSet::from([first_pane]),
         pane_grid,
         pane_exit,
         pane_render,
@@ -797,6 +803,7 @@ impl WinApp {
         self.pane_last.remove(&pane);
         self.pane_titles.remove(&pane);
         self.pane_slots.remove(&pane);
+        self.pane_spawned.remove(&pane);
         self.pane_grid.remove(&pane);
         self.pane_exit.remove(&pane);
         self.pane_render.remove(&pane);
@@ -843,10 +850,14 @@ impl WinApp {
     }
 
     fn load_active_pane(&mut self, pane: PaneKey) {
+        // The pane's own slot, kept in the map; never another pane's
+        // (a pane without one used to share the previous pane's, audit
+        // RV6).
         self.slot = self
             .pane_slots
-            .remove(&pane)
-            .unwrap_or_else(|| self.slot.clone());
+            .entry(pane)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
         self.last_grid = self.pane_grid.remove(&pane).unwrap_or((0, 0));
         self.child_exit = self.pane_exit.remove(&pane).unwrap_or(None);
         self.state = self.pane_render.remove(&pane).unwrap_or_default();
@@ -907,6 +918,12 @@ impl WinApp {
         for (tab, layout) in layouts {
             for (pane_id, _x, _y, pw, ph) in layout.compute_rectangles(cols, rows) {
                 let pane = PaneKey { tab, pane: pane_id };
+                if !self.pane_spawned.contains(&pane) {
+                    if pw > 0 && ph > 0 {
+                        self.spawn_pane(pane, pw, ph);
+                    }
+                    continue;
+                }
                 let prev = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
                 if prev != (pw, ph) {
                     self.pane_grid.insert(pane, (pw, ph));
@@ -918,6 +935,24 @@ impl WinApp {
                 }
             }
         }
+    }
+
+    /// Ask the pump to spawn `pane`'s session at `cols` x `rows`, into the
+    /// pane's own snapshot slot.
+    fn spawn_pane(&mut self, pane: PaneKey, cols: u16, rows: u16) {
+        let slot = self
+            .pane_slots
+            .entry(pane)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        self.pane_spawned.insert(pane);
+        self.pane_grid.insert(pane, (cols, rows));
+        let _ = self.pump_commands.send(PumpMsg::NewPane {
+            pane,
+            rows: rows as usize,
+            cols: cols as usize,
+            slot,
+        });
     }
 
     /// Apply a tab command (N23b): the keyboard handler maps Ctrl+T /
@@ -948,13 +983,6 @@ impl WinApp {
         // Compute the new tab's full grid size first (immutable borrows
         // of `self.window` and `self.fonts` end before the mutable
         // operations below).
-        // After the command (the tab count is already updated), so the
-        // new tab's pane gets the area below the tab bar.
-        let new_tab_grid = if cmd == nora::workspace::TabCommand::New {
-            self.pane_area()
-        } else {
-            None
-        };
         match cmd {
             nora::workspace::TabCommand::New => {
                 if let Some(tab) = new_active {
@@ -970,17 +998,8 @@ impl WinApp {
                     self.layout = Layout::new();
                     self.tab_layouts.insert(tab, self.layout.clone());
                     self.init_pane_state(new_pane);
-                    if let Some((cols, rows)) = new_tab_grid {
-                        let slot: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
-                        self.pane_slots.insert(new_pane, slot.clone());
-                        self.pane_grid.insert(new_pane, (cols, rows));
-                        let _ = self.pump_commands.send(PumpMsg::NewPane {
-                            pane: new_pane,
-                            rows: rows as usize,
-                            cols: cols as usize,
-                            slot,
-                        });
-                    }
+                    // Its session spawns in `resize_all_panes` below, once
+                    // the pane area is known and non-zero.
                     self.load_active_pane(new_pane);
                 }
             }
@@ -1044,20 +1063,9 @@ impl WinApp {
             pane: new_pane_id,
         };
         self.init_pane_state(new_pane);
-        // The layout changed: recompute every pane's grid and spawn the new
-        // pane's session at its (now known) size.
+        // The layout changed: recompute every pane's grid; the new pane's
+        // session spawns at its size, or later once it has room.
         self.resize_all_panes();
-        let (cols, rows) = self.pane_grid.get(&new_pane).copied().unwrap_or((0, 0));
-        if cols > 0 && rows > 0 {
-            let slot: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
-            self.pane_slots.insert(new_pane, slot.clone());
-            let _ = self.pump_commands.send(PumpMsg::NewPane {
-                pane: new_pane,
-                rows: rows as usize,
-                cols: cols as usize,
-                slot,
-            });
-        }
         // The new pane becomes active; load its (fresh) state.
         self.load_active_pane(new_pane);
     }
