@@ -141,6 +141,9 @@ pub enum AppEvent {
     /// The background font loader finished the full font system (sent by
     /// the window's own loader thread, not the pump).
     FontsReady,
+    /// A termination signal arrived (SIGTERM, SIGHUP, SIGINT): close the
+    /// window as if asked to (sent by the signal thread, not the pump).
+    Terminate,
     /// The configuration file changed on disk (sent by the window's file
     /// watcher, not the pump).
     ConfigChanged,

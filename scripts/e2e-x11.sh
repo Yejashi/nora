@@ -686,7 +686,8 @@ RC
 
 # Inline suggestions (ADR-013 step 4): a command run once is suggested
 # (dim ghost text) for a prefix; Right types it, and the shell runs
-# exactly the suggestion. The history is saved under the state directory.
+# exactly the suggestion. SIGTERM then closes nora in order, and the
+# history is saved under the state directory.
 scenario_suggest() {
     have zsh suggest || return
     local dir="$OUT/suggest"; mkdir -p "$dir/zdot"
@@ -709,9 +710,10 @@ RC
     xdotool key Return
     wait_lines() { [ "$(wc -l <"$dir/out.txt" 2>/dev/null)" -ge 2 ]; }
     for _ in $(seq 1 30); do wait_lines && break; sleep 0.1; done
-    # Exit the shell: the window closes and nora saves its history.
-    xdotool type --delay 30 "exit"; xdotool key Return
-    for _ in $(seq 1 50); do kill -0 "$NORA_PID" 2>/dev/null || break; sleep 0.1; done
+    # SIGTERM closes nora in order: sessions closed, history saved.
+    kill -TERM "$NORA_PID"
+    local exited=no
+    for _ in $(seq 1 50); do kill -0 "$NORA_PID" 2>/dev/null || { exited=yes; break; }; sleep 0.1; done
     finish
     local ghost plain hist="$OUT/suggest/home/.local/state/nora/history"
     ghost=$(count_color "$dir/ghost.png" '#666666')
@@ -720,6 +722,8 @@ RC
     [ "$ghost" -gt $((plain + 50)) ] || { fail suggest "no ghost text drawn"; return; }
     [ "$(cat "$dir/out.txt")" = "$(printf 'ghost-alpha-1\nghost-alpha-1')" ] \
         || { fail suggest "accepted command differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
+    [ "$exited" = yes ] || { fail suggest "nora did not exit within 5 s of SIGTERM"; return; }
+    grep -q "termination signal" "$OUT/suggest/nora.log" || { fail suggest "SIGTERM not handled"; return; }
     grep -q "echo ghost-alpha-1" "$hist" 2>/dev/null || { fail suggest "history not saved at $hist"; return; }
     pass suggest
 }

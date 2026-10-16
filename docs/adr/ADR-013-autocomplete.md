@@ -144,7 +144,8 @@ Option 4, with these parts:
    outside the input phase); the alternate screen and an in-flight paste
    are checked too. **Open:** the ECHO-off check (the PTY master is owned
    by the event loop); the IME case is unverified with a real input
-   method; SIGTERM ends nora without saving (no signal handling yet).
+   method. (SIGTERM/SIGHUP/SIGINT now close nora in order and save the
+   history: `src/signals.rs`, Unix only.)
 5. Measure keystroke-to-ghost-text latency and the cost of the zsh hook.
 
 ## Gate

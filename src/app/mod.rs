@@ -1565,7 +1565,7 @@ impl WinApp {
                 let _ = pane;
             }
             // Handled in `user_event` before routing.
-            AppEvent::FontsReady | AppEvent::ConfigChanged => {}
+            AppEvent::FontsReady | AppEvent::ConfigChanged | AppEvent::Terminate => {}
             AppEvent::Suggestion { pane, suffix } => {
                 let changed = match suffix {
                     Some(suffix) => self.suggestions.insert(pane, suffix.clone()) != Some(suffix),
@@ -2141,6 +2141,12 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        if let AppEvent::Terminate = event {
+            eprintln!("nora: termination signal, closing");
+            self.stop.store(true, Ordering::Relaxed);
+            event_loop.exit();
+            return;
+        }
         if let AppEvent::ConfigChanged = event {
             self.reload_config();
             if let Some(window) = self.window.as_ref() {

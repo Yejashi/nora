@@ -425,6 +425,14 @@ fn run_windowed(
     let (pump_commands, pump_commands_rx) =
         std::sync::mpsc::channel::<nora::session::pump::PumpMsg>();
     let proxy = event_loop.create_proxy();
+    // SIGTERM/SIGHUP/SIGINT close the window in order (sessions closed,
+    // history saved); a second one exits at once.
+    let signal_proxy = proxy.clone();
+    if let Err(error) = nora::signals::on_termination(move |_| {
+        let _ = signal_proxy.send_event(nora::session::pump::AppEvent::Terminate);
+    }) {
+        eprintln!("nora: signal handling unavailable: {error}");
+    }
     // The pump's own wake sender (PTY output wakes it), and one kept here
     // to wake it for shutdown.
     let pump_wake = pump_commands.clone();
