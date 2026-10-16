@@ -119,6 +119,14 @@ Option 4, with these parts:
    e2e `zshell` checks the buffer sequence through typing, Tab completion,
    Ctrl+U, Ctrl+Y and Up (`NORA_TRACE_SHELL=1` logs each report).
 3. Suggestion model with frecency; unit tests on ranking.
+   **Done 2026-10-16** (history part): `src/suggest.rs`. Score = count x
+   recency (4 within an hour, 2 within a day, 1 within a week, else 0.5),
+   x 3 when it ran in the current directory, x (0.2 + 0.8 x success
+   ratio). Not recorded: lines starting with a space, multi-line or with
+   control characters, over 4 KiB. Caps: 5 000 entries, 2 MiB; the lowest
+   ranked is evicted. File `$XDG_STATE_HOME/nora/history` (mode 0600,
+   atomic rename, damaged lines skipped). Path and PATH candidates
+   (sources b and c) are not implemented yet. Tests: `tests/suggest.rs`.
 4. Rendering and acceptance; e2e: a suggestion appears for a prefix of a
    previously run command, Right accepts it, and the command executed is
    exactly the suggestion; no suggestion in vim, at a `read -s` prompt, or
