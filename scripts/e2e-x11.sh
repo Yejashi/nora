@@ -690,13 +690,13 @@ RC
 # history is saved under the state directory.
 scenario_suggest() {
     have zsh suggest || return
-    local dir="$OUT/suggest"; mkdir -p "$dir/zdot"
+    local dir="$OUT/suggest"; rm -rf "$dir"; mkdir -p "$dir/zdot"
     cat >"$dir/zdot/.zshrc" <<RC
 PROMPT='%% '
 bindkey -e
 source "$ROOT/shell/nora-zsh.zsh"
 RC
-    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch suggest zsh -d -i \
+    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 NORA_TRACE_LATENCY=1 launch suggest zsh -d -i \
         || { fail suggest "no window"; return; }
     for _ in $(seq 1 100); do
         grep -q '^shell: buffer "" cursor 0' "$OUT/suggest/nora.log" && break
@@ -719,6 +719,7 @@ RC
     ghost=$(count_color "$dir/ghost.png" '#666666')
     plain=$(count_color "$dir/plain.png" '#666666')
     echo "  ghost px: $ghost (before: $plain); out: $(tr '\n' '|' <"$dir/out.txt")"
+    echo "  key-to-suggestion ms: $(grep -o 'key-to-suggestion [0-9.]*' "$OUT/suggest/nora.log" | awk '{print $2}' | tr '\n' ' ')"
     [ "$ghost" -gt $((plain + 50)) ] || { fail suggest "no ghost text drawn"; return; }
     [ "$(cat "$dir/out.txt")" = "$(printf 'ghost-alpha-1\nghost-alpha-1')" ] \
         || { fail suggest "accepted command differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }

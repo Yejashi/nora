@@ -147,6 +147,9 @@ Option 4, with these parts:
    method. (SIGTERM/SIGHUP/SIGINT now close nora in order and save the
    history: `src/signals.rs`, Unix only.)
 5. Measure keystroke-to-ghost-text latency and the cost of the zsh hook.
+   **Done 2026-10-16:** docs/performance/2026-10-16-suggestions.md (hook
+   0.1-0.5 ms per keystroke by buffer length; key to suggestion on screen
+   median 1.4 ms, max 3.5 ms on a software GPU).
 
 ## Gate
 

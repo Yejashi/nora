@@ -522,6 +522,10 @@ struct WinApp {
     /// The same, until a frame with fresh pane content is presented
     /// (key-to-fresh: view changes the pump applies, e.g. scrollback).
     trace_fresh_key_at: Option<std::time::Instant>,
+    /// The same, until a frame shows a new inline suggestion
+    /// (key-to-suggestion, ADR-013), and whether one is waiting to show.
+    trace_suggest_key_at: Option<std::time::Instant>,
+    trace_suggest_pending: bool,
     trace_latency: bool,
     /// `NORA_TRACE_FRAMES`: log a per-phase timing line for every frame.
     trace_frames: bool,
@@ -726,6 +730,8 @@ pub fn run_windowed(
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
         trace_fresh_key_at: None,
+        trace_suggest_key_at: None,
+        trace_suggest_pending: false,
         trace_latency: std::env::var_os("NORA_TRACE_LATENCY").is_some(),
         trace_frames: std::env::var_os("NORA_TRACE_FRAMES").is_some(),
         search: nora::search::SearchUi::new(),
@@ -1567,10 +1573,14 @@ impl WinApp {
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged | AppEvent::Terminate => {}
             AppEvent::Suggestion { pane, suffix } => {
+                let shown = suffix.is_some();
                 let changed = match suffix {
                     Some(suffix) => self.suggestions.insert(pane, suffix.clone()) != Some(suffix),
                     None => self.suggestions.remove(&pane).is_some(),
                 };
+                if self.trace_latency && shown && changed {
+                    self.trace_suggest_pending = true;
+                }
                 if changed
                     && self.active_pane_key() == Some(pane)
                     && let Some(window) = self.window.as_ref()
@@ -1994,6 +2004,14 @@ impl WinApp {
                         at.elapsed().as_secs_f64() * 1000.0
                     );
                 }
+                if std::mem::take(&mut self.trace_suggest_pending)
+                    && let Some(at) = self.trace_suggest_key_at.take()
+                {
+                    eprintln!(
+                        "latency: key-to-suggestion {:.3} ms",
+                        at.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 if fresh_any && let Some(at) = self.trace_fresh_key_at.take() {
                     eprintln!(
                         "latency: key-to-fresh {:.3} ms",
@@ -2370,6 +2388,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     let now = std::time::Instant::now();
                     self.trace_key_at.get_or_insert(now);
                     self.trace_fresh_key_at.get_or_insert(now);
+                    // The latest key: a suggestion answers the keystroke
+                    // that produced its buffer.
+                    self.trace_suggest_key_at = Some(now);
                 }
                 // Local UI bindings (input::bindings). A bound chord whose
                 // action has nothing to act on falls through to the
