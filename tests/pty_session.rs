@@ -79,9 +79,12 @@ fn pump(
             return Ok(());
         }
         if Instant::now() > deadline {
+            // Trailing blanks trimmed so the message (a CI annotation)
+            // keeps the content.
+            let grid = last.trim_end();
             return Err(format!(
-                "deadline exceeded; last grid: {last:?}; saw {} event(s)",
-                events.len()
+                "deadline exceeded; last grid ({} chars): {grid:?}; events: {events:?}",
+                grid.len()
             ));
         }
         thread::sleep(POLL);
