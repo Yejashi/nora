@@ -7,7 +7,7 @@ This record re-establishes acceptance per roadmap milestone
 **accepted** (acceptance criteria met, evidence in CI or recorded),
 **partial** (some criteria open, listed), **open**.
 
-Evidence sources: `scripts/e2e-x11.sh` (24 scenarios in a real X11 window
+Evidence sources: `scripts/e2e-x11.sh` (25 scenarios in a real X11 window
 with real key and mouse events, run in CI job `e2e-x11`), the test suite
 (about 600 tests), `scripts/perf.sh`, and the audit table of fixes
 (docs/audit/2026-10-15-runtime-audit.md).
@@ -27,7 +27,7 @@ with real key and mouse events, run in CI job `e2e-x11`), the test suite
 | M3 performance | accepted (baseline recorded) | docs/performance/2026-10-15-baseline.md, input latency record | window-path throughput ~56 MiB/s vs ~110 MiB/s headless (snapshot under the terminal lock, audit P8); per-frame allocations not measured |
 | M4 customization | accepted | e2e `config` (startup, live reload incl. palette repaint of an idle pane, invalid edit), schema tests; RV5, RV7 fixed | — |
 | M5 cross-platform | partial | Linux X11/Wayland verified; Windows: build + headless tests green in CI; macOS: build, unit, platform-neutral and PTY tests green in CI (first full green run `80047545`) | `cwd_is_honored` failed once on macOS (suspected flaky; panic messages now reach CI annotations); macOS/Windows interactive use untested; no macOS/Windows packaging |
-| M6 autocomplete | design accepted (ADR-013) | — | implementation started 2026-10-16 (M1-M4 accepted; M5's open items are interactive checks on other OSes, not blockers for a Linux-first feature) |
+| M6 autocomplete | partial (prototype plan steps 1-5 done) | `tests/shell_input.rs`, `tests/suggest.rs`, PTY test; e2e `zshell` (buffer follows typing, completion, kill/yank, history recall), `suggest` (ghost text, Right runs exactly the suggestion, path completion, history saved on SIGTERM); docs/performance/2026-10-16-suggestions.md | ECHO-off check not implemented; IME case unverified with a real input method; zsh only (bash needs ble.sh, fish not enabled); OSC number 6973 not yet checked against other terminals' registries |
 
 Real applications exercised end to end: vim (insert, Escape, `:wq`), tmux
 (status line and pane), htop (colors and meters).
