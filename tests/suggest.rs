@@ -151,3 +151,120 @@ fn history_file_round_trips_and_tolerates_damage() {
     assert!(History::load(&path).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+mod words {
+    use nora::suggest::{complete_word, path_executables};
+
+    fn tree(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nora-words-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["project/src", "project/scripts", "home/docs", "bin"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "project/README.md",
+            "project/.hidden",
+            "project/src/main.rs",
+            "home/docs/notes.txt",
+        ] {
+            std::fs::write(root.join(file), "").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn paths_complete_unambiguously() {
+        let root = tree("paths");
+        let cwd = root.join("project");
+        let cwd = cwd.to_str();
+        let home = root.join("home");
+        let home = home.to_str();
+        let none: &[String] = &[];
+        assert_eq!(
+            complete_word("cat REA", cwd, home, none).as_deref(),
+            Some("DME.md")
+        );
+        assert_eq!(
+            complete_word("ls sr", cwd, home, none).as_deref(),
+            Some("c/"),
+            "a directory"
+        );
+        assert_eq!(
+            complete_word("ls s", cwd, home, none),
+            None,
+            "src and scripts: ambiguous"
+        );
+        assert_eq!(
+            complete_word("ls sc", cwd, home, none).as_deref(),
+            Some("ripts/")
+        );
+        assert_eq!(
+            complete_word("vim src/ma", cwd, home, none).as_deref(),
+            Some("in.rs")
+        );
+        assert_eq!(
+            complete_word("cat ~/docs/no", cwd, home, none).as_deref(),
+            Some("tes.txt")
+        );
+        let abs = format!("cat {}/project/RE", root.display());
+        assert_eq!(
+            complete_word(&abs, cwd, home, none).as_deref(),
+            Some("ADME.md")
+        );
+        assert_eq!(
+            complete_word("cat .hi", cwd, home, none).as_deref(),
+            Some("dden")
+        );
+        assert_eq!(complete_word("cat ", cwd, home, none), None, "no word");
+        assert_eq!(complete_word("cat 'REA", cwd, home, none), None, "quoted");
+        assert_eq!(complete_word("cat REA", None, home, none), None, "no cwd");
+        assert_eq!(complete_word("cat zzz", cwd, home, none), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn first_word_completes_from_path() {
+        let exes: Vec<String> = ["cargo", "cargo-clippy", "cat", "htop"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            complete_word("ht", None, None, &exes).as_deref(),
+            Some("op")
+        );
+        assert_eq!(
+            complete_word("car", None, None, &exes).as_deref(),
+            Some("go"),
+            "common prefix"
+        );
+        assert_eq!(
+            complete_word("ca", None, None, &exes),
+            None,
+            "cargo and cat"
+        );
+        assert_eq!(
+            complete_word("sudo ht", None, None, &exes),
+            None,
+            "only the first word"
+        );
+        assert_eq!(
+            complete_word("  ht", None, None, &exes).as_deref(),
+            Some("op")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_executables_lists_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tree("exes");
+        let bin = root.join("bin");
+        for (name, mode) in [("tool-a", 0o755), ("data", 0o644)] {
+            let path = bin.join(name);
+            std::fs::write(&path, "").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let path_var = std::env::join_paths([bin.clone(), bin, root.join("missing")]).unwrap();
+        assert_eq!(path_executables(&path_var), vec!["tool-a".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -125,8 +125,15 @@ Option 4, with these parts:
    ratio). Not recorded: lines starting with a space, multi-line or with
    control characters, over 4 KiB. Caps: 5 000 entries, 2 MiB; the lowest
    ranked is evicted. File `$XDG_STATE_HOME/nora/history` (mode 0600,
-   atomic rename, damaged lines skipped). Path and PATH candidates
-   (sources b and c) are not implemented yet. Tests: `tests/suggest.rs`.
+   atomic rename, damaged lines skipped). Tests: `tests/suggest.rs`.
+   **Sources b and c, done 2026-10-16:** when history has no match, the
+   last word completes as a path (cwd from OSC 7, `~/` from HOME) or, as
+   the first word, as an executable on PATH; only an unambiguous extension
+   (the matches' common prefix, `/` after a single directory), no hidden
+   names unless typed, none for words with quotes, escapes or globs. At
+   most 4 096 entries are read per directory. PATH is listed on a
+   background thread (cold scan measured at 223 ms for 1 921 executables
+   in 16 directories, warm 13 ms) and again every 5 minutes.
 4. Rendering and acceptance; e2e: a suggestion appears for a prefix of a
    previously run command, Right accepts it, and the command executed is
    exactly the suggestion; no suggestion in vim, at a `read -s` prompt, or

@@ -67,7 +67,8 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
   command line and exit status (`OSC 133;C;cmdline_url`, `OSC 133;D`) and
   the line editor's buffer on every redraw (`OSC 6973`); nora suggests the
   best match from your history (frequency, recency, current directory,
-  past failures) as dim text after the cursor. Right or End types it,
+  past failures), else an unambiguous path or command-name completion, as
+  dim text after the cursor. Right or End types it,
   Alt+Right one word. Lines starting with a space are never recorded
   ([ADR-013](docs/adr/ADR-013-autocomplete.md))
 - Hyperlinks (OSC 8): Ctrl+click opens http(s), mailto, file and ftp links

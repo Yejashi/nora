@@ -472,11 +472,19 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The suggestion history and where it is saved (ADR-013).
+/// How often the PATH executables are listed again.
+const EXECUTABLES_REFRESH: Duration = Duration::from_secs(300);
+
+/// The suggestion history and where it is saved, and the executables on
+/// PATH for first-word completion (ADR-013).
 struct Suggestions {
     history: crate::suggest::History,
     path: Option<std::path::PathBuf>,
     last_save: Instant,
+    /// Listed on a background thread (a cold scan of PATH takes hundreds
+    /// of milliseconds); empty until the first listing finishes.
+    executables: Arc<Mutex<Arc<Vec<String>>>>,
+    executables_at: Option<Instant>,
 }
 
 impl Suggestions {
@@ -491,11 +499,53 @@ impl Suggestions {
             }),
             None => crate::suggest::History::new(),
         };
-        Self {
+        let mut suggestions = Self {
             history,
             path,
             last_save: Instant::now(),
+            executables: Arc::new(Mutex::new(Arc::new(Vec::new()))),
+            executables_at: None,
+        };
+        suggestions.refresh_executables();
+        suggestions
+    }
+
+    /// List PATH's executables again in the background when the last
+    /// listing started more than [`EXECUTABLES_REFRESH`] ago.
+    fn refresh_executables(&mut self) {
+        if self
+            .executables_at
+            .is_some_and(|at| at.elapsed() < EXECUTABLES_REFRESH)
+        {
+            return;
         }
+        self.executables_at = Some(Instant::now());
+        let Some(path_var) = std::env::var_os("PATH") else {
+            return;
+        };
+        let out = self.executables.clone();
+        let _ = std::thread::Builder::new()
+            .name("nora-path-scan".to_string())
+            .spawn(move || {
+                let names = Arc::new(crate::suggest::path_executables(&path_var));
+                *out.lock().unwrap_or_else(PoisonError::into_inner) = names;
+            });
+    }
+
+    /// The best suggestion for `buffer`: history first, else an
+    /// unambiguous path or executable completion of the last word.
+    fn suggest(&mut self, buffer: &str, cwd: Option<&str>, now: u64) -> Option<String> {
+        if let Some(full) = self.history.suggest(buffer, cwd, now) {
+            return Some(full[buffer.len()..].to_string());
+        }
+        self.refresh_executables();
+        let executables = self
+            .executables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let home = std::env::var("HOME").ok();
+        crate::suggest::complete_word(buffer, cwd, home.as_deref(), &executables)
     }
 
     /// Save when changed, at most every `interval`.
@@ -535,15 +585,13 @@ fn update_suggestion(
     if buffer == pane_pump.shell_buffer {
         return;
     }
-    let suffix = match (&buffer, suggestions.as_ref()) {
+    let suffix = match (&buffer, suggestions.as_mut()) {
         (Some(b), Some(s))
             if b.cursor_at_end()
                 && !engine.modes().contains(TermMode::ALT_SCREEN)
                 && pane_pump.paste_block.is_none() =>
         {
-            s.history
-                .suggest(&b.text, engine.cwd().as_deref(), now)
-                .map(|full| full[b.text.len()..].to_string())
+            s.suggest(&b.text, engine.cwd().as_deref(), now)
         }
         _ => None,
     };

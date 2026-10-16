@@ -333,3 +333,132 @@ fn unescape(s: &str) -> Option<String> {
     out.push_str(rest);
     Some(out)
 }
+
+/// Most directory entries read for one completion (a huge directory must
+/// not stall the pump).
+pub const MAX_DIR_ENTRIES: usize = 4096;
+
+/// A completion for the buffer's last word when history has none (ADR-013
+/// sources b and c): a path relative to `cwd` (`~/` from `home`), or for
+/// the first word without a `/`, an executable from `executables`
+/// (sorted). Only an unambiguous extension is offered: the longest common
+/// prefix of the matches, plus `/` for a single directory. Words with
+/// quotes or backslashes get none (their shell meaning differs from the
+/// text), nor do hidden names unless the word starts them with `.`.
+pub fn complete_word(
+    buffer: &str,
+    cwd: Option<&str>,
+    home: Option<&str>,
+    executables: &[String],
+) -> Option<String> {
+    if buffer.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let start = buffer.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    let word = &buffer[start..];
+    if word.is_empty() || word.contains(['\'', '"', '\\', '$', '`', '*', '?']) {
+        return None;
+    }
+    let first_word = buffer[..start].trim().is_empty();
+    if first_word && !word.contains('/') {
+        let matches = executables.iter().filter(|e| e.starts_with(word));
+        return common_extension(word, matches.map(String::as_str), false);
+    }
+    let (dir_part, name) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word),
+    };
+    let dir = if let Some(rest) = dir_part.strip_prefix("~/") {
+        std::path::Path::new(home?).join(rest)
+    } else if dir_part.starts_with('/') {
+        PathBuf::from(dir_part)
+    } else {
+        std::path::Path::new(cwd?).join(dir_part)
+    };
+    let mut names = Vec::new();
+    let mut single_is_dir = false;
+    for entry in std::fs::read_dir(&dir)
+        .ok()?
+        .take(MAX_DIR_ENTRIES)
+        .flatten()
+    {
+        let Ok(entry_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry_name.starts_with(name) || (entry_name.starts_with('.') && !name.starts_with('.'))
+        {
+            continue;
+        }
+        // The entry's own type (no `stat`), following a symlink only.
+        single_is_dir = match entry.file_type() {
+            Ok(t) if t.is_symlink() => entry.path().is_dir(),
+            Ok(t) => t.is_dir(),
+            Err(_) => false,
+        };
+        names.push(entry_name);
+    }
+    let dir_slash = names.len() == 1 && single_is_dir;
+    common_extension(name, names.iter().map(String::as_str), dir_slash)
+}
+
+/// What the longest common prefix of `matches` adds to `typed` (plus `/`
+/// when asked), or `None` when it adds nothing.
+fn common_extension<'a>(
+    typed: &str,
+    matches: impl Iterator<Item = &'a str>,
+    slash: bool,
+) -> Option<String> {
+    let mut common: Option<&str> = None;
+    for m in matches {
+        common = Some(match common {
+            None => m,
+            Some(c) => {
+                let len = c
+                    .char_indices()
+                    .zip(m.chars())
+                    .find(|((_, a), b)| a != b)
+                    .map_or(c.len().min(m.len()), |((i, _), _)| i);
+                &c[..len]
+            }
+        });
+    }
+    let mut extension = common?.get(typed.len()..)?.to_string();
+    if slash {
+        extension.push('/');
+    }
+    (!extension.is_empty() && !extension.chars().any(char::is_control)).then_some(extension)
+}
+
+/// Executable file names in the directories of `path_var` (a `PATH`
+/// value), sorted and deduplicated, at most [`MAX_DIR_ENTRIES`] read per
+/// directory.
+pub fn path_executables(path_var: &std::ffi::OsStr) -> Vec<String> {
+    let mut names = Vec::new();
+    for dir in std::env::split_paths(path_var) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.take(MAX_DIR_ENTRIES).flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if is_executable(&entry.path()) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}

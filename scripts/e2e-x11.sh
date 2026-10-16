@@ -710,6 +710,10 @@ RC
     xdotool key Return
     wait_lines() { [ "$(wc -l <"$dir/out.txt" 2>/dev/null)" -ge 2 ]; }
     for _ in $(seq 1 30); do wait_lines && break; sleep 0.1; done
+    # No history match: the last word completes as a path (zsh's cwd is
+    # the repository).
+    xdotool type --delay 30 "ls scripts/e2e-x1"; sleep 0.7
+    xdotool key ctrl+u; sleep 0.3
     # SIGTERM closes nora in order: sessions closed, history saved.
     kill -TERM "$NORA_PID"
     local exited=no
@@ -723,6 +727,7 @@ RC
     [ "$ghost" -gt $((plain + 50)) ] || { fail suggest "no ghost text drawn"; return; }
     [ "$(cat "$dir/out.txt")" = "$(printf 'ghost-alpha-1\nghost-alpha-1')" ] \
         || { fail suggest "accepted command differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
+    grep -q '^shell: suggestion Some("1.sh")' "$OUT/suggest/nora.log" || { fail suggest "no path completion for scripts/e2e-x1"; return; }
     [ "$exited" = yes ] || { fail suggest "nora did not exit within 5 s of SIGTERM"; return; }
     grep -q "termination signal" "$OUT/suggest/nora.log" || { fail suggest "SIGTERM not handled"; return; }
     grep -q "echo ghost-alpha-1" "$hist" 2>/dev/null || { fail suggest "history not saved at $hist"; return; }
