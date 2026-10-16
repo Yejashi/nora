@@ -82,6 +82,12 @@ fn debug_enabled() -> bool {
     std::env::var_os("NORA_DEBUG").is_some()
 }
 
+/// `NORA_TRACE_SHELL`: log the shell integration's buffer reports.
+fn trace_shell() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NORA_TRACE_SHELL").is_some())
+}
+
 /// A pane's identity (N24b): its tab and its position within that tab's
 /// layout. The pump owns one session per pane, so a pane is addressed by
 /// both parts — two tabs may each have a `PaneId(0)`.
@@ -421,6 +427,9 @@ struct PanePump {
     drain_deadline: Option<Instant>,
     /// The child's exit status, captured when first terminating (N12a).
     exit_status: Option<ExitStatus>,
+    /// The shell's last reported editor buffer (ADR-013), for change
+    /// detection.
+    shell_buffer: Option<crate::shell_input::LineBuffer>,
 }
 
 impl PanePump {
@@ -437,6 +446,7 @@ impl PanePump {
             draining: false,
             drain_deadline: None,
             exit_status: None,
+            shell_buffer: None,
         }
     }
 }
@@ -525,6 +535,19 @@ fn tick_pane(
             eprintln!("debug: pump: stored snapshot rows={rows} cols={cols}");
         }
         let _ = events.send_event(AppEvent::DirtyPulse { pane });
+    }
+
+    // The shell's editor buffer (ADR-013). `NORA_TRACE_SHELL` logs each
+    // change, the evidence the e2e shell checks read.
+    let buffer = pane_pump.session.engine().shell_buffer();
+    if buffer != pane_pump.shell_buffer {
+        if trace_shell() {
+            match &buffer {
+                Some(b) => eprintln!("shell: buffer {:?} cursor {}", b.text, b.cursor),
+                None => eprintln!("shell: buffer none"),
+            }
+        }
+        pane_pump.shell_buffer = buffer;
     }
 
     // Publish title changes and bells for the window.

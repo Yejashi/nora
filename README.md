@@ -56,12 +56,17 @@ on a machine. `nora -- htop` runs a specific command instead of the shell.
 - Budgets: 32 MiB per image, 128 MiB total, 1,024 image/placement IDs
 - PNG (`f=100`) is documented as a later slice
 
-**Shell integration (N35)** — opt-in via `shell/nora-bash.sh`:
+**Shell integration (N35)** — opt-in via `shell/nora-bash.sh` or
+`shell/nora-zsh.zsh`:
 
 - OSC 133 prompt markers (A/B/C/D)
 - Jump to the previous prompt (Ctrl+Shift+Z) and select the previous
   command's output (Ctrl+Shift+G)
 - Working-directory tracking (OSC 7)
+- zsh only: the executed command line and exit status (`OSC 133;C;cmdline_url`,
+  `OSC 133;D;<status>`) and the line editor's buffer on every redraw
+  (`OSC 6973`), the groundwork for inline suggestions
+  ([ADR-013](docs/adr/ADR-013-autocomplete.md), in progress)
 - Hyperlinks (OSC 8): Ctrl+click opens http(s), mailto, file and ftp links
   with the platform opener (`xdg-open`, `open`, `explorer`)
 
@@ -231,6 +236,12 @@ previous-command selection, working-directory tracking and hyperlinks.
 The hook coexists with other `PROMPT_COMMAND`/DEBUG-trap shell
 integrations (e.g. starship).
 
+For zsh, source `shell/nora-zsh.zsh` from your `.zshrc`. It adds the same
+markers and directory tracking through `precmd`/`preexec`, and reports
+the editor buffer through `zle-line-pre-redraw` (pure zsh, no process per
+keystroke; unchanged buffers are not re-sent). Other terminals ignore the
+reports.
+
 ## Development
 
 Check set (what CI runs; see `.github/workflows/ci.yml`):
@@ -258,7 +269,7 @@ Repository layout:
 | `src/bin/` | `nora_child` test helper, `nora_bench` benchmark tool |
 | `tests/` | Integration tests (one target per feature area) |
 | `vendor/alacritty_terminal/` | Vendored terminal engine (path dependency) |
-| `shell/` | Shell integration script |
+| `shell/` | Shell integration scripts (bash, zsh) |
 | `terminfo/` | `nora` terminfo entry source |
 | `resources/` | Desktop entry, icon, example config |
 | `scripts/` | Clean build, install, uninstall |

@@ -7,7 +7,7 @@ This record re-establishes acceptance per roadmap milestone
 **accepted** (acceptance criteria met, evidence in CI or recorded),
 **partial** (some criteria open, listed), **open**.
 
-Evidence sources: `scripts/e2e-x11.sh` (23 scenarios in a real X11 window
+Evidence sources: `scripts/e2e-x11.sh` (24 scenarios in a real X11 window
 with real key and mouse events, run in CI job `e2e-x11`), the test suite
 (about 600 tests), `scripts/perf.sh`, and the audit table of fixes
 (docs/audit/2026-10-15-runtime-audit.md).

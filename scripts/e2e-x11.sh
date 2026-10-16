@@ -641,6 +641,42 @@ scenario_vim() {
     pass vim
 }
 
+# zsh integration (ADR-013 step 2): the buffer nora receives through
+# OSC 6973 follows zsh's editor through typing, completion, kill/yank and
+# history recall, none of which a keystroke shadow could follow.
+scenario_zshell() {
+    have zsh zshell || return
+    local dir="$OUT/zshell"; mkdir -p "$dir/zdot" "$dir/work"
+    : >"$dir/work/uniquefile.txt"
+    cat >"$dir/zdot/.zshrc" <<RC
+PROMPT='%% '
+HISTSIZE=100
+bindkey -e
+cd "$dir/work"
+source "$ROOT/shell/nora-zsh.zsh"
+RC
+    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch zshell zsh -i \
+        || { fail zshell "no window"; return; }
+    xdotool type --delay 40 "echo one"; xdotool key Return; sleep 0.5
+    xdotool type --delay 40 "cat uniq"; xdotool key Tab; sleep 0.5
+    xdotool key ctrl+u; sleep 0.3
+    xdotool key ctrl+y; sleep 0.3
+    xdotool key ctrl+u; sleep 0.3
+    xdotool key Up; sleep 0.5
+    finish
+    sed -n 's/^shell: buffer //p' "$OUT/zshell/nora.log" >"$dir/buffers.txt"
+    echo "  zsh buffers: $(wc -l <"$dir/buffers.txt") reports, last: $(tail -1 "$dir/buffers.txt")"
+    # Each expected state, in order (other reports may come between).
+    local expect=('"echo one" cursor 8' '"cat uniquefile.txt " cursor 19' '"" cursor 0'
+        '"cat uniquefile.txt " cursor 19' '"" cursor 0' '"echo one" cursor 8')
+    local line i=0
+    while IFS= read -r line; do
+        [ "$i" -lt ${#expect[@]} ] && [ "$line" = "${expect[$i]}" ] && i=$((i + 1))
+    done <"$dir/buffers.txt"
+    [ "$i" -eq ${#expect[@]} ] || { fail zshell "buffer reports diverged at step $((i + 1)) (${expect[$i]}); see $dir/buffers.txt"; return; }
+    pass zshell
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -677,7 +713,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

@@ -114,6 +114,10 @@ Option 4, with these parts:
 2. zsh integration script; e2e: type into a zsh prompt under nora and
    assert the reported buffer matches `$BUFFER` after history recall,
    completion and kill/yank.
+   **Done 2026-10-16:** `shell/nora-zsh.zsh` (base64 and percent encoding
+   in pure zsh; hook widgets need `zle -N` before `add-zle-hook-widget`).
+   e2e `zshell` checks the buffer sequence through typing, Tab completion,
+   Ctrl+U, Ctrl+Y and Up (`NORA_TRACE_SHELL=1` logs each report).
 3. Suggestion model with frecency; unit tests on ranking.
 4. Rendering and acceptance; e2e: a suggestion appears for a prefix of a
    previously run command, Right accepts it, and the command executed is
