@@ -76,6 +76,9 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-lower | Hyperlink click and prompt navigation advertised but not wired | M1.8 (Ctrl+click; Ctrl+Shift+Z / Ctrl+Shift+G) |
 | M3 regression | Redraw loop while scrolled back: empty damage with an off-screen cursor counted as damage, and the post-frame pump wake (M3) turned it into a frame per wake (1703 frames in a short idle run) | fixed (17 frames; e2e `idle` guards it) |
 | I-F10 (rest) | Search covered the visible screen only | fixed: pump searches scrollback + screen, scrolls to and selects the match; IME-committed text goes to the search query |
+| RV3 | Search scanned the whole scrollback under the terminal lock per keystroke and per Enter | fixed (bottom-up scan, 256 lines per lock hold) |
+| RV4 | With more than 10 000 matches, the "newest" shown was the 10 000th oldest | fixed (newest 10 000 kept; test past the cap) |
+| RV9 | Search positions went stale when output scrolled during a search | fixed (hits carry a stable line id: grid line + scrolled - pulled; test) |
 | RV2 | View changes on an idle pane (scroll, search, prompt jump, selection, config) showed ~507 ms late: the pump ticked before applying commands, then slept its idle heartbeat | fixed (re-tick after any command; `NORA_TRACE_LATENCY` key-to-fresh trace; e2e `viewlat`: 507 ms before, 7-9 ms after) |
 | RV1 | Redraw loop while partly scrolled back (cursor on screen): the probe's cursor was in screen rows, the damage in viewport rows, so the always-damaged cursor never matched (2026 frames in 3 s idle) | fixed (viewport-mapped probe cursor; scrollback tests; e2e `idle` partly-scrolled leg, 0 frames) |
 | RV-OSC7 | `ESC]7;file:///%aé BEL` panicked the PTY reader (the pane died); a trailing `%XX` was never decoded | fixed (byte-level decoder; unit + filter tests) |
@@ -174,13 +177,10 @@ search and redraw-loop commits. Not yet fixed; ordered by severity.
 
 | ID | Sev | Finding | Fix direction |
 | --- | --- | --- | --- |
-| RV3 | medium | `search_text` scans the whole scrollback under the terminal lock on every keystroke and every Enter (stalls the reader and the pump with a large history) | Copy lines in chunks releasing the lock, or cache hits per query |
-| RV4 | medium | With more than 10 000 hits, "newest match" is the 10 000th oldest | Scan bottom-up or keep the last N |
 | RV5 | medium | A config color change does not repaint idle panes (retained snapshots hold already-overlaid colors; `Configure` forces no snapshot) | Retain raw colors, or force a snapshot of every pane on `Configure` |
 | RV6 | medium | Splitting a 1-row pane, or while minimized, gives a zero-size pane with no session; it shares the previous pane's slot; same for a new tab with no pane area | Always give the new pane a fresh slot; spawn its session when its size becomes non-zero |
 | RV7 | low | A font reload while the background fallback loader runs can drop the fallback fonts | Tag `FontsReady` with a generation |
 | RV8 | low | While searching, Ctrl+Shift+V pastes into the shell; unbound Ctrl/Alt chords append letters to the query | Route paste to the query; ignore Ctrl/Alt chords in search |
-| RV9 | low (suspected) | Search positions go stale when output arrives during a search | Store hits by absolute line, resolve under one lock |
 | RV10 | low | A match ending in a wide char highlights only its left half; a preedit can overlap a wide glyph starting one column earlier | Extend `end` over the spacer; clear the overlapped glyph |
 
 Also noted: a legacy `[keys]` binding with an unknown action now rejects

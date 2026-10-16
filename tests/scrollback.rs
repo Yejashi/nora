@@ -642,7 +642,10 @@ fn search_finds_matches_in_scrollback_and_scrolls_to_them() {
     let hits = engine.search_text("needle");
     assert_eq!(hits.len(), 1, "case-insensitive for a lowercase query");
     let hit = hits[0];
-    assert!(hit.line < 0, "the match is in the scrollback: {hit:?}");
+    assert!(
+        engine.search_hit_line(hit).is_some_and(|line| line < 0),
+        "the match is in the scrollback: {hit:?}"
+    );
     assert_eq!((hit.start, hit.end), (4, 9));
     assert!(
         engine.search_text("Needle").is_empty(),
@@ -654,6 +657,71 @@ fn search_finds_matches_in_scrollback_and_scrolls_to_them() {
     let snap = engine.snapshot();
     let selected: usize = snap.selected.iter().filter(|s| **s).count();
     assert_eq!(selected, 6, "the six cells of NEEDLE are selected");
+}
+
+/// Audit RV4: with more matches than the cap, the newest are kept (the
+/// pump starts at the last hit, which must be the bottom-most match).
+/// The scan crosses many lock chunks (audit RV3).
+#[test]
+fn search_keeps_the_newest_matches_past_the_cap() {
+    let total = nora::engine::MAX_SEARCH_HITS + 2_000;
+    let mut engine = Engine::with_history(5, 30, total + 100);
+    let mut stream = Vec::new();
+    for i in 0..total {
+        stream.extend_from_slice(format!("needle {i}\r\n").as_bytes());
+    }
+    engine.feed(&stream);
+    let hits = engine.search_text("needle");
+    assert_eq!(hits.len(), nora::engine::MAX_SEARCH_HITS);
+    let lines: Vec<i32> = hits
+        .iter()
+        .map(|h| engine.search_hit_line(*h).expect("in history"))
+        .collect();
+    assert!(
+        lines.windows(2).all(|w| w[0] < w[1]),
+        "top to bottom, no repeats"
+    );
+    // The last output line ("needle {total-1}") sits just above the
+    // cursor's (empty) bottom row.
+    assert_eq!(*lines.last().unwrap(), 3, "the newest match is kept");
+    engine.show_search_hit(*hits.last().unwrap());
+    let text: String = engine.snapshot().cells.iter().map(|c| c.ch).collect();
+    assert!(text.contains(&format!("needle {}", total - 1)), "{text:?}");
+}
+
+/// Audit RV9: a hit stays on its line while output scrolls the screen
+/// between the search and showing the hit.
+#[test]
+fn search_hit_survives_new_output() {
+    let mut engine = Engine::with_history(5, 30, 200);
+    let mut stream = Vec::new();
+    for i in 0..20 {
+        let line = if i == 3 {
+            "the NEEDLE".to_string()
+        } else {
+            format!("filler {i}")
+        };
+        stream.extend_from_slice(format!("{line}\r\n").as_bytes());
+    }
+    engine.feed(&stream);
+    let hit = engine.search_text("NEEDLE")[0];
+    let before = engine.search_hit_line(hit).unwrap();
+    let mut more = Vec::new();
+    for i in 0..7 {
+        more.extend_from_slice(format!("more {i}\r\n").as_bytes());
+    }
+    engine.feed(&more);
+    assert_eq!(engine.search_hit_line(hit), Some(before - 7));
+    engine.show_search_hit(hit);
+    let snap = engine.snapshot();
+    let selected: String = snap
+        .cells
+        .iter()
+        .zip(&snap.selected)
+        .filter(|(_, s)| **s)
+        .map(|(c, _)| c.ch)
+        .collect();
+    assert_eq!(selected, "NEEDLE");
 }
 
 /// Regression: while the view is scrolled back, an idle terminal reports no

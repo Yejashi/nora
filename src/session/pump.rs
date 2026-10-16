@@ -673,7 +673,7 @@ pub fn pump_thread(
                         && let Some((query, current)) = pane_pump.search.clone()
                     {
                         let hits = pane_pump.session.engine().search_text(&query);
-                        let key = |h: &crate::engine::SearchHit| (h.line, h.start);
+                        let key = |h: &crate::engine::SearchHit| (h.line_id, h.start);
                         let next = match current {
                             Some(cur) if backwards => hits
                                 .iter()

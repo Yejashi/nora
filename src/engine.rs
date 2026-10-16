@@ -557,13 +557,26 @@ pub fn opener_argv(uri: &str) -> Option<Vec<String>> {
 /// Most matches [`Engine::search_text`] returns.
 pub const MAX_SEARCH_HITS: usize = 10_000;
 
-/// One search match: grid `line` (0 = top screen row, negative = in the
-/// scrollback) and its first and last column.
+/// Lines [`Engine::search_text`] copies per terminal-lock hold.
+const SEARCH_CHUNK_LINES: usize = 256;
+
+/// One search match: its line and its first and last column.
+///
+/// `line_id` is stable while output arrives: the grid line at scan time
+/// plus the lines scrolled into history minus the lines pulled back by
+/// resizes since the terminal started. [`Engine::search_hit_line`] maps it
+/// to the current grid line (0 = top screen row, negative = scrollback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchHit {
-    pub line: i32,
+    pub line_id: i64,
     pub start: usize,
     pub end: usize,
+}
+
+/// `total_scrolled - total_pulled`: adding it to a grid line gives the
+/// line's stable id (see [`SearchHit`]).
+fn line_shift(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>) -> i64 {
+    grid.total_scrolled() as i64 - grid.total_pulled() as i64
 }
 
 impl Engine {
@@ -1146,8 +1159,14 @@ impl Engine {
     }
 
     /// Every occurrence of `query` in the scrollback and the screen, top
-    /// to bottom (at most [`MAX_SEARCH_HITS`]). Matching is per line;
-    /// it ignores case unless the query has an uppercase letter.
+    /// to bottom: the newest [`MAX_SEARCH_HITS`] when there are more.
+    /// Matching is per line; it ignores case unless the query has an
+    /// uppercase letter.
+    ///
+    /// The scan runs bottom-up and copies [`SEARCH_CHUNK_LINES`] lines per
+    /// hold of the terminal lock, so a long history never stalls the PTY
+    /// reader for the whole scan (audit RV3). Lines are tracked by stable
+    /// id, so output arriving between chunks does not skip or repeat any.
     pub fn search_text(&self, query: &str) -> Vec<SearchHit> {
         use alacritty_terminal::index::{Column, Line};
         let mut hits = Vec::new();
@@ -1163,54 +1182,94 @@ impl Engine {
             }
         };
         let needle: Vec<char> = query.chars().map(norm).collect();
-        let term = self.term.lock();
-        let grid = term.grid();
-        let history = grid.total_lines().saturating_sub(grid.screen_lines()) as i32;
-        let cols = grid.columns();
-        for line in -history..grid.screen_lines() as i32 {
-            let row = &grid[Line(line)];
-            // Characters with their columns, skipping wide-char spacers.
-            let chars: Vec<(char, usize)> = (0..cols)
-                .filter_map(|c| {
-                    let cell = &row[Column(c)];
-                    (!cell.flags.contains(Flags::WIDE_CHAR_SPACER)).then(|| (norm(cell.c), c))
-                })
-                .collect();
-            if chars.len() < needle.len() {
-                continue;
+        // Stable id of the next line to scan (moving up), once started.
+        let mut next: Option<i64> = None;
+        'scan: loop {
+            let mut lines: Vec<(i64, Vec<(char, usize)>)> = Vec::new();
+            {
+                let term = self.term.lock();
+                let grid = term.grid();
+                let shift = line_shift(grid);
+                let top = -(grid.total_lines().saturating_sub(grid.screen_lines()) as i64);
+                let bottom = grid.screen_lines() as i64 - 1;
+                let cols = grid.columns();
+                let mut line = next.map_or(bottom, |id| (id - shift).min(bottom));
+                while line >= top && lines.len() < SEARCH_CHUNK_LINES {
+                    let row = &grid[Line(line as i32)];
+                    // Characters with their columns, skipping wide-char
+                    // spacers.
+                    let chars = (0..cols)
+                        .filter_map(|c| {
+                            let cell = &row[Column(c)];
+                            (!cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                                .then(|| (norm(cell.c), c))
+                        })
+                        .collect();
+                    lines.push((line + shift, chars));
+                    line -= 1;
+                }
+                next = Some(line + shift);
             }
-            for start in 0..=chars.len() - needle.len() {
-                if chars[start..start + needle.len()]
-                    .iter()
-                    .zip(&needle)
-                    .all(|((c, _), n)| c == n)
-                {
-                    hits.push(SearchHit {
-                        line,
-                        start: chars[start].1,
-                        end: chars[start + needle.len() - 1].1,
-                    });
-                    if hits.len() >= MAX_SEARCH_HITS {
-                        return hits;
+            if lines.is_empty() {
+                break;
+            }
+            for (line_id, chars) in &lines {
+                if chars.len() < needle.len() {
+                    continue;
+                }
+                // Right to left, so a full result keeps the newest.
+                for start in (0..=chars.len() - needle.len()).rev() {
+                    if chars[start..start + needle.len()]
+                        .iter()
+                        .zip(&needle)
+                        .all(|((c, _), n)| c == n)
+                    {
+                        hits.push(SearchHit {
+                            line_id: *line_id,
+                            start: chars[start].1,
+                            end: chars[start + needle.len() - 1].1,
+                        });
+                        if hits.len() >= MAX_SEARCH_HITS {
+                            break 'scan;
+                        }
                     }
                 }
             }
         }
+        hits.reverse();
         hits
+    }
+
+    /// The current grid line of `hit` (0 = top screen row, negative =
+    /// scrollback), or `None` once it has left the history.
+    pub fn search_hit_line(&self, hit: SearchHit) -> Option<i32> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let line = hit.line_id - line_shift(grid);
+        let top = -(grid.total_lines().saturating_sub(grid.screen_lines()) as i64);
+        let bottom = grid.screen_lines() as i64 - 1;
+        (top..=bottom)
+            .contains(&line)
+            .then(|| i32::try_from(line).ok())
+            .flatten()
     }
 
     /// Scroll `hit` into view (to the bottom row when it is off screen) and
     /// select it, so the selection highlight marks the match.
     pub fn show_search_hit(&self, hit: SearchHit) {
+        let Some(line) = self.search_hit_line(hit) else {
+            self.clear_selection();
+            return;
+        };
         let rows = self.rows as i32;
         let visible = |offset: usize| {
-            let row = hit.line + offset as i32;
+            let row = line + offset as i32;
             (0..rows).contains(&row).then_some(row as usize)
         };
         let row = match visible(self.display_offset()) {
             Some(row) => row,
             None => {
-                self.scroll_to_line(hit.line);
+                self.scroll_to_line(line);
                 match visible(self.display_offset()) {
                     Some(row) => row,
                     None => return,
