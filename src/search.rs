@@ -24,6 +24,9 @@ pub struct SearchState {
     pub generation: u64,
 }
 
+/// Longest search query, in characters.
+pub const MAX_QUERY_CHARS: usize = 256;
+
 impl SearchState {
     /// Create a new search state with an empty query.
     pub fn new() -> Self {
@@ -41,6 +44,18 @@ impl SearchState {
         self.current = 0;
         self.total = 0;
         self.generation += 1;
+    }
+
+    /// Append typed, committed or pasted `text` to the query: its first
+    /// line, without control characters, up to [`MAX_QUERY_CHARS`] in
+    /// all. Returns whether the query changed.
+    pub fn push_text(&mut self, text: &str) -> bool {
+        let room = MAX_QUERY_CHARS.saturating_sub(self.query.chars().count());
+        let line = text.split(['\n', '\r']).next().unwrap_or("");
+        let before = self.query.len();
+        self.query
+            .extend(line.chars().filter(|c| !c.is_control()).take(room));
+        self.query.len() != before
     }
 
     /// Move to the next match.

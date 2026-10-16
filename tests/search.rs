@@ -6,7 +6,7 @@
 //! and generation tagging.
 
 use nora::search::{
-    SearchOutcome, SearchState, SearchUi, check_stale, run_search, search_snapshot,
+    MAX_QUERY_CHARS, SearchOutcome, SearchState, SearchUi, check_stale, run_search, search_snapshot,
 };
 
 /// Build a snapshot from raw row strings (row 0 = oldest).
@@ -350,4 +350,23 @@ fn search_escape() {
     assert_eq!(ui.state.query, "");
     assert_eq!(ui.state.total, 0);
     assert!(ui.matches.is_empty());
+}
+
+/// Audit RV8: pasted or committed text joins the query as one line with
+/// no control characters, bounded in length.
+#[test]
+fn search_push_text_takes_one_clean_bounded_line() {
+    let mut state = SearchState::new();
+    assert!(state.push_text("cargo\tbuild\x1b[0m"));
+    assert_eq!(state.query, "cargobuild[0m");
+    assert!(state.push_text(" --release\nrm -rf /\n"));
+    assert_eq!(state.query, "cargobuild[0m --release");
+    assert!(
+        !state.push_text("\n"),
+        "an empty first line changes nothing"
+    );
+    let mut long = SearchState::new();
+    long.push_text(&"x".repeat(MAX_QUERY_CHARS + 50));
+    assert_eq!(long.query.chars().count(), MAX_QUERY_CHARS);
+    assert!(!long.push_text("y"), "full query takes no more");
 }

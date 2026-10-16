@@ -455,6 +455,9 @@ scenario_search() {
     xdotool key ctrl+shift+f
     xdotool type --delay 15 "needle-old"
     xdotool key space BackSpace Up Down Left Tab
+    # Unbound Ctrl/Alt chords add nothing to the query (audit RV8): the
+    # match must still be shown.
+    xdotool key ctrl+a alt+b ctrl+e
     shot "$dir/bar.png"
     xdotool key Escape
     xdotool type --delay 15 "echo CLEAN > $dir/out.txt"; xdotool key Return

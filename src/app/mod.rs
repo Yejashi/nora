@@ -1295,6 +1295,19 @@ impl WinApp {
             }
             return;
         };
+        // While searching, a paste is query text, never shell input
+        // (audit RV8).
+        if self.search.visible {
+            if self.search.state.push_text(&text)
+                && let Some(pane) = self.active_pane_key()
+            {
+                let query = self.search.state.query.clone();
+                let _ = self
+                    .pump_commands
+                    .send(PumpMsg::SearchQuery { pane, query });
+            }
+            return;
+        }
         let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
         if let Some(pane) = self.active_pane_key() {
             let _ = self.pump_commands.send(PumpMsg::Paste {
@@ -2317,15 +2330,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // match with the selection.
                 if self.search.visible {
                     let pane = self.active_pane_key();
+                    // A Ctrl/Alt/Super chord that is not a binding is not
+                    // text: it must not add its letter (audit RV8).
+                    let chord =
+                        self.mods.control_key() || self.mods.alt_key() || self.mods.super_key();
                     let query_changed = match &event.logical_key {
-                        Key::Character(text) => {
-                            self.search.state.query.push_str(text);
-                            true
-                        }
-                        Key::Named(NamedKey::Space) => {
-                            self.search.state.query.push(' ');
-                            true
-                        }
+                        Key::Character(text) if !chord => self.search.state.push_text(text),
+                        Key::Named(NamedKey::Space) if !chord => self.search.state.push_text(" "),
                         Key::Named(NamedKey::Backspace) => {
                             self.search.state.query.pop();
                             true
@@ -2596,8 +2607,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         // (on Wayland text-input every letter arrives this
                         // way); it must not reach the shell.
                         if self.search.visible {
-                            self.search.state.query.push_str(&committed);
-                            if let Some(pane) = self.active_pane_key() {
+                            if self.search.state.push_text(&committed)
+                                && let Some(pane) = self.active_pane_key()
+                            {
                                 let query = self.search.state.query.clone();
                                 let _ = self
                                     .pump_commands
