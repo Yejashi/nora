@@ -1221,6 +1221,41 @@ fn pty_graphics_apc_reaches_shared_queue() {
 /// The `PromptMarkerFilter` runs on the PTY reader thread *before* the
 /// parser, so by the time `OSC-DONE` is visible in the grid every event
 /// has already been queued.
+/// ADR-013 step 1 over a real PTY: the editor buffer is current while the
+/// prompt waits for input; the executed command line arrives with the cwd
+/// and exit status the shell reported.
+#[test]
+fn pty_shell_input_reports_reach_shared_state() {
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: helper(),
+            args: vec!["cmdline".to_string()],
+            cwd: None,
+            env: Vec::new(),
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("helper spawns over a real PTY");
+
+    pump(&mut session, |text, _events| text.contains("BUF-SHOWN"))
+        .expect("BUF-SHOWN within the deadline");
+    let buffer = session.engine().shell_buffer().expect("buffer is current");
+    assert_eq!((buffer.text.as_str(), buffer.cursor), ("make all", 8));
+
+    pump(&mut session, |text, _events| text.contains("CMD-DONE"))
+        .expect("CMD-DONE within the deadline");
+    assert_eq!(session.engine().shell_buffer(), None);
+    let executed = session.engine().take_executed();
+    assert_eq!(executed.len(), 1, "{executed:?}");
+    assert_eq!(executed[0].cmdline, "make all");
+    assert_eq!(executed[0].cwd.as_deref(), Some("/tmp"));
+    assert_eq!(executed[0].exit, Some(2));
+
+    session.close();
+}
+
 #[test]
 fn pty_shell_events_reach_shared_state() {
     let mut session = PtySession::spawn(

@@ -113,6 +113,32 @@ pub fn main() {
             let _ = out.flush();
             std::process::exit(0);
         }
+        Some("cmdline") => {
+            // ADR-013 shell input reports: a prompt with an editor buffer
+            // ("make all", base64), shown long enough to be read, then the
+            // executed command line and its exit status.
+            for frame in [
+                "\x1b]7;file:///tmp\x1b\\",
+                "\x1b]133;A\x1b\\",
+                "\x1b]133;B\x1b\\",
+                "\x1b]6973;buffer;8;bWFrZSBhbGw=\x1b\\",
+            ] {
+                let _ = out.write_all(frame.as_bytes());
+            }
+            let _ = writeln!(out, "BUF-SHOWN");
+            let _ = out.flush();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for frame in [
+                "\x1b]6973;end\x1b\\",
+                "\x1b]133;C;cmdline_url=make%20all\x1b\\",
+                "\x1b]133;D;2\x1b\\",
+            ] {
+                let _ = out.write_all(frame.as_bytes());
+            }
+            let _ = writeln!(out, "CMD-DONE");
+            let _ = out.flush();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         Some("osc") => {
             ready(&mut out);
             // Let READY reach the screen through the loop's normal master

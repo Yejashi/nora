@@ -1156,6 +1156,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
+ "base64",
  "cosmic-text",
  "glyphon",
  "libc",

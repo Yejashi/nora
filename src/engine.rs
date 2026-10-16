@@ -78,6 +78,9 @@ pub struct Engine {
     /// `file://` path, shared between the headless `Engine::feed` path and
     /// the PTY `EventLoop` filter. `None` until the child reports one.
     cwd: Arc<Mutex<Option<String>>>,
+    /// The shell's reported command line state (ADR-013), shared between
+    /// the headless `Engine::feed` path and the PTY `EventLoop` filter.
+    shell_input: Arc<Mutex<crate::shell_input::ShellInput>>,
     /// Byte-bounded queue of hyperlink events, shared between the
     /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35d).
     hyperlink_queue: Arc<Mutex<crate::prompt_marker::HyperlinkQueue>>,
@@ -618,6 +621,7 @@ impl Engine {
             marker_queue: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
             marker_store: crate::prompt_marker::MarkerStore::new(),
             cwd: Arc::new(Mutex::new(None)),
+            shell_input: Arc::new(Mutex::new(crate::shell_input::ShellInput::new())),
             hyperlink_queue: Arc::new(Mutex::new(crate::prompt_marker::HyperlinkQueue::new())),
             hyperlink_store: crate::prompt_marker::HyperlinkStore::new(),
         }
@@ -722,6 +726,13 @@ impl Engine {
                 let line = term.grid().cursor.point.line.0;
                 let scrolled = term.grid().total_scrolled();
                 let pulled = term.grid().total_pulled();
+                {
+                    let cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
+                    self.shell_input
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .apply(&event, cwd.as_deref());
+                }
                 match event {
                     crate::prompt_marker::ShellEvent::Marker(m) => {
                         let entry = crate::prompt_marker::MarkerAtLine {
@@ -755,6 +766,11 @@ impl Engine {
                             .unwrap_or_else(PoisonError::into_inner);
                         queue.push(entry);
                     }
+                    // Folded into the shell input state above.
+                    crate::prompt_marker::ShellEvent::Buffer(_)
+                    | crate::prompt_marker::ShellEvent::BufferEnd
+                    | crate::prompt_marker::ShellEvent::CommandLine(_)
+                    | crate::prompt_marker::ShellEvent::CommandExit(_) => {}
                 }
                 pos = marker_pos;
             }
@@ -1057,6 +1073,31 @@ impl Engine {
     /// headless [`Engine::feed`] path uses.
     pub fn hyperlink_handle(&self) -> Arc<Mutex<crate::prompt_marker::HyperlinkQueue>> {
         Arc::clone(&self.hyperlink_queue)
+    }
+
+    /// The shell line editor's buffer while it is current (ADR-013): the
+    /// last `OSC 6973` report after the prompt's input marker.
+    pub fn shell_buffer(&self) -> Option<crate::shell_input::LineBuffer> {
+        self.shell_input
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current_buffer()
+            .cloned()
+    }
+
+    /// Take the command lines the shell reported executing (ADR-013),
+    /// oldest first, each with its cwd and exit status.
+    pub fn take_executed(&self) -> Vec<crate::shell_input::ExecutedCommand> {
+        self.shell_input
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_executed()
+    }
+
+    /// A clone of the shared shell-input handle (ADR-013) for the PTY
+    /// `EventLoop` filter.
+    pub fn shell_input_handle(&self) -> Arc<Mutex<crate::shell_input::ShellInput>> {
+        Arc::clone(&self.shell_input)
     }
 
     /// A clone of the shared cwd handle (N35d): the PTY `EventLoop` filter

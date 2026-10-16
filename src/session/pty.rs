@@ -61,6 +61,9 @@ struct PtyFilter {
     /// The child's current working directory (N35d): the most recent OSC 7
     /// `file://` path, shared with the headless `Engine::feed` path.
     cwd: Arc<Mutex<Option<String>>>,
+    /// The shell's reported command line state (ADR-013), shared with the
+    /// headless `Engine::feed` path.
+    shell_input: Arc<Mutex<crate::shell_input::ShellInput>>,
     /// Byte-bounded queue of hyperlink events, shared with the headless
     /// `Engine::feed` path (N35d).
     hyperlink_queue: Arc<Mutex<crate::prompt_marker::HyperlinkQueue>>,
@@ -101,6 +104,13 @@ impl alacritty_terminal::event_loop::Filter for PtyFilter {
     ) {
         if let Some(event) = self.pending_events.get(self.pending_index).cloned() {
             self.pending_index += 1;
+            {
+                let cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
+                self.shell_input
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .apply(&event, cwd.as_deref());
+            }
             match event {
                 crate::prompt_marker::ShellEvent::Marker(m) => {
                     let entry = crate::prompt_marker::MarkerAtLine {
@@ -133,6 +143,11 @@ impl alacritty_terminal::event_loop::Filter for PtyFilter {
                         .unwrap_or_else(PoisonError::into_inner);
                     queue.push(entry);
                 }
+                // Folded into the shell input state above.
+                crate::prompt_marker::ShellEvent::Buffer(_)
+                | crate::prompt_marker::ShellEvent::BufferEnd
+                | crate::prompt_marker::ShellEvent::CommandLine(_)
+                | crate::prompt_marker::ShellEvent::CommandExit(_) => {}
             }
         }
     }
@@ -415,6 +430,7 @@ impl PtySession {
             markers: crate::prompt_marker::PromptMarkerFilter::new(),
             marker_queue: engine.markers_handle(),
             cwd: engine.cwd_handle(),
+            shell_input: engine.shell_input_handle(),
             hyperlink_queue: engine.hyperlink_handle(),
             pending_events: Vec::new(),
             pending_index: 0,

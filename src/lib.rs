@@ -18,5 +18,6 @@ pub mod prompt_marker;
 pub mod render;
 pub mod search;
 pub mod session;
+pub mod shell_input;
 pub mod trace;
 pub mod workspace;

@@ -72,6 +72,17 @@ pub enum ShellEvent {
     Cwd(String),
     /// An OSC 8 hyperlink (the URI).
     Hyperlink(String),
+    /// `OSC 6973 ; buffer ; <cursor> ; <base64 UTF-8>`: the shell line
+    /// editor's buffer and cursor (ADR-013).
+    Buffer(crate::shell_input::LineBuffer),
+    /// `OSC 6973 ; end`: the line editor finished (accept or abort).
+    BufferEnd,
+    /// `OSC 133 ; C ; cmdline=` / `cmdline_url=`: the command line the
+    /// shell is executing (decoded). Follows its `C` marker.
+    CommandLine(String),
+    /// `OSC 133 ; D ; <status>`: the finished command's exit status.
+    /// Follows its `D` marker.
+    CommandExit(i32),
 }
 
 impl ShellEvent {
@@ -81,6 +92,9 @@ impl ShellEvent {
             ShellEvent::Marker(e) => e.byte_cost(),
             ShellEvent::Cwd(s) => s.len(),
             ShellEvent::Hyperlink(s) => s.len(),
+            ShellEvent::Buffer(b) => b.text.len(),
+            ShellEvent::CommandLine(s) => s.len(),
+            ShellEvent::BufferEnd | ShellEvent::CommandExit(_) => 1,
         }
     }
 }
@@ -636,11 +650,19 @@ impl PromptMarkerFilter {
             return;
         }
         match classify_frame(&data) {
-            FrameAction::Marker(kind) => {
+            FrameAction::Marker(kind, extra) => {
                 // Well-formed OSC 133 marker: suppress the frame. Record
                 // the position in the forwarded stream (the number of
-                // forwarded bytes before this marker).
+                // forwarded bytes before this marker); a command line or
+                // exit status it carries follows at the same position.
                 events.push((out.len(), ShellEvent::Marker(PromptMarkerEvent { kind })));
+                if let Some(extra) = extra {
+                    events.push((out.len(), extra));
+                }
+            }
+            FrameAction::Shell(event) => {
+                // OSC 6973 buffer report: metadata, suppressed.
+                events.push((out.len(), event));
             }
             FrameAction::Cwd(path) => {
                 // OSC 7 cwd update: suppress the frame (metadata, no
@@ -679,11 +701,12 @@ impl Default for PromptMarkerFilter {
 
 /// Parse an OSC frame's data (the bytes between `]` and the terminator).
 ///
-/// Returns `Some(kind)` when the frame is exactly `133 ; <kind>` with
-/// `<kind>` one of `A`/`B`/`C`/`D`; `None` otherwise (a different OSC
-/// command, or a malformed 133 frame). A single optional space around the
+/// Returns `Some(kind)` when the frame is `133 ; <kind>` with `<kind>`
+/// one of `A`/`B`/`C`/`D`, optionally followed by `;`-separated
+/// parameters (returned too); `None` otherwise (a different OSC command,
+/// or a malformed 133 frame). A single optional space around the first
 /// `;` is tolerated (both `133;A` and `133 ; A` are accepted).
-fn parse_marker(data: &[u8]) -> Option<MarkerKind> {
+fn parse_marker(data: &[u8]) -> Option<(MarkerKind, &[u8])> {
     // Split on the first `;`.
     let semi = data.iter().position(|&b| b == b';')?;
     let head = &data[..semi];
@@ -697,20 +720,78 @@ fn parse_marker(data: &[u8]) -> Option<MarkerKind> {
     // The kind must be exactly one of `A`/`B`/`C`/`D` (tolerating one
     // optional leading space).
     let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-    match rest {
-        b"A" => Some(MarkerKind::A),
-        b"B" => Some(MarkerKind::B),
-        b"C" => Some(MarkerKind::C),
-        b"D" => Some(MarkerKind::D),
-        _ => None,
+    let (kind, params) = match rest.iter().position(|&b| b == b';') {
+        Some(p) => (&rest[..p], &rest[p + 1..]),
+        None => (rest, &rest[rest.len()..]),
+    };
+    let kind = match kind {
+        b"A" => MarkerKind::A,
+        b"B" => MarkerKind::B,
+        b"C" => MarkerKind::C,
+        b"D" => MarkerKind::D,
+        _ => return None,
+    };
+    Some((kind, params))
+}
+
+/// The event a marker's parameters carry: the command line on `C`
+/// (`cmdline=` shell-quoted, or `cmdline_url=` percent-encoded, as kitty
+/// defines them) and the exit status on `D`.
+fn marker_extra(kind: MarkerKind, params: &[u8]) -> Option<ShellEvent> {
+    let params = std::str::from_utf8(params).ok()?;
+    match kind {
+        MarkerKind::C => params.split(';').find_map(|param| {
+            if let Some(url) = param.strip_prefix("cmdline_url=") {
+                Some(ShellEvent::CommandLine(percent_decode(url)))
+            } else {
+                param
+                    .strip_prefix("cmdline=")
+                    .and_then(crate::shell_input::unquote_shell)
+                    .map(ShellEvent::CommandLine)
+            }
+        }),
+        MarkerKind::D => params
+            .split(';')
+            .next()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .map(ShellEvent::CommandExit),
+        MarkerKind::A | MarkerKind::B => None,
     }
+}
+
+/// Parse an `OSC 6973` buffer report's data (after `6973;`): `buffer ;
+/// <cursor> ; <base64 UTF-8 text>` or `end`.
+fn parse_buffer_report(rest: &[u8]) -> Option<ShellEvent> {
+    use base64::Engine as _;
+    if rest == b"end" {
+        return Some(ShellEvent::BufferEnd);
+    }
+    let rest = rest.strip_prefix(b"buffer;")?;
+    let semi = rest.iter().position(|&b| b == b';')?;
+    let cursor = std::str::from_utf8(&rest[..semi])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&rest[semi + 1..])
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    Some(ShellEvent::Buffer(crate::shell_input::LineBuffer {
+        text,
+        cursor,
+    }))
 }
 
 /// What to do with a completed OSC frame.
 #[derive(Debug, Clone)]
 enum FrameAction {
-    /// A well-formed OSC 133 marker: suppress and emit a marker event.
-    Marker(MarkerKind),
+    /// A well-formed OSC 133 marker: suppress and emit a marker event,
+    /// then the command line or exit status it carries.
+    Marker(MarkerKind, Option<ShellEvent>),
+    /// An OSC 6973 buffer report: suppress and emit it.
+    Shell(ShellEvent),
     /// An OSC 7 cwd update: suppress and emit a cwd event.
     Cwd(String),
     /// An OSC 8 hyperlink: forward and emit a hyperlink event.
@@ -738,7 +819,11 @@ fn classify_frame(data: &[u8]) -> FrameAction {
     let head = head.strip_suffix(b" ").unwrap_or(head);
     match std::str::from_utf8(head) {
         Ok("133") => match parse_marker(data) {
-            Some(kind) => FrameAction::Marker(kind),
+            Some((kind, params)) => FrameAction::Marker(kind, marker_extra(kind, params)),
+            None => FrameAction::Forward,
+        },
+        Ok("6973") => match parse_buffer_report(rest) {
+            Some(event) => FrameAction::Shell(event),
             None => FrameAction::Forward,
         },
         Ok("7") => match parse_cwd(rest) {

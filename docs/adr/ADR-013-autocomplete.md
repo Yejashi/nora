@@ -1,7 +1,7 @@
 # ADR-013: Shell-cooperative inline autocomplete
 
-Status: proposed (2026-10-15). Implementation is gated on the roadmap's
-foundation milestones (M1-M5) being accepted; see "Gate" below.
+Status: accepted (2026-10-16); in implementation. Step 1 is done
+(`src/shell_input.rs`, parsing in `src/prompt_marker.rs`).
 
 ## Problem
 
@@ -104,6 +104,13 @@ Option 4, with these parts:
 
 1. Engine: parse `OSC 6973` and `OSC 133;C;cmdline=`; expose the current
    buffer per pane. Unit tests for parsing and the B/C gating.
+   **Done 2026-10-16:** `cmdline=` (shell-quoted, unquoted by
+   `shell_input::unquote_shell`) and `cmdline_url=` (percent-encoded), the
+   `D` exit status, and markers with parameters (previously forwarded
+   unrecognized). The buffer cursor counts characters. The executed
+   commands (with cwd and exit status; at most 256 / 256 KiB pending) are
+   taken by the consumer once their status arrives. Tests:
+   `tests/shell_input.rs`, `pty_shell_input_reports_reach_shared_state`.
 2. zsh integration script; e2e: type into a zsh prompt under nora and
    assert the reported buffer matches `$BUFFER` after history recall,
    completion and kill/yank.
@@ -116,6 +123,7 @@ Option 4, with these parts:
 
 ## Gate
 
-Per the roadmap, implementation starts after M1-M5 acceptance. Open items
-at the time of writing: the macOS PTY tests in CI, a manual IME check, and
-the scrollback search gap (visible-screen search only).
+Implementation started on 2026-10-16 with M1-M4 accepted and M5 partial.
+The macOS PTY tests are green in CI and scrollback search is done. Still
+open from M5: interactive use on macOS and Windows, and a manual IME
+check.

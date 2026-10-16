@@ -22,6 +22,9 @@ wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
 [dependencies]
 alacritty_terminal = "0.26.0"
 arboard = "3.6"
+# Decodes OSC 6973 shell buffer reports (ADR-013); the same version
+# alacritty_terminal already pulls in.
+base64 = "0.22.1"
 # Direct dependency (same pinned version glyphon pulls in): enables
 # `Font::unicode_codepoints()` for per-char font fallback (N13a).
 cosmic-text = { version = "0.19", features = ["monospace_fallback"] }
