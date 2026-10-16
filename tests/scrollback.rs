@@ -10,6 +10,7 @@
 use alacritty_terminal::grid::Scroll;
 
 use nora::engine::{Damage, Engine, opener_argv};
+use nora::render::term::is_noop_damage;
 
 /// The platform opener `opener_argv` uses.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -165,6 +166,44 @@ fn scroll_produces_full_damage() {
         Damage::Full,
         "a viewport scroll must report full damage"
     );
+}
+
+/// Audit RV1: partly scrolled back with the cursor still on screen (after
+/// `clear`, wheel up 3 lines), an idle probe is a no-op. The damage
+/// iterator reports the always-damaged cursor cell in viewport rows, so
+/// the probe's cursor must be in viewport rows too; otherwise every pump
+/// wake built a snapshot and a frame (a redraw loop).
+#[test]
+fn idle_probe_is_noop_when_partly_scrolled() {
+    let mut engine = Engine::with_history(24, 80, 100);
+    feed_lines(&mut engine, 200);
+    // `clear`: home the cursor and erase the screen.
+    engine.feed(b"\x1b[H\x1b[2J");
+    engine.scroll(Scroll::Delta(3));
+    // Consume the scroll's full damage.
+    let _ = engine.snapshot();
+
+    for round in 0..3 {
+        let (damage, cursor) = engine.probe();
+        assert_eq!(cursor, Some((3, 0)), "viewport-mapped cursor");
+        assert!(
+            is_noop_damage(&damage, cursor),
+            "idle probe {round} counted as damage: {damage:?} cursor {cursor:?}"
+        );
+    }
+}
+
+/// Fully scrolled past the cursor, the probe reports no cursor and an
+/// empty (no-op) damage list.
+#[test]
+fn idle_probe_is_noop_when_cursor_scrolled_off() {
+    let mut engine = Engine::with_history(24, 80, 100);
+    feed_lines(&mut engine, 200);
+    engine.scroll(Scroll::Delta(5));
+    let _ = engine.snapshot();
+    let (damage, cursor) = engine.probe();
+    assert_eq!(cursor, None);
+    assert!(is_noop_damage(&damage, cursor), "{damage:?}");
 }
 
 /// N35b: with no prompt markers stored, jumping to the previous prompt

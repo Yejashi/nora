@@ -1415,15 +1415,18 @@ impl Engine {
             ),
         };
 
-        // The cursor in screen coordinates, the same space alacritty
-        // records cursor damage in, whatever the display offset. (The
-        // viewport-mapped cursor is None while scrolled back, which made
-        // every probe count the cursor line as real damage: a snapshot per
-        // pump wake and a redraw loop while the view was scrolled.)
+        // The cursor in viewport coordinates, the space the damage
+        // iterator reports lines in (screen line + display offset, lines
+        // pushed off the bottom dropped). Screen coordinates never matched
+        // the always-damaged cursor cell while partly scrolled back, so
+        // every probe counted as real damage: a redraw loop (audit RV1).
+        // Fully off screen, the cursor's damage is dropped too and the
+        // empty report is a no-op (`is_noop_damage`).
         let point = term.grid().cursor.point;
-        let cursor = usize::try_from(point.line.0)
-            .ok()
-            .map(|line| (line, point.column.0));
+        let display_offset = term.grid().display_offset();
+        let cursor = point_to_viewport(display_offset, point)
+            .filter(|p| p.line < self.rows)
+            .map(|p| (p.line, p.column.0));
 
         (damage, cursor)
     }

@@ -530,7 +530,7 @@ scenario_hyperlink() {
     pass hyperlink
 }
 
-# Idle: a window that is idle (also while scrolled back in history) draws
+# Idle: a window that is idle (also while fully or partly scrolled back) draws
 # no frames; a redraw loop here once drew hundreds per second.
 scenario_idle() {
     local dir="$OUT/idle"; mkdir -p "$dir"
@@ -543,9 +543,22 @@ scenario_idle() {
     before=$(grep -c '^frame:' "$OUT/idle/nora.log")
     sleep 3
     after=$(grep -c '^frame:' "$OUT/idle/nora.log")
+    # Partly scrolled with the cursor still on screen (audit RV1): clear
+    # the screen (its lines go to history), then one wheel notch up.
+    xdotool key shift+Next
+    xdotool type --delay 15 "printf '\\033[H\\033[2J'"; xdotool key Return
+    sleep 1
+    xdotool mousemove --window "$WIN" 40 40 click 4
+    sleep 1
+    local before2 after2
+    before2=$(grep -c '^frame:' "$OUT/idle/nora.log")
+    sleep 3
+    after2=$(grep -c '^frame:' "$OUT/idle/nora.log")
     finish
     echo "  frames during 3 s idle while scrolled back: $((after - before))"
+    echo "  frames during 3 s idle while partly scrolled: $((after2 - before2))"
     [ $((after - before)) -le 2 ] || { fail idle "redraw loop: $((after - before)) frames while idle"; return; }
+    [ $((after2 - before2)) -le 2 ] || { fail idle "redraw loop: $((after2 - before2)) frames while partly scrolled"; return; }
     pass idle
 }
 
