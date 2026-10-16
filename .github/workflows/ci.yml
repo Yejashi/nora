@@ -274,6 +274,10 @@ jobs:
             --test navigation_input --test paste_pump 2>&1 | tee pty.log
           STATUS=${PIPESTATUS[0]}
           set -e
-          grep -E "^test .* FAILED$|panicked at" pty.log \
-            | sort -u | head -40 | sed 's/^/::error::/' || true
+          # Annotations carry one line each: report each panic location
+          # together with its message (the line after it).
+          grep -E "^test .* FAILED$" pty.log | sort -u | head -20 \
+            | sed 's/^/::error::/' || true
+          grep -A1 "panicked at" pty.log | grep -v '^--$' | paste -d' ' - - \
+            | cut -c1-1500 | head -20 | sed 's/^/::error::/' || true
           exit "$STATUS"
