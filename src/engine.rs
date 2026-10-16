@@ -1185,7 +1185,9 @@ impl Engine {
         // Stable id of the next line to scan (moving up), once started.
         let mut next: Option<i64> = None;
         'scan: loop {
-            let mut lines: Vec<(i64, Vec<(char, usize)>)> = Vec::new();
+            // (stable line id, [(char, first column, last column)]).
+            type ScanLine = (i64, Vec<(char, usize, usize)>);
+            let mut lines: Vec<ScanLine> = Vec::new();
             {
                 let term = self.term.lock();
                 let grid = term.grid();
@@ -1196,13 +1198,14 @@ impl Engine {
                 let mut line = next.map_or(bottom, |id| (id - shift).min(bottom));
                 while line >= top && lines.len() < SEARCH_CHUNK_LINES {
                     let row = &grid[Line(line as i32)];
-                    // Characters with their columns, skipping wide-char
-                    // spacers.
+                    // Characters with their first and last columns (a wide
+                    // char spans two), skipping wide-char spacers.
                     let chars = (0..cols)
                         .filter_map(|c| {
                             let cell = &row[Column(c)];
+                            let last = c + usize::from(cell.flags.contains(Flags::WIDE_CHAR));
                             (!cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                                .then(|| (norm(cell.c), c))
+                                .then(|| (norm(cell.c), c, last.min(cols - 1)))
                         })
                         .collect();
                     lines.push((line + shift, chars));
@@ -1222,12 +1225,14 @@ impl Engine {
                     if chars[start..start + needle.len()]
                         .iter()
                         .zip(&needle)
-                        .all(|((c, _), n)| c == n)
+                        .all(|((c, ..), n)| c == n)
                     {
+                        // `end` covers a final wide char's right half
+                        // (audit RV10).
                         hits.push(SearchHit {
                             line_id: *line_id,
                             start: chars[start].1,
-                            end: chars[start + needle.len() - 1].1,
+                            end: chars[start + needle.len() - 1].2,
                         });
                         if hits.len() >= MAX_SEARCH_HITS {
                             break 'scan;

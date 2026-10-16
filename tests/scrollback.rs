@@ -689,6 +689,21 @@ fn search_keeps_the_newest_matches_past_the_cap() {
     assert!(text.contains(&format!("needle {}", total - 1)), "{text:?}");
 }
 
+/// Audit RV10: a match ending in a wide char covers both of its columns,
+/// so the highlight includes the right half.
+#[test]
+fn search_hit_ending_in_wide_char_covers_its_right_half() {
+    let mut engine = Engine::with_history(5, 30, 50);
+    engine.feed("ab日本 x\r\n".as_bytes());
+    let hits = engine.search_text("b日本");
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].start, hits[0].end), (1, 5));
+    engine.show_search_hit(hits[0]);
+    let snap = engine.snapshot();
+    let selected = snap.selected.iter().filter(|s| **s).count();
+    assert_eq!(selected, 5, "b plus two wide chars of two columns each");
+}
+
 /// Audit RV9: a hit stays on its line while output scrolls the screen
 /// between the search and showing the hit.
 #[test]

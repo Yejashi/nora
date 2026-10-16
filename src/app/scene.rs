@@ -268,8 +268,11 @@ impl Scene {
             if at + width > cols {
                 break;
             }
-            self.cells
-                .retain(|c| !(c.row == row && c.col >= at && c.col < at + width));
+            // Drop every glyph overlapping the span, including a wide one
+            // that starts a column earlier (audit RV10).
+            self.cells.retain(|c| {
+                !(c.row == row && c.col < at + width && c.col + u32::from(c.width.max(1)) > at)
+            });
             self.fills.push(CellFill {
                 row,
                 col: at,
@@ -344,6 +347,31 @@ mod tests {
         assert_eq!(cols, vec![5, 7, 9]);
         let mut clipped = Scene::default();
         assert_eq!(clipped.add_preedit("日本", 0, 38, 40, fg, bg), 2);
+    }
+
+    /// Audit RV10: a wide glyph starting one column before the preedit
+    /// overlaps it and is removed; one ending before it stays.
+    #[test]
+    fn preedit_removes_an_overlapping_wide_glyph() {
+        let mut scene = Scene::default();
+        let fg = [255, 255, 255, 255];
+        let bg = [0, 0, 0, 255];
+        for (col, text) in [(2, "日"), (4, "本")] {
+            scene.cells.push(DrawCell {
+                row: 0,
+                col,
+                text: text.to_string(),
+                style: tab_style(fg, bg, false),
+                width: 2,
+            });
+        }
+        scene.add_preedit("a", 0, 5, 40, fg, bg);
+        let left: Vec<(u32, &str)> = scene
+            .cells
+            .iter()
+            .map(|c| (c.col, c.text.as_str()))
+            .collect();
+        assert_eq!(left, vec![(2, "日"), (5, "a")]);
     }
 
     #[test]
