@@ -404,6 +404,45 @@ fn classify_change_new_session() {
     assert!(matches!(changes[0].1, ConfigChange::NewSession));
 }
 
+/// Every section is classified, not only the legacy ones: a reload that
+/// changes only `[colors]`, `[scrolling]`, `[keyboard]`, `[window]`,
+/// `[cursor]` or `[autocomplete]` is reported.
+#[test]
+fn classify_change_covers_every_section() {
+    let old = NoraConfig::default();
+    let mut new = NoraConfig::default();
+    new.colors.background = Some("#101418".to_string());
+    new.colors.selection_background = Some("#333333".to_string());
+    new.colors.normal.red = Some("#aa0000".to_string());
+    new.colors.bright.blue = Some("#0000ff".to_string());
+    new.scrolling.history = Some(500);
+    new.scrolling.multiplier = Some(5);
+    new.keyboard.bindings.push(nora::config::BindingConfig {
+        keys: "ctrl+shift+t".to_string(),
+        action: "new_tab".to_string(),
+    });
+    new.window.columns = Some(100);
+    new.window.lines = Some(30);
+    new.cursor.style = nora::config::CursorShape::Beam;
+    new.autocomplete.enabled = Some(false);
+
+    let changes = classify_change(&old, &new);
+    let expected = [
+        ("scrolling.history", ConfigChange::NewSession),
+        ("scrolling.multiplier", ConfigChange::Immediate),
+        ("window.columns", ConfigChange::NewSession),
+        ("window.lines", ConfigChange::NewSession),
+        ("colors.background", ConfigChange::Immediate),
+        ("colors.selection_background", ConfigChange::Immediate),
+        ("colors.normal", ConfigChange::Immediate),
+        ("colors.bright", ConfigChange::Immediate),
+        ("cursor.style", ConfigChange::Immediate),
+        ("keyboard.bindings", ConfigChange::Immediate),
+        ("autocomplete.enabled", ConfigChange::Immediate),
+    ];
+    assert_eq!(changes, expected.to_vec());
+}
+
 /// Identical configs produce no changes.
 #[test]
 fn classify_change_no_change() {

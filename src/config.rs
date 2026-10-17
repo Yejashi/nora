@@ -731,9 +731,13 @@ pub fn zoom_reset() -> f32 {
 
 /// Classify the differences between two configs, one entry per changed field.
 ///
-/// The result follows a fixed field order (terminal, font, theme, keys), so
-/// callers get a deterministic list. An empty result means the configs are
-/// identical.
+/// The result follows a fixed field order (terminal, scrolling, window,
+/// font, colors, theme, cursor, keys, keyboard, autocomplete), so callers
+/// get a deterministic list. An empty result means the configs are
+/// identical. The kinds follow how a live reload applies them: colors,
+/// bindings, the wheel multiplier, the cursor shape and autocomplete at
+/// once; fonts staged; scrollback for new sessions; the window size only
+/// for a new window (reported as `NewSession`).
 pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str, ConfigChange)> {
     let mut changes = Vec::new();
 
@@ -745,12 +749,46 @@ pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str,
         changes.push(("terminal.mouse", ConfigChange::Immediate));
     }
 
+    // Scrolling and window size.
+    if old.scrolling.history != new.scrolling.history {
+        changes.push(("scrolling.history", ConfigChange::NewSession));
+    }
+    if old.scrolling.multiplier != new.scrolling.multiplier {
+        changes.push(("scrolling.multiplier", ConfigChange::Immediate));
+    }
+    if old.window.columns != new.window.columns {
+        changes.push(("window.columns", ConfigChange::NewSession));
+    }
+    if old.window.lines != new.window.lines {
+        changes.push(("window.lines", ConfigChange::NewSession));
+    }
+
     // Font settings.
     if old.font.family != new.font.family {
         changes.push(("font.family", ConfigChange::Staged));
     }
     if old.font.size != new.font.size {
         changes.push(("font.size", ConfigChange::Staged));
+    }
+
+    // Colors (`[colors]` overrides the legacy `[theme]`).
+    if old.colors.foreground != new.colors.foreground {
+        changes.push(("colors.foreground", ConfigChange::Immediate));
+    }
+    if old.colors.background != new.colors.background {
+        changes.push(("colors.background", ConfigChange::Immediate));
+    }
+    if old.colors.cursor != new.colors.cursor {
+        changes.push(("colors.cursor", ConfigChange::Immediate));
+    }
+    if old.colors.selection_background != new.colors.selection_background {
+        changes.push(("colors.selection_background", ConfigChange::Immediate));
+    }
+    if old.colors.normal != new.colors.normal {
+        changes.push(("colors.normal", ConfigChange::Immediate));
+    }
+    if old.colors.bright != new.colors.bright {
+        changes.push(("colors.bright", ConfigChange::Immediate));
     }
 
     // Theme settings.
@@ -767,9 +805,22 @@ pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str,
         changes.push(("theme.colors", ConfigChange::Immediate));
     }
 
+    // Cursor shape (until an application sets one).
+    if old.cursor.style != new.cursor.style {
+        changes.push(("cursor.style", ConfigChange::Immediate));
+    }
+
     // Key bindings.
     if old.keys.bindings != new.keys.bindings {
         changes.push(("keys.bindings", ConfigChange::Immediate));
+    }
+    if old.keyboard.bindings != new.keyboard.bindings {
+        changes.push(("keyboard.bindings", ConfigChange::Immediate));
+    }
+
+    // Suggestions (the pump loads or drops the history at once).
+    if old.autocomplete.enabled != new.autocomplete.enabled {
+        changes.push(("autocomplete.enabled", ConfigChange::Immediate));
     }
 
     changes
