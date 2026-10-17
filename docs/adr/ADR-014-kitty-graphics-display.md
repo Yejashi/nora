@@ -37,7 +37,7 @@ A conforming display needs, from the spec
   segments around reported positions; its hook gains the screen size and
   the alternate-screen flag, and a way to inject bytes at that point.
 - **Cursor movement by injection.** After a display without `C=1` the hook
-  injects ordinary control bytes (line feeds, then `CSI n C`, or CR LF when
+  injects ordinary control bytes (IND, then `CSI n C`, or CR LF when
   the image reaches the right edge) into the parser at the APC's position,
   so scrolling and margins behave as for text.
 - **Replies through the recorder.** The hook records a reply as a

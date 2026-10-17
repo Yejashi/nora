@@ -52,6 +52,21 @@ fn display_moves_the_cursor_past_the_image() {
     assert_eq!(e.snapshot().cursor, Some((1, 4)), "C=1 keeps the cursor");
 }
 
+/// Line feed/new line mode (`CSI 20 h`) does not change the movement
+/// after an image: it moves down with IND, which keeps the column.
+/// (vte 0.15 never applies the mode to LF either, so this guards the
+/// movement against a future engine that does.)
+#[test]
+fn display_movement_ignores_line_feed_new_line_mode() {
+    let mut e = engine();
+    e.feed(b"\x1b[20hab");
+    e.feed(&apc(&format!("Ga=T,s=16,v=32;{}", zeros(16, 32))));
+    assert_eq!(e.snapshot().cursor, Some((1, 4)));
+    e.feed(b"\x1b[24;3H");
+    e.feed(&apc(&format!("Ga=T,s=16,v=48;{}", zeros(16, 48))));
+    assert_eq!(e.snapshot().cursor, Some((23, 4)), "scrolled at the bottom");
+}
+
 #[test]
 fn an_image_reaching_the_right_edge_ends_on_the_next_line() {
     let mut e = engine();

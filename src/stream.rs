@@ -206,10 +206,12 @@ impl StreamFilter {
 /// down `rows - 1` lines (scrolling at the bottom), then right by
 /// `columns`, to the next line's start when that reaches the right edge.
 /// The line feeds stop at the screen height: past it, more only add blank
-/// history, and an image's rows come from the client.
+/// history, and an image's rows come from the client. They are IND
+/// (`ESC D`), not LF: IND never returns the carriage, whatever line
+/// feed/new line mode (`CSI 20 h`) says, so the column is kept.
 fn cursor_movement(columns: u32, rows: u32, at: &MarkerContext) -> Vec<u8> {
     let feeds = (rows.saturating_sub(1) as usize).min(at.screen_lines);
-    let mut out = b"\n".repeat(feeds);
+    let mut out = b"\x1bD".repeat(feeds);
     if at.cursor_col + columns as usize >= at.columns {
         out.extend_from_slice(b"\r\n");
     } else if columns > 0 {
