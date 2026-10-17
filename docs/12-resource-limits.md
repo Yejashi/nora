@@ -145,6 +145,8 @@ window the channel holds whatever the window sent.
 
 | Limit | Value | Past the limit | Evidence |
 | --- | --- | --- | --- |
+| History (`suggest::MAX_ENTRIES`, `MAX_HISTORY_BYTES`) | 5 000 command lines; 2 MiB of command lines plus their directories (8 per line, each at most `MAX_DIR_BYTES` = 4 096) | the lowest ranked entry is evicted; a longer directory is not remembered | `tests/suggest.rs` `entry_cap_evicts_the_lowest_ranked`, `directories_count_against_the_byte_cap` |
+| Executed commands awaiting the pump (`shell_input::MAX_EXECUTED`, `MAX_EXECUTED_BYTES`) | 256 commands; 256 KiB of command lines plus directories (each at most `MAX_CWD_BYTES` = 4 096) | the oldest is dropped; a longer directory is not kept | `tests/shell_input.rs` `cursor_is_clamped_and_executed_is_bounded`, `executed_bytes_count_the_directory` |
 | Directory entries per path completion (`suggest::MAX_DIR_ENTRIES`) | 4 096 | no completion | `tests/suggest.rs` `truncated_listing_offers_no_completion` |
 | Path completion lookups (`suggest::PathCompleter`) | 1 running on a `nora-path-complete` thread, 1 waiting | a newer request replaces the waiting one; a lookup that never returns (dead network mount) holds that one thread and blocks later path completions, never the pump | `tests/suggest.rs` `background_paths` |
 | PATH listing (`suggest::MAX_PATH_ENTRIES`, `MAX_PATH_EXECUTABLES`) | 262 144 entries, 65 536 names, on a background thread every 5 min | no executable completion | `tests/suggest.rs` `path_executables_lists_executable_files` |

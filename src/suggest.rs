@@ -16,10 +16,13 @@ use std::sync::{Arc, mpsc};
 
 /// Most distinct command lines kept.
 pub const MAX_ENTRIES: usize = 5_000;
-/// Most bytes of command lines kept in all.
+/// Most bytes of command lines and their directories kept in all.
 pub const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 /// Longest command line recorded, in bytes.
 pub const MAX_CMDLINE_BYTES: usize = 4096;
+/// Longest directory remembered for a command line, in bytes; a longer
+/// one is not remembered.
+pub const MAX_DIR_BYTES: usize = crate::shell_input::MAX_CWD_BYTES;
 /// Directories remembered per command line (the most used).
 const MAX_DIRS: usize = 8;
 /// First line of the history file.
@@ -94,6 +97,12 @@ impl History {
         self.index.get(cmdline).map(|&i| &self.entries[i])
     }
 
+    /// Bytes of command lines and directories stored, as counted against
+    /// [`MAX_HISTORY_BYTES`].
+    pub fn stored_bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Whether the history changed since it was loaded or last saved.
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -126,6 +135,7 @@ impl History {
         if !recordable(cmdline) {
             return false;
         }
+        let cwd = cwd.filter(|cwd| cwd.len() <= MAX_DIR_BYTES);
         let failed = matches!(exit, Some(status) if status != 0);
         let i = match self.index.get(cmdline) {
             Some(&i) => i,
@@ -143,6 +153,7 @@ impl History {
                 self.entries.len() - 1
             }
         };
+        self.bytes -= entry_bytes(&self.entries[i]);
         let entry = &mut self.entries[i];
         entry.count = entry.count.saturating_add(1);
         entry.failures = entry.failures.saturating_add(u32::from(failed));
@@ -160,6 +171,7 @@ impl History {
                 }
             }
         }
+        self.bytes += entry_bytes(&self.entries[i]);
         self.dirty = true;
         self.evict(cmdline, now);
         true
@@ -196,7 +208,7 @@ impl History {
                 });
             let Some(victim) = victim else { break };
             let removed = self.entries.swap_remove(victim);
-            self.bytes -= removed.cmdline.len();
+            self.bytes -= entry_bytes(&removed);
             self.index.remove(&removed.cmdline);
             if let Some(moved) = self.entries.get(victim) {
                 self.index.insert(moved.cmdline.clone(), victim);
@@ -245,7 +257,7 @@ impl History {
                 && !history.index.contains_key(&entry.cmdline)
             {
                 newest = newest.max(entry.last_used);
-                history.bytes += entry.cmdline.len();
+                history.bytes += entry_bytes(&entry);
                 history
                     .index
                     .insert(entry.cmdline.clone(), history.entries.len());
@@ -265,12 +277,13 @@ impl History {
     fn merge(&mut self, other: Self) {
         for theirs in other.entries {
             let Some(&i) = self.index.get(&theirs.cmdline) else {
-                self.bytes += theirs.cmdline.len();
+                self.bytes += entry_bytes(&theirs);
                 self.index
                     .insert(theirs.cmdline.clone(), self.entries.len());
                 self.entries.push(theirs);
                 continue;
             };
+            self.bytes -= entry_bytes(&self.entries[i]);
             let mine = &mut self.entries[i];
             if (theirs.count, theirs.failures) > (mine.count, mine.failures) {
                 mine.count = theirs.count;
@@ -287,6 +300,7 @@ impl History {
                 mine.dirs.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
                 mine.dirs.truncate(MAX_DIRS);
             }
+            self.bytes += entry_bytes(&self.entries[i]);
         }
         let newest = self.entries.iter().map(|e| e.last_used).max().unwrap_or(0);
         self.evict("", newest);
@@ -383,6 +397,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// The bytes an entry holds, as counted against [`MAX_HISTORY_BYTES`]:
+/// its command line and its directories.
+fn entry_bytes(entry: &Entry) -> usize {
+    entry.cmdline.len() + entry.dirs.iter().map(|(dir, _)| dir.len()).sum::<usize>()
+}
+
 /// Whether a (trailing-trimmed) command line may be stored.
 fn recordable(cmdline: &str) -> bool {
     !cmdline.is_empty()
@@ -402,7 +422,11 @@ fn parse_line(line: &str) -> Option<Entry> {
     let mut dirs = Vec::new();
     for field in fields.take(MAX_DIRS) {
         let (n, dir) = field.split_once(':')?;
-        dirs.push((unescape(dir)?, n.parse().ok()?));
+        let dir = unescape(dir)?;
+        let n = n.parse().ok()?;
+        if dir.len() <= MAX_DIR_BYTES {
+            dirs.push((dir, n));
+        }
     }
     Some(Entry {
         cmdline,

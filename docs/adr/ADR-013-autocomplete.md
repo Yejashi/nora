@@ -136,8 +136,9 @@ Option 4, with these parts:
    recency (4 within an hour, 2 within a day, 1 within a week, else 0.5),
    x 3 when it ran in the current directory, x (0.2 + 0.8 x success
    ratio). Not recorded: lines starting with a space, multi-line or with
-   control characters, over 4 KiB. Caps: 5 000 entries, 2 MiB; the lowest
-   ranked is evicted. File `$XDG_STATE_HOME/nora/history` (mode 0600,
+   control characters, over 4 KiB. Caps: 5 000 entries, 2 MiB of command
+   lines and their directories (8 per line; a directory over 4 096 bytes
+   is not remembered); the lowest ranked is evicted. File `$XDG_STATE_HOME/nora/history` (mode 0600,
    atomic rename, damaged lines skipped; each save loads, merges and
    renames under an exclusive `flock` on `history.lock`, waiting at most
    1 s, so concurrent saves from several processes keep every command). Tests: `tests/suggest.rs`.

@@ -216,3 +216,32 @@ fn bare_d_completes_at_the_next_prompt() {
     state.apply(&ShellEvent::CommandExit(3), None);
     assert!(state.take_executed().is_empty());
 }
+
+/// The executed-command queue counts each command's directory against
+/// its byte cap, and drops a directory longer than `PATH_MAX` (an OSC 7
+/// report may be 64 KiB).
+#[test]
+fn executed_bytes_count_the_directory() {
+    use nora::shell_input::{MAX_CWD_BYTES, MAX_EXECUTED_BYTES};
+    let mut state = ShellInput::new();
+    let huge = format!("/{}", "d".repeat(64 * 1024));
+    state.apply(&ShellEvent::CommandLine("ls".to_string()), Some(&huge));
+    state.apply(&ShellEvent::CommandExit(0), None);
+    let taken = state.take_executed();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].cwd, None, "a directory past PATH_MAX is not kept");
+
+    let long = format!("/{}", "d".repeat(MAX_CWD_BYTES - 1));
+    for i in 0..MAX_EXECUTED {
+        state.apply(&ShellEvent::CommandLine(format!("c{i}")), Some(&long));
+        state.apply(&ShellEvent::CommandExit(0), None);
+    }
+    let taken = state.take_executed();
+    let bytes: usize = taken
+        .iter()
+        .map(|c| c.cmdline.len() + c.cwd.as_ref().map_or(0, String::len))
+        .sum();
+    assert!(bytes <= MAX_EXECUTED_BYTES, "{bytes} bytes kept");
+    assert!(taken.len() < MAX_EXECUTED, "the byte cap bounds the count");
+    assert_eq!(taken.last().unwrap().cwd.as_deref(), Some(long.as_str()));
+}

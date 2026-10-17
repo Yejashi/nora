@@ -18,8 +18,12 @@ use crate::prompt_marker::{MarkerKind, ShellEvent};
 
 /// Most executed commands kept until the consumer takes them.
 pub const MAX_EXECUTED: usize = 256;
-/// Most bytes of executed command lines kept until taken.
+/// Most bytes of executed command lines and their directories kept until
+/// taken.
 pub const MAX_EXECUTED_BYTES: usize = 256 * 1024;
+/// Longest working directory kept with a command, in bytes (`PATH_MAX`);
+/// a longer one (an OSC 7 report may be up to 64 KiB) is not kept.
+pub const MAX_CWD_BYTES: usize = 4096;
 
 /// The line editor's buffer as last reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,10 +47,18 @@ impl LineBuffer {
 pub struct ExecutedCommand {
     /// The command line as the shell reported it.
     pub cmdline: String,
-    /// The working directory the shell last reported (OSC 7), if any.
+    /// The working directory the shell last reported (OSC 7), if any and
+    /// at most [`MAX_CWD_BYTES`].
     pub cwd: Option<String>,
     /// The exit status from `OSC 133 ; D ; <status>`, once reported.
     pub exit: Option<i32>,
+}
+
+impl ExecutedCommand {
+    /// The bytes it holds, as counted against [`MAX_EXECUTED_BYTES`].
+    fn bytes(&self) -> usize {
+        self.cmdline.len() + self.cwd.as_ref().map_or(0, String::len)
+    }
 }
 
 /// Per-pane shell input state, shared by the PTY filter (writer) and the
@@ -93,17 +105,20 @@ impl ShellInput {
             }
             ShellEvent::BufferEnd => self.buffer = None,
             ShellEvent::CommandLine(cmdline) => {
-                self.executed_bytes += cmdline.len();
-                self.executed.push_back(ExecutedCommand {
+                let command = ExecutedCommand {
                     cmdline: cmdline.clone(),
-                    cwd: cwd.map(str::to_string),
+                    cwd: cwd
+                        .filter(|cwd| cwd.len() <= MAX_CWD_BYTES)
+                        .map(str::to_string),
                     exit: None,
-                });
+                };
+                self.executed_bytes += command.bytes();
+                self.executed.push_back(command);
                 while self.executed.len() > MAX_EXECUTED || self.executed_bytes > MAX_EXECUTED_BYTES
                 {
                     match self.executed.pop_front() {
                         Some(old) => {
-                            self.executed_bytes -= old.cmdline.len();
+                            self.executed_bytes -= old.bytes();
                             self.complete = self.complete.saturating_sub(1);
                         }
                         None => break,
@@ -138,7 +153,7 @@ impl ShellInput {
     pub fn take_executed(&mut self) -> Vec<ExecutedCommand> {
         let taken: Vec<ExecutedCommand> = self.executed.drain(..self.complete).collect();
         self.complete = 0;
-        self.executed_bytes -= taken.iter().map(|c| c.cmdline.len()).sum::<usize>();
+        self.executed_bytes -= taken.iter().map(ExecutedCommand::bytes).sum::<usize>();
         taken
     }
 

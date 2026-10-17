@@ -108,6 +108,52 @@ fn entry_cap_evicts_the_lowest_ranked() {
     );
 }
 
+/// Directories count against the byte cap: command lines each run in
+/// eight `PATH_MAX`-long directories stay within `MAX_HISTORY_BYTES`, in
+/// memory and after a save and load; a longer directory is not kept.
+#[test]
+fn directories_count_against_the_byte_cap() {
+    use nora::suggest::{MAX_DIR_BYTES, MAX_HISTORY_BYTES};
+    let mut h = History::new();
+    let huge = format!("/{}", "d".repeat(64 * 1024));
+    assert!(h.record("ls", Some(&huge), Some(0), NOW));
+    assert!(h.get("ls").unwrap().dirs.is_empty(), "past PATH_MAX");
+    let mut recorded = vec!["ls".to_string()];
+    for i in 0..200 {
+        let cmd = format!("cmd {i}");
+        for d in 0..8 {
+            let dir = format!("/{d}{}", "x".repeat(MAX_DIR_BYTES - 2));
+            assert!(h.record(&cmd, Some(&dir), Some(0), NOW + i));
+        }
+        recorded.push(cmd);
+    }
+    let counted = |h: &History| -> usize {
+        recorded
+            .iter()
+            .filter_map(|c| h.get(c))
+            .map(|e| e.cmdline.len() + e.dirs.iter().map(|(d, _)| d.len()).sum::<usize>())
+            .sum()
+    };
+    assert_eq!(counted(&h), h.stored_bytes(), "accounting matches");
+    assert!(
+        h.stored_bytes() <= MAX_HISTORY_BYTES,
+        "{}",
+        h.stored_bytes()
+    );
+    assert!(h.len() < 200, "the byte cap evicted entries");
+    assert!(h.get("cmd 199").is_some(), "the newest stays");
+
+    let dir = std::env::temp_dir().join(format!("nora-suggest-dirbytes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("history");
+    h.save(&path).unwrap();
+    let disk = History::load(&path).unwrap();
+    assert_eq!(counted(&disk), disk.stored_bytes());
+    assert!(disk.stored_bytes() <= MAX_HISTORY_BYTES);
+    assert_eq!(disk.len(), h.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn history_file_round_trips_and_tolerates_damage() {
     let dir = std::env::temp_dir().join(format!("nora-suggest-{}", std::process::id()));
