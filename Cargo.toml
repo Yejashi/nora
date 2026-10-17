@@ -73,9 +73,13 @@ codegen-units = 1
 # `Engine::feed` (headless/tests) and `EventLoop::pty_read` (PTY) paths, so
 # the filter must run inside the pinned `EventLoop` (N32a already covers the
 # `Engine::feed` path). The vendored copy is byte-identical to the pinned
-# 0.26.0 except for: the `Filter` trait, the `EventLoop::filter` field,
-# `EventLoop::with_filter`, the `pty_read` hook, and deferring a `pty_read`
-# error until already-read bytes are parsed (no lost final output). See
+# 0.26.0 except where marked `// nora:`: the `Filter` trait, the
+# `EventLoop::filter` field, `EventLoop::with_filter`, the `pty_read` hook
+# and `at_marker_position` (markers inside a synchronized update), the
+# in-flight input counter, deferring a `pty_read` error until already-read
+# bytes are parsed and woken for (no lost final output), `send` accepting a
+# queued message whatever the waker reports, the DA1 reply (`?62;22c`), and
+# `grow_lines` not counting its history scroll as a shift. See
 # docs/adr/ADR-011-graphics-apc-hook.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
