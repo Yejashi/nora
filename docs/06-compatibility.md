@@ -37,6 +37,8 @@ Route engine PTY-write events to the session's ordered writer. For color/size qu
 
 For synchronized updates, first inspect the pinned parser/worker support. If it handles the mode and timeout, preserve it through the session adapter. Do not add a second CSI scanner. If needed, extend a defined engine hook or a minimal patch. Missing-end and resize/shutdown behavior must be tested. Proposed timeout: 200 ms, to be calibrated and recorded; it bounds withheld presentation, not data parsing.
 
+Status 2026-10-17: the pinned parser buffers an update and ends it after 150 ms (vte `SYNC_UPDATE_TIMEOUT`). A stream marker inside an update (OSC 133, kitty APC, `CSI 2 J` for graphics) parses the buffered bytes so the marker sees the terminal at its position, then resumes the update (`at_marker_position`), so the terminal can hold half a frame. The vendored loop therefore sends no redraw at the end of a read while an update is still pending, and reports it through a shared flag (`EventLoop::with_sync_pending`, `PtySession::sync_pending`); the pump builds no frame while it is set. The end marker on a later read, or the timeout, sends the redraw (`tests/event_loop_sync.rs`). Known limit: each resumed update restarts the 150 ms timeout (vte offers no way to keep the deadline), so markers inside an unterminated update can extend it; the 2 MiB sync buffer cap still ends it.
+
 ## Keyboard pipeline
 
 Use this order: IME/composition handling → enabled local shortcuts → normalized key event → mode-aware encoder → accepted ordered PTY bytes. Text events represent the active layout; physical key IDs are for explicit physical bindings. Do not produce the same text from both key events and IME commits.

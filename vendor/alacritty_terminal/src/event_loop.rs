@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -160,6 +160,10 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// accepted, so the owner can bound input end to end (the channel and
     /// the write list are otherwise unbounded).
     in_flight: Option<Arc<AtomicUsize>>,
+    /// nora: whether a synchronized update is still pending after the
+    /// last read (set by `pty_read`, cleared when the update times out),
+    /// so the owner can hold its frame until the update ends.
+    sync_pending: Option<Arc<AtomicBool>>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -188,6 +192,7 @@ where
             ref_test,
             filter: None,
             in_flight: None,
+            sync_pending: None,
         })
     }
 
@@ -204,6 +209,12 @@ where
     /// nora: install the shared in-flight byte counter (see the field).
     pub fn with_in_flight(mut self, counter: Arc<AtomicUsize>) -> Self {
         self.in_flight = Some(counter);
+        self
+    }
+
+    /// nora: install the shared synchronized-update flag (see the field).
+    pub fn with_sync_pending(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.sync_pending = Some(flag);
         self
     }
 
@@ -337,8 +348,17 @@ where
             }
         }
 
-        // Queue terminal redraw unless all processed bytes were synchronized.
-        if state.parser.sync_bytes_count() < processed && processed > 0 {
+        // nora: queue a redraw only when no synchronized update is pending.
+        // Upstream compared the buffered byte count with the bytes read,
+        // but `at_marker_position` parses the buffered part of an update
+        // and resumes it, so the count no longer says whether the
+        // terminal holds a half-applied frame. The update's end (ESU on a
+        // later read) or its timeout sends the redraw instead.
+        let pending = state.parser.sync_timeout().sync_timeout().is_some();
+        if let Some(flag) = &self.sync_pending {
+            flag.store(pending, Ordering::Release);
+        }
+        if processed > 0 && !pending {
             self.event_proxy.send_event(Event::Wakeup);
         }
 
@@ -427,6 +447,10 @@ where
                 // Handle synchronized update timeout.
                 if events.is_empty() && self.rx.peek().is_none() {
                     state.parser.stop_sync(&mut *self.terminal.lock());
+                    // nora: the update ended (see `sync_pending`).
+                    if let Some(flag) = &self.sync_pending {
+                        flag.store(false, Ordering::Release);
+                    }
                     self.event_proxy.send_event(Event::Wakeup);
                     continue;
                 }

@@ -63,14 +63,20 @@ pub fn pump_tick_with(session: &mut PtySession, want_snapshot: bool) -> PumpOutc
     }
 
     let mut snapshot = None;
+    // While a synchronized update is pending the terminal may hold part of
+    // its frame (a stream marker inside it parses the buffered bytes): no
+    // frame until it ends or times out, which wakes the pump again.
+    // (Read after the probe, which waits for a read in progress.)
     if !terminated && want_snapshot {
         let (damage, cursor) = session.engine().probe();
+        let sync_pending = session.sync_pending();
         // An image change is a frame even without grid damage, and so is
         // a change at the cursor the term reports as cursor-only damage
         // (`Engine::cursor_changed`).
-        if !is_noop_damage(&damage, cursor)
-            || session.engine().cursor_changed()
-            || session.engine().graphics_changed()
+        if !sync_pending
+            && (!is_noop_damage(&damage, cursor)
+                || session.engine().cursor_changed()
+                || session.engine().graphics_changed())
         {
             snapshot = Some(session.engine().snapshot());
         }

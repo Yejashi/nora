@@ -215,6 +215,9 @@ pub struct PtySession {
     /// Bytes sent as `Msg::Input` and not yet written (decremented by the
     /// vendored loop's `pty_write`).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether a synchronized update was pending after the PTY loop's
+    /// last read (set by the vendored loop): its frame is half-applied.
+    sync_pending: Arc<std::sync::atomic::AtomicBool>,
     /// The session loop thread (N12a): a wrapper around the pinned PTY
     /// reader that folds [`Lifecycle::Exiting`] on the wrapper's return
     /// (every exit path of the pinned loop funnels through it) and
@@ -332,11 +335,13 @@ impl PtySession {
         );
         let pty_filter = crate::stream::StreamFilter::new(engine.stream_targets());
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sync_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
             .map(|loop_| {
                 loop_
                     .with_filter(Box::new(pty_filter))
                     .with_in_flight(in_flight.clone())
+                    .with_sync_pending(sync_pending.clone())
             })
             .map_err(PtyError::Spawn)?;
         let sender = loop_.channel();
@@ -378,6 +383,7 @@ impl PtySession {
             sender,
             palette: options.palette,
             in_flight,
+            sync_pending,
             #[cfg(unix)]
             child_pid,
             #[cfg(unix)]
@@ -479,6 +485,14 @@ impl PtySession {
     /// (at most [`MAX_IN_FLIGHT`] plus one flush chunk).
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a synchronized update (`CSI ? 2026 h`) is still pending:
+    /// the terminal may hold part of its frame, so no frame should be
+    /// built from it until the update ends or times out (the loop then
+    /// sends a wakeup).
+    pub fn sync_pending(&self) -> bool {
+        self.sync_pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Bytes still reserved by the session writer.
