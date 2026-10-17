@@ -150,3 +150,80 @@ fn an_image_change_without_damage_is_a_frame() {
     assert!(e.snapshot().images.is_empty());
     assert!(!e.graphics_changed());
 }
+
+/// Unicode placeholders (ADR-014): a virtual placement (`U=1`) draws
+/// nothing by itself and does not move the cursor; `U+10EEEE` cells show
+/// its tiles. The image id is the foreground color, row and column are
+/// combining marks, and a cell without marks continues the one to its
+/// left.
+#[test]
+fn unicode_placeholders_show_tiles() {
+    let mut e = engine();
+    // 20x20 px into 2x1 cells of 8x16: fitted to 16x16, centered (no gap
+    // horizontally: 2 cells are 16 px wide).
+    e.feed(&apc(&format!(
+        "Ga=T,U=1,i=42,c=2,r=1,q=2,s=20,v=20;{}",
+        zeros(20, 20)
+    )));
+    let snap = e.snapshot();
+    assert_eq!(
+        snap.cursor,
+        Some((0, 0)),
+        "a virtual placement keeps the cursor"
+    );
+    assert!(snap.images.is_empty(), "nothing without placeholder cells");
+    // 256-color id 42; row 0 col 0 by marks (U+0305 = 0), then inherited.
+    e.feed("\x1b[38;5;42m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\x1b[m".as_bytes());
+    let tiles = e.snapshot().images;
+    let geometry: Vec<_> = tiles
+        .iter()
+        .map(|t| (t.row, t.col, t.source, t.size))
+        .collect();
+    assert_eq!(
+        geometry,
+        vec![
+            (0, 0, [0, 0, 10, 20], (8, 16)),
+            (0, 1, [10, 0, 10, 20], (8, 16))
+        ],
+        "each cell shows its half of the fitted image"
+    );
+}
+
+#[test]
+fn placeholder_ids_from_true_color_and_high_byte() {
+    let mut e = engine();
+    // Image id 0x05_000102: 24-bit color 0,1,2 and a third mark for 5.
+    let id = 0x0500_0102u32;
+    e.feed(&apc(&format!(
+        "Ga=T,U=1,i={id},c=1,r=1,q=2,s=8,v=16;{}",
+        zeros(8, 16)
+    )));
+    // Marks: row 0 (U+0305), col 0 (U+0305), high byte 5 (the 6th mark,
+    // U+033D).
+    e.feed("\x1b[38;2;0;1;2m\u{10EEEE}\u{0305}\u{0305}\u{033D}\x1b[m".as_bytes());
+    let tiles = e.snapshot().images;
+    assert_eq!(tiles.len(), 1);
+    assert_eq!(tiles[0].image_id, id);
+    // Without the high byte it names another image: nothing to show.
+    e.feed("\r\n\x1b[38;2;0;1;2m\u{10EEEE}\u{0305}\u{0305}\x1b[m".as_bytes());
+    assert_eq!(e.snapshot().images.len(), 1);
+}
+
+#[test]
+fn placeholder_placement_ids_and_missing_placements() {
+    let mut e = engine();
+    e.feed(&apc(&format!("Ga=t,i=7,q=2,s=8,v=16;{}", zeros(8, 16))));
+    e.feed(&apc("Ga=p,U=1,i=7,p=3,c=1,r=1,q=2"));
+    // Underline color 3 names placement 3; 4 names none.
+    e.feed("\x1b[38;5;7;58;5;3m\u{10EEEE}\u{0305}\u{0305}\x1b[m".as_bytes());
+    assert_eq!(e.snapshot().images.len(), 1);
+    e.feed("\r\n\x1b[38;5;7;58;5;4m\u{10EEEE}\u{0305}\u{0305}\x1b[m".as_bytes());
+    assert_eq!(
+        e.snapshot().images.len(),
+        1,
+        "no tile for a missing placement"
+    );
+    // Deleting the image's placements removes the virtual one too.
+    e.feed(&apc("Ga=d,d=i,i=7"));
+    assert!(e.snapshot().images.is_empty());
+}

@@ -971,6 +971,25 @@ scenario_imagetools() {
         [ "$(cat "$dir/$name.status" 2>/dev/null)" = 0 ] || { fail imagetools "$name did not exit 0"; return; }
         [ "$colored" -gt 19000 ] || { fail imagetools "$name drew no image"; return; }
     done
+    # Inside tmux: icat sends the image through tmux's passthrough and
+    # prints Unicode placeholder cells, which tmux redraws to nora.
+    if command -v kitten >/dev/null 2>&1 && command -v tmux >/dev/null 2>&1; then
+        echo "set -g allow-passthrough on" >"$dir/tmux.conf"
+        rm -f "$dir/tmux.status"
+        launch "imagetools" tmux -L nora-e2e-img -f "$dir/tmux.conf" new-session \
+            "kitten icat '$dir/img.png'; echo \$? >'$dir/tmux.status'; sleep 30" \
+            || { fail imagetools "no window for tmux"; return; }
+        wait_file "$dir/tmux.status"
+        sleep 0.5
+        shot "$dir/tmux.png"
+        finish
+        tmux -L nora-e2e-img kill-server 2>/dev/null
+        local colored
+        colored=$("${IM_CONVERT[@]}" "$dir/tmux.png" -crop 1024x540+0+0 +repage -fuzz 10% \
+            -fill black -opaque black -fill white +opaque black -format '%[fx:round(mean*w*h)]' info:)
+        echo "  icat in tmux (placeholders): exit $(cat "$dir/tmux.status" 2>/dev/null), image px $colored"
+        [ "$colored" -gt 19000 ] || { fail imagetools "no image through tmux placeholders"; return; }
+    fi
     [ "$ran" = 1 ] || { echo "SKIP imagetools: neither kitten nor chafa installed"; return; }
     pass imagetools
 }

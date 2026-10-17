@@ -70,9 +70,11 @@ decoded); `i`, `I`, `p`;
 source rectangle `x,y,w,h`; `X,Y`; `c,r` (aspect kept when one is given);
 `C`; `z`; delete `a/A i/I n/N c/C p/P q/Q x/X y/Y z/Z r/R`; chunking.
 
+Unicode placeholders (`U=1` virtual placements and `U+10EEEE` cells) were
+added after the first slices.
+
 Out (documented, answered with an error where a reply is due):
-animation (`a=f`, `a=a`, `a=c`), relative placements
-(`P,Q,H,V`), Unicode placeholders (`U=1`).
+animation (`a=f`, `a=a`, `a=c`), relative placements (`P,Q,H,V`).
 
 ## Consequences
 

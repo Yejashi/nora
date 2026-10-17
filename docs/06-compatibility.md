@@ -107,8 +107,17 @@ Images are handled on the reader thread at their place in the output
 | Layers | z below -1 073 741 824 under cell backgrounds, other negative z under the text, z >= 0 over it | e2e `graphics` (z=-1 and z=0 checked) |
 | Deletes and clears | `d=` a i n c p q x y z r (uppercase frees unused images); `CSI 2 J` deletes the screen's placements, `CSI 3 J` the scrollback's, `ESC c` everything; the alternate screen has its own placements, dropped when it is left | `tests/graphics_image.rs`, `tests/graphics_protocol.rs` |
 
-Not implemented (an error reply where one is due): animation (`a=f`, `a=a`, `a=c`), relative placements (`P`, `Q`, `H`,
-`V`), Unicode placeholders (`U=1`).
+Unicode placeholders: `U=1` makes a virtual placement (no cursor
+movement, not drawn by itself); each `U+10EEEE` cell shows its tile of the
+image fitted into the placement's cells (aspect kept, centered), with the
+image id from the foreground color (256-color or 24-bit, high byte from a
+third mark), the placement id from the underline color, and row and
+column from the protocol's combining marks (inherited from the cell to the
+left when omitted); the placeholder character itself is never drawn
+(`tests/graphics_protocol.rs`; e2e `imagetools` runs icat inside tmux).
+
+Not implemented (an error reply where one is due): animation (`a=f`,
+`a=a`, `a=c`), relative placements (`P`, `Q`, `H`, `V`).
 
 Real clients: `kitten icat` (support detection, then shared memory, file or
 stream transfer) and `chafa -f kitty` draw their images (e2e `imagetools`;

@@ -281,7 +281,7 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   installers; work on them is deferred. See
   [docs/15-platforms.md](docs/15-platforms.md).
 - **Not supported yet:** font ligatures; kitty graphics animation and
-  Unicode placeholders (images themselves are shown).
+  relative placements (images, including in tmux, are shown).
 - **Input methods.** Composition is checked end to end with ibus over
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
   Wayland text-input path and the drawing of a candidate window have not

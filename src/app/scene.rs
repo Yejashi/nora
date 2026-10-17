@@ -104,7 +104,8 @@ impl Scene {
                         color: style.bg,
                     });
                 }
-                if cell.ch == ' ' || style.conceal {
+                // Unicode placeholders show image tiles (ADR-014), never a glyph.
+                if cell.ch == ' ' || style.conceal || cell.ch == nora::graphics_image::PLACEHOLDER {
                     continue;
                 }
                 // The cluster: the character plus its combining marks.

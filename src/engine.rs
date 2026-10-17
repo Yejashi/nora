@@ -1321,14 +1321,17 @@ impl Engine {
                 graphics.leave_alternate_screen();
             }
             self.graphics_seen = graphics.version();
-            graphics.visible(
+            let mut images = graphics.visible(
                 grid.total_scrolled(),
                 grid.total_pulled(),
                 display_offset,
                 self.rows,
                 history,
                 alt,
-            )
+            );
+            images.extend(placeholder_tiles(&cells, &graphics));
+            images.sort_by_key(|image| image.z);
+            images
         };
 
         // Increment before assignment: the first snapshot is epoch 1.
@@ -1442,4 +1445,76 @@ impl Engine {
         state.events.clear();
         state.bytes = 0;
     }
+}
+
+/// Unicode placeholder cells (kitty graphics, ADR-014): each shows the tile
+/// of a virtual placement given by its marks (row, column, image id high
+/// byte), its foreground color (image id) and underline color (placement
+/// id). Missing marks continue the cell to the left when it has the same
+/// colors: the same row, the next column, the same high byte.
+fn placeholder_tiles(
+    cells: &[CellText],
+    graphics: &crate::graphics_image::GraphicsState,
+) -> Vec<crate::graphics_image::VisibleImage> {
+    use crate::graphics_image::{PLACEHOLDER, placeholder_mark};
+    struct Previous {
+        row: usize,
+        col: usize,
+        fg: Color,
+        underline: Option<Color>,
+        image_row: u32,
+        image_col: u32,
+        high: u32,
+    }
+    let id_of = |color: Color| match color {
+        Color::Spec(rgb) => Some(u32::from(rgb.r) << 16 | u32::from(rgb.g) << 8 | u32::from(rgb.b)),
+        Color::Indexed(index) => Some(u32::from(index)),
+        Color::Named(_) => None,
+    };
+    let cell = graphics.cell_size();
+    let mut tiles = Vec::new();
+    let mut previous: Option<Previous> = None;
+    for c in cells.iter().filter(|c| c.ch == PLACEHOLDER) {
+        let Some(low) = id_of(c.fg) else {
+            previous = None;
+            continue;
+        };
+        let marks: Vec<u32> = c
+            .zerowidth
+            .iter()
+            .filter_map(|&m| placeholder_mark(m))
+            .collect();
+        let left = previous.as_ref().filter(|p| {
+            p.row == c.row && p.col + 1 == c.col && p.fg == c.fg && p.underline == c.underline_color
+        });
+        let (image_row, image_col, high) = match (marks.as_slice(), left) {
+            ([], Some(p)) => (p.image_row, p.image_col + 1, p.high),
+            ([r], Some(p)) if *r == p.image_row => (*r, p.image_col + 1, p.high),
+            ([r, col], Some(p)) if *r == p.image_row && *col == p.image_col + 1 => {
+                (*r, *col, p.high)
+            }
+            ([r, col, high, ..], _) => (*r, *col, *high),
+            ([r, col], _) => (*r, *col, 0),
+            ([r], _) => (*r, 0, 0),
+            ([], _) => (0, 0, 0),
+        };
+        previous = Some(Previous {
+            row: c.row,
+            col: c.col,
+            fg: c.fg,
+            underline: c.underline_color,
+            image_row,
+            image_col,
+            high,
+        });
+        let id = high << 24 | low;
+        let placement = c.underline_color.and_then(id_of).unwrap_or(0);
+        if let Some(mut tile) = graphics.placeholder_tile(id, placement, image_row, image_col, cell)
+        {
+            tile.row = c.row as i32;
+            tile.col = c.col as u32;
+            tiles.push(tile);
+        }
+    }
+    tiles
 }

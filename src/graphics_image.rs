@@ -96,6 +96,9 @@ pub struct Placement {
     pub rows: u32,
     pub z: i32,
     pub alt: bool,
+    /// A virtual placement (`U=1`): drawn only where the text has Unicode
+    /// placeholder cells for it, never on its own.
+    pub is_virtual: bool,
     /// Placement order, for eviction and stable drawing.
     serial: u64,
 }
@@ -394,6 +397,7 @@ impl GraphicsState {
             (c, r) => (c * cw, r * ch),
         };
         let offset = (keys.u32("X").min(cw - 1), keys.u32("Y").min(ch - 1));
+        let is_virtual = keys.u32("U") == 1;
         let columns = (offset.0 + size.0).div_ceil(cw).max(1);
         let rows = (offset.1 + size.1).div_ceil(ch).max(1);
         if placement_id != 0 {
@@ -425,10 +429,11 @@ impl GraphicsState {
             columns,
             rows,
             z: keys.i32("z"),
-            alt: at.alt,
+            alt: at.alt && !is_virtual,
+            is_virtual,
             serial: self.serial,
         });
-        (keys.u32("C") != 1).then_some((columns, rows))
+        (keys.u32("C") != 1 && !is_virtual).then_some((columns, rows))
     }
 
     /// `a=d`: delete placements (lowercase) or placements and their now
@@ -455,6 +460,19 @@ impl GraphicsState {
             _ => Some(id),
         };
         let doomed = |p: &Placement| -> bool {
+            if p.is_virtual {
+                // Not on the screen: only deletes by image, number, z or id
+                // range reach it.
+                return matches!(what.to_ascii_lowercase(), 'i' | 'n' | 'z' | 'r') && {
+                    match what.to_ascii_lowercase() {
+                        'i' | 'n' => {
+                            Some(p.image_id) == target_image && (pid == 0 || p.placement_id == pid)
+                        }
+                        'z' => p.z == z,
+                        _ => p.image_id >= x && p.image_id <= y,
+                    }
+                };
+            }
             if p.alt != at.alt {
                 return false;
             }
@@ -509,15 +527,16 @@ impl GraphicsState {
         let lines = at.lines as i64;
         self.placements.retain(|p| {
             let top = p.line_now(at.scrolled, at.pulled);
-            p.alt != at.alt || !(top + i64::from(p.rows) > 0 && top < lines)
+            p.is_virtual || p.alt != at.alt || !(top + i64::from(p.rows) > 0 && top < lines)
         });
     }
 
     /// `CSI 3 J`: delete the placements in the scrollback.
     pub fn clear_scrollback(&mut self, at: &Cursor) {
         self.version += 1;
-        self.placements
-            .retain(|p| p.alt || p.line_now(at.scrolled, at.pulled) + i64::from(p.rows) > 0);
+        self.placements.retain(|p| {
+            p.is_virtual || p.alt || p.line_now(at.scrolled, at.pulled) + i64::from(p.rows) > 0
+        });
     }
 
     /// `ESC c`: delete every placement and image.
@@ -552,11 +571,11 @@ impl GraphicsState {
     ) -> Vec<VisibleImage> {
         let oldest = -(history as i64);
         self.placements
-            .retain(|p| p.line_now(scrolled, pulled) + i64::from(p.rows) > oldest);
+            .retain(|p| p.is_virtual || p.line_now(scrolled, pulled) + i64::from(p.rows) > oldest);
         let mut shown: Vec<(&Placement, i64)> = self
             .placements
             .iter()
-            .filter(|p| p.alt == alt)
+            .filter(|p| !p.is_virtual && p.alt == alt)
             .map(|p| (p, p.line_now(scrolled, pulled) + display_offset as i64))
             .filter(|(p, row)| *row < lines as i64 && row + i64::from(p.rows) > 0)
             .collect();
@@ -581,6 +600,65 @@ impl GraphicsState {
                 })
             })
             .collect()
+    }
+
+    /// The part of image `image_id` that a placeholder cell at (`row`, `col`)
+    /// of its virtual placement shows, for a `cell`-sized cell: the image is
+    /// fitted into the placement's columns x rows, keeping its aspect ratio,
+    /// centered. `placement_id` 0 takes the newest virtual placement of the
+    /// image. `row` and `col` of the result are left 0 for the caller.
+    pub fn placeholder_tile(
+        &self,
+        image_id: u32,
+        placement_id: u32,
+        row: u32,
+        col: u32,
+        cell: (u32, u32),
+    ) -> Option<VisibleImage> {
+        let p = self
+            .placements
+            .iter()
+            .filter(|p| p.is_virtual && p.image_id == image_id)
+            .filter(|p| placement_id == 0 || p.placement_id == placement_id)
+            .max_by_key(|p| p.serial)?;
+        let image = self.images.get(&image_id)?;
+        let (cw, ch) = (f64::from(cell.0.max(1)), f64::from(cell.1.max(1)));
+        let [sx, sy, sw, sh] = p.source;
+        let (iw, ih) = (f64::from(sw.max(1)), f64::from(sh.max(1)));
+        let (bw, bh) = (f64::from(p.columns) * cw, f64::from(p.rows) * ch);
+        let scale = (bw / iw).min(bh / ih);
+        let (dw, dh) = (iw * scale, ih * scale);
+        let (ox, oy) = ((bw - dw) / 2.0, (bh - dh) / 2.0);
+        // The cell's part of the fitted image, in the box's pixels.
+        let (cx, cy) = (f64::from(col) * cw, f64::from(row) * ch);
+        let x0 = cx.max(ox);
+        let y0 = cy.max(oy);
+        let x1 = (cx + cw).min(ox + dw);
+        let y1 = (cy + ch).min(oy + dh);
+        if x1 - x0 < 0.5 || y1 - y0 < 0.5 {
+            return None;
+        }
+        let to_source = |v: f64, origin: f64| (v - origin) / scale;
+        let source = [
+            sx + to_source(x0, ox).round() as u32,
+            sy + to_source(y0, oy).round() as u32,
+            (to_source(x1, ox) - to_source(x0, ox)).round().max(1.0) as u32,
+            (to_source(y1, oy) - to_source(y0, oy)).round().max(1.0) as u32,
+        ];
+        Some(VisibleImage {
+            image_id: image.id,
+            generation: image.generation,
+            width: image.width,
+            height: image.height,
+            pixels: Arc::clone(&image.pixels),
+            row: 0,
+            col: 0,
+            offset: ((x0 - cx).round() as u32, (y0 - cy).round() as u32),
+            source,
+            size: ((x1 - x0).round() as u32, (y1 - y0).round() as u32),
+            cell,
+            z: p.z,
+        })
     }
 
     /// The stored image `id`.
@@ -811,3 +889,47 @@ fn is_protocol_temp_file(path: &std::path::Path) -> bool {
     dirs.iter().any(|dir| path.starts_with(dir))
         && path.to_string_lossy().contains("tty-graphics-protocol")
 }
+
+/// The Unicode placeholder character: a cell showing part of an image of a
+/// virtual placement.
+pub const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// The number a combining mark gives a placeholder's row, column or image
+/// id high byte.
+pub fn placeholder_mark(mark: char) -> Option<u32> {
+    DIACRITICS
+        .iter()
+        .position(|&c| c == u32::from(mark))
+        .map(|i| i as u32)
+}
+
+/// The combining marks that number rows and columns of Unicode placeholder
+/// cells, in order (value = index): kitty's `gen/rowcolumn-diacritics.txt`,
+/// derived from Unicode 6.0 data.
+const DIACRITICS: [u32; 297] = [
+    0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A, 0x034B, 0x034C,
+    0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
+    0x036A, 0x036B, 0x036C, 0x036D, 0x036E, 0x036F, 0x0483, 0x0484, 0x0485, 0x0486, 0x0487, 0x0592,
+    0x0593, 0x0594, 0x0595, 0x0597, 0x0598, 0x0599, 0x059C, 0x059D, 0x059E, 0x059F, 0x05A0, 0x05A1,
+    0x05A8, 0x05A9, 0x05AB, 0x05AC, 0x05AF, 0x05C4, 0x0610, 0x0611, 0x0612, 0x0613, 0x0614, 0x0615,
+    0x0616, 0x0617, 0x0657, 0x0658, 0x0659, 0x065A, 0x065B, 0x065D, 0x065E, 0x06D6, 0x06D7, 0x06D8,
+    0x06D9, 0x06DA, 0x06DB, 0x06DC, 0x06DF, 0x06E0, 0x06E1, 0x06E2, 0x06E4, 0x06E7, 0x06E8, 0x06EB,
+    0x06EC, 0x0730, 0x0732, 0x0733, 0x0735, 0x0736, 0x073A, 0x073D, 0x073F, 0x0740, 0x0741, 0x0743,
+    0x0745, 0x0747, 0x0749, 0x074A, 0x07EB, 0x07EC, 0x07ED, 0x07EE, 0x07EF, 0x07F0, 0x07F1, 0x07F3,
+    0x0816, 0x0817, 0x0818, 0x0819, 0x081B, 0x081C, 0x081D, 0x081E, 0x081F, 0x0820, 0x0821, 0x0822,
+    0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082A, 0x082B, 0x082C, 0x082D, 0x0951, 0x0953, 0x0954,
+    0x0F82, 0x0F83, 0x0F86, 0x0F87, 0x135D, 0x135E, 0x135F, 0x17DD, 0x193A, 0x1A17, 0x1A75, 0x1A76,
+    0x1A77, 0x1A78, 0x1A79, 0x1A7A, 0x1A7B, 0x1A7C, 0x1B6B, 0x1B6D, 0x1B6E, 0x1B6F, 0x1B70, 0x1B71,
+    0x1B72, 0x1B73, 0x1CD0, 0x1CD1, 0x1CD2, 0x1CDA, 0x1CDB, 0x1CE0, 0x1DC0, 0x1DC1, 0x1DC3, 0x1DC4,
+    0x1DC5, 0x1DC6, 0x1DC7, 0x1DC8, 0x1DC9, 0x1DCB, 0x1DCC, 0x1DD1, 0x1DD2, 0x1DD3, 0x1DD4, 0x1DD5,
+    0x1DD6, 0x1DD7, 0x1DD8, 0x1DD9, 0x1DDA, 0x1DDB, 0x1DDC, 0x1DDD, 0x1DDE, 0x1DDF, 0x1DE0, 0x1DE1,
+    0x1DE2, 0x1DE3, 0x1DE4, 0x1DE5, 0x1DE6, 0x1DFE, 0x20D0, 0x20D1, 0x20D4, 0x20D5, 0x20D6, 0x20D7,
+    0x20DB, 0x20DC, 0x20E1, 0x20E7, 0x20E9, 0x20F0, 0x2CEF, 0x2CF0, 0x2CF1, 0x2DE0, 0x2DE1, 0x2DE2,
+    0x2DE3, 0x2DE4, 0x2DE5, 0x2DE6, 0x2DE7, 0x2DE8, 0x2DE9, 0x2DEA, 0x2DEB, 0x2DEC, 0x2DED, 0x2DEE,
+    0x2DEF, 0x2DF0, 0x2DF1, 0x2DF2, 0x2DF3, 0x2DF4, 0x2DF5, 0x2DF6, 0x2DF7, 0x2DF8, 0x2DF9, 0x2DFA,
+    0x2DFB, 0x2DFC, 0x2DFD, 0x2DFE, 0x2DFF, 0xA66F, 0xA67C, 0xA67D, 0xA6F0, 0xA6F1, 0xA8E0, 0xA8E1,
+    0xA8E2, 0xA8E3, 0xA8E4, 0xA8E5, 0xA8E6, 0xA8E7, 0xA8E8, 0xA8E9, 0xA8EA, 0xA8EB, 0xA8EC, 0xA8ED,
+    0xA8EE, 0xA8EF, 0xA8F0, 0xA8F1, 0xAAB0, 0xAAB2, 0xAAB3, 0xAAB7, 0xAAB8, 0xAABE, 0xAABF, 0xAAC1,
+    0xFE20, 0xFE21, 0xFE22, 0xFE23, 0xFE24, 0xFE25, 0xFE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186,
+    0x1D187, 0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242, 0x1D243, 0x1D244,
+];
