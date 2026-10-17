@@ -22,9 +22,29 @@
 [[ -n ${__nora_bash_loaded-} ]] && return 0
 __nora_bash_loaded=1
 
+# The terminal, as the fd the markers are written to. The DEBUG trap runs
+# with the command's redirections in effect (`{ echo a; } > out.txt`), so
+# B and C written to stdout would land in the file. The fd is dup'ed from
+# stdout (the terminal) at each prompt and closed as the command line's
+# first command starts, so commands never inherit it (a background daemon
+# holding it would keep the terminal open).
+__nora_fd=
+
+# Open the terminal fd afresh (stdout at prompt time is the terminal).
+__nora_open_fd() {
+    [[ -n $__nora_fd ]] && exec {__nora_fd}>&-
+    exec {__nora_fd}>&1
+}
+
+# Close the terminal fd before the user's commands run.
+__nora_close_fd() {
+    [[ -n $__nora_fd ]] && exec {__nora_fd}>&-
+    __nora_fd=
+}
+
 # Emit an OSC 133 marker: `ESC ] 133 ; <kind> ST`.
 __nora_osc133() {
-    printf '\033]133;%s\033\\' "$1"
+    printf '\033]133;%s\033\\' "$1" >&"${__nora_fd:-1}"
 }
 
 # Report the working directory: `ESC ] 7 ; file://<host><path> ST`, the
@@ -39,7 +59,7 @@ __nora_osc7() {
             *) printf -v hex '%%%02X' "'$ch"; out+=$hex ;;
         esac
     done
-    printf '\033]7;file://%s%s\033\\' "${HOSTNAME-}" "$out"
+    printf '\033]7;file://%s%s\033\\' "${HOSTNAME-}" "$out" >&"${__nora_fd:-1}"
 }
 
 # Set once a prompt is drawn, cleared by the first command after it.
@@ -51,6 +71,7 @@ __nora_at_prompt=
 # taken by the PROMPT_COMMAND entry itself (a function cannot see it).
 __nora_prompt_start() {
     [[ -n ${__nora_debug_installed-} ]] || __nora_install_debug_trap "$1"
+    __nora_open_fd
     __nora_osc133 D
     __nora_osc7
     __nora_osc133 A
@@ -73,6 +94,7 @@ __nora_command_start() {
         __nora_at_prompt=
         __nora_osc133 B
         __nora_osc133 C
+        __nora_close_fd
     fi
     return "${1:-0}"
 }

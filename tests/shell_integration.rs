@@ -308,3 +308,49 @@ fn bash_debug_trap_keeps_last_argument() {
         assert!(!out.grid.contains("No such file"), "{name}:\n{}", out.grid);
     }
 }
+
+/// The bash markers go to the terminal even when the command line's first
+/// command runs under a redirection (the DEBUG trap runs inside it), and
+/// the terminal fd they use is not inherited by the user's commands.
+#[test]
+fn bash_markers_bypass_redirections_and_stay_private() {
+    let Some(bash) = bash() else {
+        eprintln!("bash not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("bash-redirect");
+    let rc = format!("PS1='$ '\nsource {}\n", script("nora-bash.sh").display());
+    let mut shell = Shell::bash(bash, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    shell.run(
+        "{ echo a; echo b; } > group.txt; if true; then echo c; fi > if.txt; echo ran-$((1 + 1))",
+        "ran-2",
+    );
+    // A child lists where its fds point: stdin and stderr are the
+    // terminal, stdout is the file; a third terminal fd would be nora's.
+    shell.run(
+        "sh -c 'for f in /proc/$$/fd/*; do readlink \"$f\"; done' > fds.txt; echo ran-$((2 + 1))",
+        "ran-3",
+    );
+    let out = shell.exit();
+    assert_eq!(
+        std::fs::read_to_string(dir.path("group.txt")).expect("group.txt"),
+        "a\nb\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path("if.txt")).expect("if.txt"),
+        "c\n"
+    );
+    assert_eq!(
+        out.kinds(),
+        vec![D, A, B, C, D, A, B, C, D, A, B, C],
+        "grid:\n{}",
+        out.grid
+    );
+    let fds = std::fs::read_to_string(dir.path("fds.txt")).expect("fds.txt");
+    let terminal_fds = fds
+        .lines()
+        .filter(|line| line.starts_with("/dev/pts/"))
+        .count();
+    assert_eq!(terminal_fds, 2, "the child's fds:\n{fds}");
+}
