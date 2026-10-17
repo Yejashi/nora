@@ -378,3 +378,32 @@ fn layout_resize_updates_pty() {
     let total: u16 = rects.iter().map(|r| r.3 * r.4).sum();
     assert_eq!(total, 120 * 60);
 }
+
+/// A window too small for its panes: the active pane, which receives the
+/// input, always keeps the cells, at every depth of the tree.
+#[test]
+fn the_active_pane_keeps_the_cells_when_the_area_is_too_small() {
+    let size = |layout: &Layout, w, h, pane| {
+        layout
+            .compute_rectangles(w, h)
+            .into_iter()
+            .find(|r| r.0 == pane)
+            .map(|r| (r.3, r.4))
+    };
+    let mut layout = Layout::new();
+    let b = layout.split_horizontal(); // a | b, b active
+    assert_eq!(size(&layout, 1, 5, b), Some((1, 5)), "second child active");
+    assert_eq!(size(&layout, 1, 5, PaneId(0)), Some((0, 5)));
+    layout.focus_pane(PaneId(0));
+    assert_eq!(size(&layout, 1, 5, PaneId(0)), Some((1, 5)));
+    assert_eq!(size(&layout, 1, 5, b), Some((0, 5)));
+    // a | (b / c) in 2 columns and 1 row: c active.
+    layout.focus_pane(b);
+    let c = layout.split_vertical();
+    assert_eq!(size(&layout, 2, 1, c), Some((1, 1)));
+    assert_eq!(size(&layout, 2, 1, b), Some((1, 0)));
+    assert_eq!(size(&layout, 2, 1, PaneId(0)), Some((1, 1)));
+    assert_tiling(&layout.compute_rectangles(2, 1), 2, 1);
+    // With room for every pane nothing changes: ratios decide.
+    assert_eq!(size(&layout, 10, 10, c), Some((5, 5)));
+}

@@ -1568,6 +1568,9 @@ impl WinApp {
         self.layout.focus_pane(target);
         self.save_active_pane(PaneKey { tab, pane: active });
         self.load_active_pane(PaneKey { tab, pane: target });
+        // In an area too small for every pane the active one takes the
+        // cells, so a focus change can resize panes.
+        self.resize_all_panes();
         self.report_pane_focus(Some(PaneKey { tab, pane: active }));
     }
 
@@ -1610,6 +1613,7 @@ impl WinApp {
         let next_pane = PaneKey { tab, pane: target };
         self.save_active_pane(prev_pane);
         self.load_active_pane(next_pane);
+        self.resize_all_panes();
         self.report_pane_focus(Some(prev_pane));
         true
     }

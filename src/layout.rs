@@ -11,7 +11,9 @@
 //! allocation: at every split the first child gets `floor(size * ratio)` and
 //! the second child gets the remainder. When a split has at least two cells
 //! to divide, each child gets at least one (minimum grids; no zero grids).
-//! Closing a pane collapses the tree consistently: the closed pane's
+//! With fewer (a window shrunk below the panes it holds) the child holding
+//! the active pane takes the cells, so the active pane, which receives the
+//! input, is never the one left without room. Closing a pane collapses the tree consistently: the closed pane's
 //! sibling subtree takes its place.
 
 use std::collections::HashMap;
@@ -304,37 +306,57 @@ impl Layout {
                 ratio,
                 first,
                 second,
-            } => match direction {
-                SplitDirection::Horizontal => {
-                    let first_width = split_size(width, *ratio);
-                    let second_width = width - first_width;
+            } => {
+                // With under two cells to divide one child gets none: the
+                // one holding the active pane keeps the cells, so the pane
+                // that receives input is always the one shown.
+                let share = |total: u16| {
+                    if total < 2 && contains(second, self.active_pane) {
+                        0
+                    } else {
+                        split_size(total, *ratio)
+                    }
+                };
+                match direction {
+                    SplitDirection::Horizontal => {
+                        let first_width = share(width);
+                        let second_width = width - first_width;
 
-                    self.compute_rectangles_node(first, x, y, first_width, height, rects);
-                    self.compute_rectangles_node(
-                        second,
-                        x + first_width,
-                        y,
-                        second_width,
-                        height,
-                        rects,
-                    );
-                }
-                SplitDirection::Vertical => {
-                    let first_height = split_size(height, *ratio);
-                    let second_height = height - first_height;
+                        self.compute_rectangles_node(first, x, y, first_width, height, rects);
+                        self.compute_rectangles_node(
+                            second,
+                            x + first_width,
+                            y,
+                            second_width,
+                            height,
+                            rects,
+                        );
+                    }
+                    SplitDirection::Vertical => {
+                        let first_height = share(height);
+                        let second_height = height - first_height;
 
-                    self.compute_rectangles_node(first, x, y, width, first_height, rects);
-                    self.compute_rectangles_node(
-                        second,
-                        x,
-                        y + first_height,
-                        width,
-                        second_height,
-                        rects,
-                    );
+                        self.compute_rectangles_node(first, x, y, width, first_height, rects);
+                        self.compute_rectangles_node(
+                            second,
+                            x,
+                            y + first_height,
+                            width,
+                            second_height,
+                            rects,
+                        );
+                    }
                 }
-            },
+            }
         }
+    }
+}
+
+/// Whether the subtree `node` holds the leaf `pane`.
+fn contains(node: &LayoutNode, pane: PaneId) -> bool {
+    match node {
+        LayoutNode::Leaf(id) => *id == pane,
+        LayoutNode::Split { first, second, .. } => contains(first, pane) || contains(second, pane),
     }
 }
 
