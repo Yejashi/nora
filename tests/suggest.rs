@@ -223,7 +223,7 @@ fn saves_from_two_processes_merge() {
 }
 
 mod words {
-    use nora::suggest::{complete_word, path_executables};
+    use nora::suggest::{MAX_DIR_ENTRIES, complete_word, path_executables};
 
     fn tree(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("nora-words-{tag}-{}", std::process::id()));
@@ -335,6 +335,34 @@ mod words {
         }
         let path_var = std::env::join_paths([bin.clone(), bin, root.join("missing")]).unwrap();
         assert_eq!(path_executables(&path_var), vec!["tool-a".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory listing cut off at `MAX_DIR_ENTRIES` may have missed
+    /// matches, so it offers no completion; at exactly the cap the
+    /// listing is whole and still completes.
+    #[test]
+    fn truncated_listing_offers_no_completion() {
+        let root = tree("huge");
+        let big = root.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(big.join("unique-name"), "").unwrap();
+        for i in 1..MAX_DIR_ENTRIES {
+            std::fs::write(big.join(format!("f{i:05}")), "").unwrap();
+        }
+        let cwd = big.to_str();
+        let none: &[String] = &[];
+        assert_eq!(
+            complete_word("cat uni", cwd, None, none).as_deref(),
+            Some("que-name"),
+            "exactly the cap: whole listing"
+        );
+        std::fs::write(big.join("f-one-more"), "").unwrap();
+        assert_eq!(
+            complete_word("cat uni", cwd, None, none),
+            None,
+            "past the cap: matches may be missing"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

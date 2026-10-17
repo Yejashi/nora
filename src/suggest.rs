@@ -424,7 +424,9 @@ pub const MAX_DIR_ENTRIES: usize = 4096;
 /// (sorted). Only an unambiguous extension is offered: the longest common
 /// prefix of the matches, plus `/` for a single directory. Words with
 /// quotes or backslashes get none (their shell meaning differs from the
-/// text), nor do hidden names unless the word starts them with `.`.
+/// text), nor do hidden names unless the word starts them with `.`, nor
+/// paths in a directory of more than [`MAX_DIR_ENTRIES`] entries (the
+/// matches past the cap are unknown).
 pub fn complete_word(
     buffer: &str,
     cwd: Option<&str>,
@@ -457,11 +459,15 @@ pub fn complete_word(
     };
     let mut names = Vec::new();
     let mut single_is_dir = false;
-    for entry in std::fs::read_dir(&dir)
-        .ok()?
-        .take(MAX_DIR_ENTRIES)
-        .flatten()
-    {
+    for (read, entry) in std::fs::read_dir(&dir).ok()?.enumerate() {
+        // A listing cut off at the cap may miss matches, so no extension
+        // of what it saw is known to be unambiguous.
+        if read >= MAX_DIR_ENTRIES {
+            return None;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         let Ok(entry_name) = entry.file_name().into_string() else {
             continue;
         };
