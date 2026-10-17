@@ -182,7 +182,7 @@ through the bounded writer).
 | Area | v0.1 behavior | Status / proof |
 | --- | --- | --- |
 | Paste queued behind keystrokes | `PumpMsg::Paste` appends validated bytes after queued keystrokes; the bounded writer feeds them in order | pass — `tests/paste_pump.rs` |
-| Cancellation | `PumpMsg::CancelPaste` drops only the in-flight paste bytes; keystrokes unaffected | pass — `tests/paste_pump.rs` |
+| Cancellation | Ctrl+C (`0x03` or kitty `CSI 99;5u`) or Escape (`0x1b` or kitty `CSI 27u`), pressed while a paste is still being fed, drops the paste's unfed text (`queue_key_input` → `cancel_paste`); a started bracketed paste keeps its end marker, and the key follows it. The pump hands the session at most `PASTE_WINDOW` (64 KiB) of paste bytes at a time, so the rest of a paste a slow or stopped child has not read is still cancellable; bytes already handed to the session are not. `PumpMsg::CancelPaste` does the same without a key; keys typed during the paste are unaffected | pass — `tests/paste_cancel.rs`, `tests/paste_pump.rs` |
 | Bracketed flag source | `bracketed` is the engine's live `TermMode::BRACKETED_PASTE`, read from the app's published modes | checked — `src/app/mod.rs` |
 | Ordered round-trip | Paste bytes reach a real PTY child in order through the bounded writer | pass — `tests/paste_pump.rs` |
 

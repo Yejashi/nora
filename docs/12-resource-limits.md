@@ -90,7 +90,7 @@ This document audits all growth limits in nora. Each section documents the limit
 
 **Tested:** `tests/pty_session.rs` — `slow_child_input_no_loss_in_order`.
 
-**Notes:** Paste is bounded by the writer cap.
+**Notes:** Paste is bounded by the writer cap. A pane hands its session at most `pump::PASTE_WINDOW` (64 KiB) of paste bytes at a time (writer queue plus bytes in flight); the rest stays in the pump queue (`MAX_PENDING_INPUT`), where Ctrl+C or Escape cancels it (`tests/paste_cancel.rs`).
 
 ## Snapshots
 

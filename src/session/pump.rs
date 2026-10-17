@@ -381,6 +381,42 @@ pub fn cancel_paste(pending_input: &mut Vec<u8>, paste_block: &mut Option<PasteB
     text_end - cut
 }
 
+/// Whether `bytes` (one encoded key) cancel an in-flight paste: Ctrl+C
+/// (`0x03`, or kitty `CSI 99;5u`) or Escape (`0x1b`, or kitty `CSI 27u`),
+/// pressed (not repeated or released). Caps Lock and Num Lock are ignored
+/// in the kitty modifiers.
+pub fn is_paste_cancel_key(bytes: &[u8]) -> bool {
+    if bytes == [0x03] || bytes == [0x1b] {
+        return true;
+    }
+    let Some(params) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+        .and_then(|params| std::str::from_utf8(params).ok())
+    else {
+        return false;
+    };
+    let mut fields = params.split(';');
+    let code = fields.next();
+    let (mods, event) = match fields.next() {
+        None => ("1", "1"),
+        Some(field) => field.split_once(':').unwrap_or((field, "1")),
+    };
+    if fields.next().is_some() || event != "1" {
+        return false;
+    }
+    // Kitty modifiers are 1 + a bit set; 64 and 128 are the lock keys.
+    let Some(mods) = mods.parse::<u32>().ok().and_then(|m| m.checked_sub(1)) else {
+        return false;
+    };
+    let mods = mods & !(64 | 128);
+    match code {
+        Some("99") => mods == 4,
+        Some("27") => mods == 0,
+        _ => false,
+    }
+}
+
 /// Advance the in-flight paste block after `drained` bytes were fed from
 /// the front of `pending_input` (N17b). The block shifts left by
 /// `drained`; when it is fully drained it becomes `None`.
@@ -402,11 +438,6 @@ pub fn advance_paste_block(paste_block: &mut Option<PasteBlock>, drained: usize)
     }
 }
 
-/// Feed `pending_input` to the session through the bounded writer, in
-/// order, until the budget is full, the input is empty, or the loop is
-/// dead (N09b, extended for N17b paste tracking). Advances
-/// `paste_block` as bytes drain, so an in-flight paste's block stays
-/// aligned with `pending_input`. Returns the total bytes fed this call.
 /// Show `hit` (scroll + selection) and report the search position.
 fn show_search(
     pane: PaneKey,
@@ -482,6 +513,37 @@ pub fn accept_input(pending_input: &mut Vec<u8>, bytes: &[u8]) -> bool {
     }
 }
 
+/// Queue one [`PumpMsg::Input`]'s bytes (see [`accept_input`]). Ctrl+C or
+/// Escape while a paste is still being fed first cancels the rest of the
+/// paste ([`cancel_paste`]: the end marker stays), so the key follows the
+/// end of the paste instead of waiting behind a paste the child reads
+/// slowly or not at all.
+pub fn queue_key_input(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    bytes: &[u8],
+) -> bool {
+    if paste_block.is_some() && is_paste_cancel_key(bytes) {
+        let dropped = cancel_paste(pending_input, paste_block);
+        if debug_enabled() {
+            eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
+        }
+    }
+    accept_input(pending_input, bytes)
+}
+
+/// Most paste bytes a pane hands its session at a time (writer queue plus
+/// bytes in flight to the PTY loop): the rest waits in the pump, so a
+/// cancel drops it (see [`is_paste_cancel_key`]). At the pump's 10 ms busy
+/// tick this still passes at least 6.4 MiB/s to a child that keeps up.
+pub const PASTE_WINDOW: usize = 64 * 1024;
+
+/// Feed `pending_input` to the session through the bounded writer, in
+/// order, until the budget is full, the input is empty, or the loop is
+/// dead (N09b, extended for N17b paste tracking). Advances
+/// `paste_block` as bytes drain, so an in-flight paste's block stays
+/// aligned with `pending_input`; paste bytes are held to
+/// [`PASTE_WINDOW`]. Returns the total bytes fed this call.
 pub fn feed_pending(
     session: &mut PtySession,
     pending_input: &mut Vec<u8>,
@@ -489,7 +551,22 @@ pub fn feed_pending(
 ) -> usize {
     let mut fed = 0;
     while !pending_input.is_empty() {
-        match session.feed(pending_input) {
+        // Paste bytes enter the session only while it holds less than
+        // `PASTE_WINDOW` (writer plus in flight), so the rest of a paste a
+        // slow child is still reading stays here, where Ctrl+C or Escape
+        // can cancel it. Bytes before the paste (keys) are not held.
+        let limit = match *paste_block {
+            Some(block) if block.start == 0 => {
+                let held = session.outstanding() + session.in_flight();
+                PASTE_WINDOW.saturating_sub(held).min(block.end)
+            }
+            Some(block) => block.start,
+            None => pending_input.len(),
+        };
+        if limit == 0 {
+            break;
+        }
+        match session.feed(&pending_input[..limit]) {
             Ok(0) => break,
             Ok(accepted) => {
                 pending_input.drain(..accepted);
@@ -1199,7 +1276,12 @@ pub fn pump_thread(
                         // Refused (never accepted, then dropped) when the
                         // pane's queue is full: the child stopped reading.
                         // Keys keep a headroom pastes cannot fill.
-                        if !accept_input(&mut pane_pump.pending_input, &bytes) && debug_enabled() {
+                        let accepted = queue_key_input(
+                            &mut pane_pump.pending_input,
+                            &mut pane_pump.paste_block,
+                            &bytes,
+                        );
+                        if !accepted && debug_enabled() {
                             eprintln!("debug: pump: input refused, {pane:?} queue full");
                         }
                     }
