@@ -73,6 +73,15 @@ source rectangle `x,y,w,h`; `X,Y`; `c,r` (aspect kept when one is given);
 Unicode placeholders (`U=1` virtual placements and `U+10EEEE` cells) were
 added after the first slices.
 
+Limits added by the 2026-10-17 bug sweep: a placement is at most 10,000
+columns and rows (`c`, `r` and the size derived from the pixels are
+clamped to it), and a display moves the cursor at most one screen. An
+image stored with neither `i` nor `I` gets an internal id that was never
+told to the client: no client command (put, delete by id or range,
+transmit, placeholder) addresses it, and a client image that takes the
+same id moves the internal one aside instead of replacing it. A file
+transfer (`t=f`) honours the `O` offset and `S` size.
+
 Out (documented, answered with an error where a reply is due):
 animation (`a=f`, `a=a`, `a=c`), relative placements (`P,Q,H,V`).
 
