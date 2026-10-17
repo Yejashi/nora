@@ -194,3 +194,51 @@ fn clear_signals_and_positions() {
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].0, apc("Ga=d").len(), "a command ends at its ST");
 }
+
+/// vte ends an APC at any ESC: an interrupted transfer (no ST) does not
+/// swallow the sequences after it, at any chunk boundary.
+#[test]
+fn an_esc_ends_an_unterminated_apc() {
+    let mut stream = b"\x1b_Ga=t,i=5,m=1;AAAA".to_vec();
+    let clear = stream.len() + 4;
+    stream.extend_from_slice(b"\x1b[2J");
+    let reset = stream.len() + 2;
+    stream.extend_from_slice(b"\x1bc");
+    stream.extend_from_slice(b"\x1b_Gx\x1b\x1b_Gy");
+    let query = apc("Ga=q,i=1;AAAA");
+    stream.extend_from_slice(&query);
+    let expected = vec![
+        (clear, GraphicsSignal::ClearScreen),
+        (reset, GraphicsSignal::Reset),
+        (
+            stream.len(),
+            GraphicsSignal::Command(GraphicsEvent {
+                command: b'G',
+                keys: vec![("a".into(), "q".into()), ("i".into(), "1".into())],
+                data: vec![0, 0, 0],
+            }),
+        ),
+    ];
+    // Every split into two chunks, then one byte at a time.
+    let mut splits: Vec<Vec<&[u8]>> = (0..=stream.len())
+        .map(|at| vec![&stream[..at], &stream[at..]])
+        .collect();
+    splits.push(stream.chunks(1).collect());
+    for chunks in splits {
+        let mut filter = GraphicsFilter::new();
+        let mut signals = Vec::new();
+        let mut start = 0;
+        for chunk in &chunks {
+            let (forward, found) = filter.process(chunk);
+            assert_eq!(forward, *chunk);
+            signals.extend(found.into_iter().map(|(at, s)| (start + at, s)));
+            start += chunk.len();
+        }
+        assert_eq!(
+            signals,
+            expected,
+            "chunks {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+    }
+}

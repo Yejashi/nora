@@ -122,7 +122,8 @@ enum FilterState {
     Csi,
     /// Inside an APC payload; accumulating bytes.
     Apc,
-    /// Saw an ESC inside an APC; the next byte may be `\` (ST terminator).
+    /// Saw an ESC inside an APC; `\` (ST) ends the APC, any other byte
+    /// abandons it and starts a new sequence after this ESC (as vte does).
     ApcEsc,
 }
 
@@ -280,8 +281,12 @@ impl GraphicsFilter {
                             signals.push((i, signal));
                         }
                     } else {
-                        self.hold(&[0x1B, byte]);
-                        self.state = FilterState::Apc;
+                        // vte ends an APC at any ESC: abandon this one and
+                        // read the byte as following a fresh ESC.
+                        self.buffer.clear();
+                        self.overflow = false;
+                        self.state = FilterState::SawEsc;
+                        i -= 1;
                     }
                 }
             }
