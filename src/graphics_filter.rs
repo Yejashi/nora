@@ -271,13 +271,11 @@ impl GraphicsFilter {
                     0x00..=0x1F => {}
                     _ => self.state = FilterState::Pass,
                 },
+                // vte 0.15 ends an APC only at CAN, SUB or ESC; the 8-bit
+                // ST (0x9C) is data there, as in UTF-8 text.
                 FilterState::Apc => {
                     if byte == 0x1B {
                         self.state = FilterState::ApcEsc;
-                    } else if byte == 0x9C {
-                        if let Some(signal) = self.finish_apc() {
-                            signals.push((i, signal));
-                        }
                     } else if byte == 0x18 || byte == 0x1A {
                         self.buffer.clear();
                         self.overflow = false;

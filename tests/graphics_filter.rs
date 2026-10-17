@@ -242,3 +242,17 @@ fn an_esc_ends_an_unterminated_apc() {
         );
     }
 }
+
+/// vte 0.15 ends an APC only at CAN, SUB or ESC: an 8-bit ST (0x9C) is
+/// data, so it neither completes a command nor ends the frame.
+#[test]
+fn an_8bit_st_does_not_end_an_apc() {
+    let mut filter = GraphicsFilter::new();
+    let (_, signals) = filter.process(b"\x1b_Ga=q,i=1;AAAA\x9c\x1b\\");
+    assert!(signals.is_empty(), "the frame holds 0x9C: {signals:?}");
+    // Text after a 0x9C is still inside the frame (vte drops it).
+    let (_, signals) = filter.process(b"\x1b_Gx\x9cGa=q,i=1;AAAA\x1b\\");
+    assert!(signals.is_empty(), "{signals:?}");
+    let (_, signals) = filter.process(&apc("Ga=q,i=1;AAAA"));
+    assert_eq!(signals.len(), 1, "the next frame is read again");
+}
