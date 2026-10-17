@@ -1790,12 +1790,24 @@ impl WinApp {
                 }
             }
             AppEvent::Title { pane, title } => {
-                match title {
-                    Some(title) => self.pane_titles.insert(pane, title),
-                    None => self.pane_titles.remove(&pane),
+                let changed = match title {
+                    Some(title) => {
+                        let changed = self.pane_titles.get(&pane) != Some(&title);
+                        self.pane_titles.insert(pane, title);
+                        changed
+                    }
+                    None => self.pane_titles.remove(&pane).is_some(),
                 };
                 if self.active_pane_key() == Some(pane) {
                     self.show_title();
+                }
+                // The tab bar (shown with more than one tab) labels each
+                // tab with its active pane's title.
+                if changed
+                    && self.workspace.tab_count() > 1
+                    && let Some(window) = self.window.as_ref()
+                {
+                    window.request_redraw();
                 }
             }
             AppEvent::Bell { pane } => {
@@ -3030,6 +3042,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 {
                     self.send_input(pane, seq.into_bytes());
                 }
+                // The cursor style (hollow when unfocused) and the ghost
+                // text depend on focus.
+                window.request_redraw();
             }
             _ => {}
         }
