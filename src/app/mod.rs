@@ -1959,7 +1959,7 @@ impl WinApp {
             .compute_rectangles(grid_cols, grid_rows.saturating_sub(bar));
         // Each pane of the active tab: its fresh snapshot, else the
         // retained one; a snapshot that does not fit its pane (from
-        // before a resize) is dropped, the pump sends a new one.
+        // before a resize) is fitted to it until the pump sends a new one.
         let mut fresh_any = false;
         let mut panes: Vec<(PaneKey, u16, u16, u16, u16, Option<Snapshot>)> = Vec::new();
         for &(pane_id, x, y, w, h) in &rects {
@@ -1975,9 +1975,19 @@ impl WinApp {
             let fresh =
                 pane_slot.and_then(|s| s.lock().unwrap_or_else(PoisonError::into_inner).take());
             fresh_any |= fresh.is_some();
+            // One that does not fit (taken before a resize) is drawn cut
+            // or padded to the pane until the pump's next snapshot, so a
+            // live resize does not flash the bare background.
             let snap = fresh
                 .or_else(|| self.pane_last.remove(&key))
-                .filter(|s| !snapshot_is_stale(s.rows as u16, s.cols as u16, h, w))
+                .and_then(|s| {
+                    if !snapshot_is_stale(s.rows as u16, s.cols as u16, h, w) {
+                        Some(s)
+                    } else {
+                        (h > 0 && w > 0)
+                            .then(|| scene::fit_snapshot(&s, usize::from(h), usize::from(w)))
+                    }
+                })
                 .map(|mut s| {
                     s.colors = self.palette.overlay(&s.colors);
                     s

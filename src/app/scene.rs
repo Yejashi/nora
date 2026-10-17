@@ -40,6 +40,62 @@ const TAB_FG: [u8; 4] = [0xb0, 0xb0, 0xb0, 255];
 const TAB_ACTIVE_BG: [u8; 4] = [0x44, 0x66, 0x88, 255];
 const TAB_ACTIVE_FG: [u8; 4] = [0xff, 0xff, 0xff, 255];
 
+/// `snap` cut or padded to `rows` x `cols`: the stand-in drawn for a pane
+/// whose latest snapshot predates a resize until the pump sends one at the
+/// new size, so a live resize shows the old content instead of a bare
+/// background. Added cells are blank; a wide character cut by the new
+/// right edge becomes a blank; the cursor is kept only when inside.
+pub fn fit_snapshot(snap: &Snapshot, rows: usize, cols: usize) -> Snapshot {
+    use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    let blank = |row, col| nora::engine::CellText {
+        row,
+        col,
+        ch: ' ',
+        fg: Color::Named(NamedColor::Foreground),
+        bg: Color::Named(NamedColor::Background),
+        flags: Flags::empty(),
+        zerowidth: Vec::new(),
+        underline_color: None,
+        hyperlink: None,
+    };
+    let mut cells = Vec::with_capacity(rows * cols);
+    let mut selected = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for col in 0..cols {
+            let i = row * snap.cols + col;
+            match snap
+                .cells
+                .get(i)
+                .filter(|_| row < snap.rows && col < snap.cols)
+            {
+                Some(cell) if !(col + 1 == cols && cell.flags.contains(Flags::WIDE_CHAR)) => {
+                    cells.push(cell.clone());
+                    selected.push(snap.selected.get(i).copied().unwrap_or(false));
+                }
+                _ => {
+                    cells.push(blank(row, col));
+                    selected.push(false);
+                }
+            }
+        }
+    }
+    Snapshot {
+        rows,
+        cols,
+        epoch: snap.epoch,
+        cells,
+        selected,
+        cursor: snap.cursor.filter(|&(row, col)| row < rows && col < cols),
+        cursor_shape: snap.cursor_shape,
+        modes: snap.modes,
+        colors: snap.colors,
+        damage: nora::engine::Damage::Full,
+        display_offset: snap.display_offset,
+        images: snap.images.clone(),
+    }
+}
+
 impl Scene {
     /// Add one pane's snapshot at grid origin (`col0`, `row0`). The
     /// snapshot's colors must already be a full table (palette overlay).
@@ -432,6 +488,32 @@ fn tab_style(fg: [u8; 4], bg: [u8; 4], bold: bool) -> CellStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot from before a resize is cut or padded to the new pane
+    /// size instead of being dropped (no bare-background frame).
+    #[test]
+    fn fit_snapshot_cuts_and_pads() {
+        let mut engine = nora::engine::Engine::new(3, 4);
+        engine.feed("ab日\r\ncd".as_bytes());
+        let snap = engine.snapshot();
+        let row = |s: &Snapshot, r: usize| -> String {
+            (0..s.cols).map(|c| s.cells[r * s.cols + c].ch).collect()
+        };
+        let small = fit_snapshot(&snap, 2, 3);
+        assert_eq!((small.rows, small.cols, small.cells.len()), (2, 3, 6));
+        assert_eq!(row(&small, 0), "ab ", "the cut wide char becomes a blank");
+        assert_eq!(row(&small, 1), "cd ");
+        assert_eq!(small.cursor, Some((1, 2)));
+        assert_eq!(small.selected.len(), 6);
+        for (i, cell) in small.cells.iter().enumerate() {
+            assert_eq!((cell.row, cell.col), (i / 3, i % 3));
+        }
+        let big = fit_snapshot(&snap, 4, 6);
+        assert_eq!((big.rows, big.cols, big.cells.len()), (4, 6, 24));
+        assert_eq!(row(&big, 1), "cd    ");
+        assert_eq!(row(&big, 3), "      ");
+        assert_eq!(fit_snapshot(&snap, 1, 1).cursor, None, "cursor cut off");
+    }
 
     #[test]
     fn tab_bar_labels_and_highlight() {
