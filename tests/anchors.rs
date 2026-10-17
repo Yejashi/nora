@@ -95,3 +95,146 @@ fn grow_shrink_cycles_do_not_drift() {
     assert_eq!(row_of(&mut engine, "$ prompt"), Some(0));
     assert_eq!(marker_lines(&mut engine), vec![0]);
 }
+
+// Each screen has its own grid counters, so an anchor belongs to the
+// screen it was recorded on; the alternate screen's anchors end with its
+// session.
+
+const ENTER_ALT: &[u8] = b"\x1b[?1049h";
+const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+fn link(uri: &str, text: &str) -> Vec<u8> {
+    format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\").into_bytes()
+}
+
+/// The viewport text, one string per row (trailing blanks dropped).
+fn rows(engine: &mut Engine) -> Vec<String> {
+    let snapshot = engine.snapshot();
+    (0..snapshot.rows)
+        .map(|row| {
+            let text: String = (0..snapshot.cols)
+                .map(|col| snapshot.cells[row * snapshot.cols + col].ch)
+                .collect();
+            text.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// A link `less` showed is not found on the main screen's text at its
+/// position after it exits, nor in the next alternate screen session.
+#[test]
+fn alt_screen_hyperlink_is_not_found_after_its_session() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    engine.feed(b"one\r\ntwo\r\nunrelated main text\r\n");
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[3;1H");
+    engine.feed(&link("https://alt.example", "alt link"));
+    engine.drain_hyperlinks();
+    assert_eq!(
+        engine.hyperlink_at(2, 3).as_deref(),
+        Some("https://alt.example"),
+        "found while its screen is shown"
+    );
+    engine.feed(LEAVE_ALT);
+    engine.drain_hyperlinks();
+    assert_eq!(engine.hyperlink_at(2, 3), None, "main screen");
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[3;1Hvim text");
+    engine.drain_hyperlinks();
+    assert_eq!(engine.hyperlink_at(2, 3), None, "a new alternate screen");
+}
+
+/// A frame of the main screen ends the alternate screen's session, as it
+/// does for its images, without a drain in between.
+#[test]
+fn a_main_screen_frame_drops_alt_screen_hyperlinks() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[3;1H");
+    engine.feed(&link("https://stored.example", "stored"));
+    engine.drain_hyperlinks();
+    engine.feed(b"\x1b[5;1H");
+    engine.feed(&link("https://queued.example", "queued"));
+    engine.feed(LEAVE_ALT);
+    let _ = engine.snapshot();
+    engine.feed(ENTER_ALT);
+    engine.drain_hyperlinks();
+    assert_eq!(engine.hyperlink_count(), 0);
+    assert_eq!(engine.hyperlink_at(2, 1), None);
+    assert_eq!(engine.hyperlink_at(4, 1), None);
+}
+
+/// The shell's prompt printed between two alternate screen sessions ends
+/// the first one's queued entries.
+#[test]
+fn a_main_screen_prompt_drops_queued_alt_screen_entries() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[3;1H");
+    engine.feed(OSC_133_A);
+    engine.feed(&link("https://alt.example", "alt link"));
+    engine.feed(LEAVE_ALT);
+    engine.feed(OSC_133_A);
+    engine.feed(b"$ ");
+    engine.feed(ENTER_ALT);
+    engine.drain_hyperlinks();
+    assert_eq!(engine.hyperlink_at(2, 3), None);
+    let markers = engine.drain_markers();
+    assert_eq!(markers.len(), 1, "only the main screen's prompt");
+    assert!(!markers[0].alt);
+}
+
+/// A main-screen link is hidden while the alternate screen is shown and
+/// found on its text again afterwards.
+#[test]
+fn main_screen_hyperlink_is_found_again_after_the_alt_screen() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    engine.feed(b"see ");
+    engine.feed(&link("https://main.example", "main link"));
+    engine.feed(b"\r\n");
+    engine.drain_hyperlinks();
+    engine.feed(ENTER_ALT);
+    engine.feed(b"alt screen text");
+    engine.drain_hyperlinks();
+    assert_eq!(
+        engine.hyperlink_at(0, 5),
+        None,
+        "not on the alternate screen"
+    );
+    engine.feed(LEAVE_ALT);
+    let _ = engine.snapshot();
+    engine.drain_hyperlinks();
+    assert_eq!(
+        engine.hyperlink_at(0, 5).as_deref(),
+        Some("https://main.example")
+    );
+}
+
+/// Prompt and command markers an application wrote on the alternate
+/// screen are not prompt-jump or command-selection targets on the main
+/// screen. Aged with the main screen's counters, the alternate screen's
+/// top line would land in the main screen's history, above the view.
+#[test]
+fn alt_screen_prompts_are_not_main_screen_targets() {
+    let mut engine = Engine::with_history(5, 40, 100);
+    engine.feed(b"\x1b]133;A\x07$ one\r\n\x1b]133;C\x07");
+    for i in 0..12 {
+        engine.feed(format!("out {i}\r\n").as_bytes());
+    }
+    engine.feed(b"\x1b]133;D\x07\x1b]133;A\x07$ ");
+    engine.drain_markers();
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[1;1H\x1b]133;A\x07alt prompt\r\n\x1b]133;C\x07alt out\r\n\x1b]133;D\x07");
+    engine.drain_markers();
+    engine.feed(LEAVE_ALT);
+    engine.drain_markers();
+    assert!(engine.jump_to_previous_prompt().is_some());
+    assert_eq!(rows(&mut engine)[0], "$ one");
+    assert!(engine.jump_to_previous_prompt().is_none(), "the only one");
+    // The main screen's command, scrolled to its end (the selection is
+    // the view's rows).
+    assert!(engine.select_previous_command().is_some());
+    let copied = engine.copy_selection().expect("selected");
+    assert!(copied.ends_with("out 10\nout 11"), "{copied:?}");
+    assert!(!copied.contains("alt"), "{copied:?}");
+}

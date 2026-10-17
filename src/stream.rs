@@ -7,7 +7,8 @@
 //! positions of both kinds of event are offsets into the same forwarded
 //! bytes. The parser processes those bytes in segments and calls
 //! [`StreamFilter::on_marker`] at each position with the terminal there:
-//! shell events are recorded at the cursor's line, graphics commands are
+//! shell events are recorded at the cursor's line on the screen shown
+//! (main or alternate, each with its own counters), graphics commands are
 //! handled at the cursor, their replies are recorded in order with the
 //! parser's own, and the bytes it returns (a cursor movement after an
 //! image) are parsed right there. A command that names a file is read
@@ -64,6 +65,9 @@ pub struct StreamFilter {
     /// called once per reported position, in order.
     pending: Vec<Pending>,
     pending_index: usize,
+    /// A prompt marker or hyperlink was queued on the alternate screen
+    /// since the last shell event seen on the main screen.
+    alt_queued: bool,
 }
 
 impl StreamFilter {
@@ -74,6 +78,7 @@ impl StreamFilter {
             targets,
             pending: Vec::new(),
             pending_index: 0,
+            alt_queued: false,
         }
     }
 
@@ -196,6 +201,21 @@ impl StreamFilter {
 
     fn shell_event(&mut self, event: ShellEvent, at: &MarkerContext) {
         let t = &self.targets;
+        if at.alt_screen {
+            self.alt_queued |= matches!(event, ShellEvent::Marker(_) | ShellEvent::Hyperlink(_));
+        } else if std::mem::take(&mut self.alt_queued) {
+            // An event on the main screen after alternate-screen entries
+            // were queued: that alternate screen session ended, and its
+            // markers and hyperlinks mean nothing on the next one.
+            t.markers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drop_alternate();
+            t.hyperlinks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drop_alternate();
+        }
         {
             let cwd = t.cwd.lock().unwrap_or_else(PoisonError::into_inner);
             t.shell_input
@@ -212,6 +232,7 @@ impl StreamFilter {
                         line: at.cursor_line,
                         scrolled: at.total_scrolled,
                         pulled: at.total_pulled,
+                        alt: at.alt_screen,
                         event: m,
                     });
             }
@@ -227,6 +248,7 @@ impl StreamFilter {
                         col: at.cursor_col,
                         scrolled: at.total_scrolled,
                         pulled: at.total_pulled,
+                        alt: at.alt_screen,
                         uri,
                     });
             }

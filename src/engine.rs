@@ -749,11 +749,12 @@ impl Engine {
             // images under the term lock, with the counters of the moment:
             // those queued before this resize move now, before any later
             // one is queued. All are bounded (byte-capped queues, image
-            // store limits).
-            for m in self.lock_markers().iter_mut() {
+            // store limits). Only the main screen reflows: alternate-screen
+            // anchors keep their own screen's line and counters.
+            for m in self.lock_markers().iter_mut().filter(|m| !m.alt) {
                 remap.rebase(&mut m.line, &mut m.scrolled, &mut m.pulled, 0);
             }
-            for h in self.lock_hyperlinks().iter_mut() {
+            for h in self.lock_hyperlinks().iter_mut().filter(|h| !h.alt) {
                 h.col = remap.rebase(&mut h.line, &mut h.scrolled, &mut h.pulled, h.col);
             }
             self.graphics().reflow_main(
@@ -774,10 +775,10 @@ impl Engine {
         }
         drop(term);
         if let Some(remap) = &remap {
-            for m in self.marker_store.iter_mut() {
+            for m in self.marker_store.iter_mut().filter(|m| !m.alt) {
                 remap.rebase(&mut m.line, &mut m.scrolled, &mut m.pulled, 0);
             }
-            for h in self.hyperlink_store.iter_mut() {
+            for h in self.hyperlink_store.iter_mut().filter(|h| !h.alt) {
                 h.col = remap.rebase(&mut h.line, &mut h.scrolled, &mut h.pulled, h.col);
             }
         }
@@ -906,14 +907,20 @@ impl Engine {
     /// [`MarkerStore`](crate::prompt_marker::MarkerStore) (N35b), so it
     /// can be consulted by prompt navigation. Entries that exceed the
     /// store's cap are dropped (the store returns `None` for them).
+    /// Alternate-screen markers are dropped from the store once the main
+    /// screen is shown (that screen's session ended).
     pub fn drain_markers(&mut self) -> Vec<crate::prompt_marker::MarkerAtLine> {
-        let entries = self
-            .marker_queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain();
+        // The screen and the queue are read under one term lock: the PTY
+        // thread queues markers under it.
+        let term = self.term.lock();
+        let main = !alt_screen(&term);
+        let entries = self.lock_markers().drain();
+        drop(term);
         for entry in &entries {
             self.marker_store.insert(entry.clone());
+        }
+        if main {
+            self.marker_store.drop_alternate();
         }
         entries
     }
@@ -937,7 +944,7 @@ impl Engine {
     /// is above the view (no integration, or the oldest one is already
     /// shown). A prompt beyond the history scrolls to its top.
     pub fn jump_to_previous_prompt(&mut self) -> Option<usize> {
-        let (scrolled, pulled, top, history) = {
+        let (scrolled, pulled, top, history, alt) = {
             let term = self.term.lock();
             let grid = term.grid();
             (
@@ -945,11 +952,15 @@ impl Engine {
                 grid.total_pulled(),
                 -(grid.display_offset() as i32),
                 grid.total_lines().saturating_sub(grid.screen_lines()),
+                alt_screen(&term),
             )
         };
+        // Only the shown screen's prompts: the other screen's lines and
+        // counters are its own grid's.
         let (id, line) = self
             .marker_store
             .iter()
+            .filter(|(_, entry)| entry.alt == alt)
             .filter(|(_, entry)| entry.event.kind == crate::prompt_marker::MarkerKind::A)
             .filter_map(|(id, entry)| Some((id, entry.current_line(scrolled, pulled)?)))
             .filter(|&(_, line)| line < top)
@@ -986,10 +997,21 @@ impl Engine {
             return None;
         }
         use crate::prompt_marker::MarkerKind;
-        // Find the latest `C` and the latest `D` marker (by ID).
+        let (scrolled, pulled, topmost, alt) = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                grid.total_scrolled(),
+                grid.total_pulled(),
+                grid.topmost_line().0,
+                alt_screen(&term),
+            )
+        };
+        // Find the latest `C` and the latest `D` marker (by ID) of the
+        // shown screen.
         let mut latest_c: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
         let mut latest_d: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
-        for (id, entry) in self.marker_store.iter() {
+        for (id, entry) in self.marker_store.iter().filter(|(_, e)| e.alt == alt) {
             match entry.event.kind {
                 MarkerKind::C if latest_c.as_ref().is_none_or(|(cid, _)| id > *cid) => {
                     latest_c = Some((id, entry));
@@ -1006,15 +1028,6 @@ impl Engine {
         // running (no `D` yet).
         let end_entry = latest_d.filter(|(d_id, _)| *d_id > c_id).map(|(_, e)| e);
         let bottom = self.rows as i32 - 1;
-        let (scrolled, pulled, topmost) = {
-            let term = self.term.lock();
-            let grid = term.grid();
-            (
-                grid.total_scrolled(),
-                grid.total_pulled(),
-                grid.topmost_line().0,
-            )
-        };
         let end_line = match end_entry {
             Some(e) => e.current_line(scrolled, pulled)?,
             None => bottom,
@@ -1173,15 +1186,18 @@ impl Engine {
     ///
     /// Each drained entry is also inserted into the engine's
     /// [`HyperlinkStore`](crate::prompt_marker::HyperlinkStore), so it can
-    /// be consulted by hyperlink activation.
+    /// be consulted by hyperlink activation. Alternate-screen hyperlinks
+    /// are dropped from the store once the main screen is shown.
     pub fn drain_hyperlinks(&mut self) -> Vec<crate::prompt_marker::HyperlinkAtLine> {
-        let entries = self
-            .hyperlink_queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain();
+        let term = self.term.lock();
+        let main = !alt_screen(&term);
+        let entries = self.lock_hyperlinks().drain();
+        drop(term);
         for entry in &entries {
             self.hyperlink_store.insert(entry.clone());
+        }
+        if main {
+            self.hyperlink_store.drop_alternate();
         }
         entries
     }
@@ -1197,9 +1213,10 @@ impl Engine {
     /// the clicked viewport row and whose start column is at or before
     /// `col`. When several hyperlinks match, the one with the greatest
     /// start column (the most recent link start on that line) is returned.
-    /// Returns `None` when no hyperlink matches.
+    /// Returns `None` when no hyperlink matches. Only the shown screen's
+    /// hyperlinks are considered.
     pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
-        let (target_line, scrolled_now, pulled_now) = {
+        let (target_line, scrolled_now, pulled_now, alt) = {
             let term = self.term.lock();
             let display_offset = term.grid().display_offset() as i32;
             let line = row as i32 - display_offset;
@@ -1207,11 +1224,12 @@ impl Engine {
                 line,
                 term.grid().total_scrolled(),
                 term.grid().total_pulled(),
+                alt_screen(&term),
             )
         };
         let mut best: Option<(usize, String)> = None;
         for (_id, entry) in self.hyperlink_store.iter() {
-            if entry.col > col {
+            if entry.alt != alt || entry.col > col {
                 continue;
             }
             if entry.current_line(scrolled_now, pulled_now) != Some(target_line) {
@@ -1232,15 +1250,16 @@ impl Engine {
     /// is not allowed. The URL is passed as a single argv element (never
     /// interpolated into a shell command). The matched hyperlink is
     /// consumed (removed from the queue) whether or not its scheme is
-    /// allowed.
+    /// allowed. Only the shown screen's hyperlinks are considered.
     pub fn activate_hyperlink(&mut self, row: usize, col: usize) -> Option<Vec<String>> {
+        let alt = alt_screen(&self.term.lock());
         let mut queue = self
             .hyperlink_queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let idx = queue
             .iter()
-            .find(|(_, h)| h.line == row as i32 && h.col == col)
+            .find(|(_, h)| h.alt == alt && h.line == row as i32 && h.col == col)
             .map(|(i, _)| i);
         match idx {
             Some(i) => queue.remove_at(i).and_then(|h| opener_argv(&h.uri)),
@@ -1672,6 +1691,22 @@ impl Engine {
             }
             selected
         };
+
+        // Leaving the alternate screen ends its session: the prompt markers
+        // and hyperlinks recorded there are dropped, as its images are
+        // below (a main-screen entry recorded after them drops them too).
+        if !content.mode.contains(TermMode::ALT_SCREEN) {
+            self.marker_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drop_alternate();
+            self.hyperlink_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drop_alternate();
+            self.marker_store.drop_alternate();
+            self.hyperlink_store.drop_alternate();
+        }
 
         // Kitty graphics in the viewport; leaving the alternate screen drops
         // its placements.

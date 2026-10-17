@@ -322,6 +322,42 @@ fn hyperlink_follows_reflow() {
     );
 }
 
+/// A width change while the alternate screen is shown reflows the main
+/// screen only: its markers move with their text, the alternate screen's
+/// markers and hyperlinks keep their lines and that screen's counters.
+#[test]
+fn reflow_behind_the_alt_screen_moves_only_main_anchors() {
+    let mut engine = Engine::with_history(8, 20, 100);
+    for i in 0..12 {
+        engine.feed(format!("line {i}\r\n").as_bytes());
+    }
+    // In view at 20 columns; the split pushes it into the history.
+    let (z, y) = ("z".repeat(50), "y".repeat(50));
+    engine.feed(format!("{OSC_133_A}$ here\r\n{z}\r\n{y}").as_bytes());
+    engine.feed(b"\x1b[?1049h\x1b[4;1H");
+    engine.feed(b"see \x1b]8;;https://alt.example\x1b\\alt link\x1b]8;;\x1b\\");
+    engine.drain_hyperlinks();
+    engine.feed(format!("\x1b[6;1H{OSC_133_A}alt prompt").as_bytes());
+    engine.resize(8, 10);
+    // Still on the alternate screen: its link and prompt are on their rows.
+    let shown = rows(&mut engine);
+    assert_eq!(shown[3], "see alt li", "cut, not reflowed");
+    assert_eq!(
+        engine.hyperlink_at(3, 5).as_deref(),
+        Some("https://alt.example")
+    );
+    assert_eq!(shown[5], "alt prompt");
+    let markers = engine.drain_markers();
+    let alt = markers.iter().find(|m| m.alt).expect("alt marker");
+    assert_eq!((alt.line, alt.scrolled, alt.pulled), (5, 0, 0));
+    // Back on the main screen, the prompt jump lands on the moved prompt.
+    engine.feed(b"\x1b[?1049l");
+    engine.drain_markers();
+    assert!(engine.jump_to_previous_prompt().is_some());
+    assert_eq!(rows(&mut engine)[0], "$ here");
+    assert_eq!(engine.hyperlink_at(3, 5), None);
+}
+
 /// A selection on a wrapped line copies the same text across a narrow and
 /// wide cycle.
 #[test]

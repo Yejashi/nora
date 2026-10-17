@@ -130,6 +130,10 @@ pub struct MarkerAtLine {
     pub scrolled: u64,
     /// The grid's `total_pulled` counter when the marker was detected.
     pub pulled: u64,
+    /// Whether the alternate screen was shown. The line and counters are
+    /// that screen's grid's (each screen has its own), so the marker is
+    /// only aged and looked up on that screen.
+    pub alt: bool,
     /// The marker event.
     pub event: PromptMarkerEvent,
 }
@@ -160,10 +164,17 @@ impl MarkerAtLine {
 ///
 /// Evicts the oldest entry when the total byte cost exceeds
 /// [`MAX_MARKER_BYTES`].
+///
+/// Alternate-screen entries ([`MarkerAtLine::alt`]) belong to the
+/// alternate screen session they were recorded in: a main-screen entry
+/// pushed after them means that session ended, so they are dropped, as
+/// they are by [`MarkerQueue::drop_alternate`].
 #[derive(Debug, Clone, Default)]
 pub struct MarkerQueue {
     events: VecDeque<MarkerAtLine>,
     total_bytes: usize,
+    /// How many of `events` are alternate-screen entries.
+    alt: usize,
 }
 
 impl MarkerQueue {
@@ -173,13 +184,19 @@ impl MarkerQueue {
     }
 
     /// Push an entry, evicting the oldest entry(ies) if the total byte
-    /// cost exceeds [`MAX_MARKER_BYTES`].
+    /// cost exceeds [`MAX_MARKER_BYTES`]. A main-screen entry drops the
+    /// queued alternate-screen ones (that screen was left).
     pub fn push(&mut self, entry: MarkerAtLine) {
+        if !entry.alt {
+            self.drop_alternate();
+        }
         self.total_bytes += entry.byte_cost();
+        self.alt += usize::from(entry.alt);
         self.events.push_back(entry);
         while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
             if let Some(old) = self.events.pop_front() {
                 self.total_bytes -= old.byte_cost();
+                self.alt -= usize::from(old.alt);
             }
         }
     }
@@ -189,11 +206,29 @@ impl MarkerQueue {
     /// Resets the byte accounting to zero (the queue is empty afterward).
     pub fn drain(&mut self) -> Vec<MarkerAtLine> {
         self.total_bytes = 0;
+        self.alt = 0;
         self.events.drain(..).collect()
     }
 
+    /// Drop the alternate-screen entries (that screen's session ended);
+    /// returns how many were dropped.
+    pub fn drop_alternate(&mut self) -> usize {
+        let dropped = std::mem::take(&mut self.alt);
+        if dropped > 0 {
+            let total = &mut self.total_bytes;
+            self.events.retain(|e| {
+                if e.alt {
+                    *total -= e.byte_cost();
+                }
+                !e.alt
+            });
+        }
+        dropped
+    }
+
     /// The queued entries, oldest first, to move their lines (a resize
-    /// that reflowed the screen). Their byte costs do not change.
+    /// that reflowed the screen). Their byte costs and screens must not
+    /// change.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MarkerAtLine> + '_ {
         self.events.iter_mut()
     }
@@ -223,12 +258,15 @@ pub const MAX_MARKERS: usize = 1024;
 /// detection order. The store is bounded by [`MAX_MARKERS`], evicting the
 /// oldest marker (the newest prompts are the useful ones), and tracks the
 /// total byte cost of stored markers (byte-cost accounting, mirroring
-/// [`crate::graphics_image::ImageStore`]).
+/// [`crate::graphics_image::ImageStore`]). As in [`MarkerQueue`], a
+/// main-screen marker drops the alternate-screen ones stored before it.
 #[derive(Debug)]
 pub struct MarkerStore {
     markers: BTreeMap<usize, MarkerAtLine>,
     total_bytes: usize,
     next_id: usize,
+    /// How many of `markers` are alternate-screen markers.
+    alt: usize,
 }
 
 impl Default for MarkerStore {
@@ -246,25 +284,49 @@ impl MarkerStore {
             markers: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
+            alt: 0,
         }
     }
 
     /// Store a marker, auto-assigning the next 1-based ID. At the
-    /// [`MAX_MARKERS`] cap the oldest marker is evicted first.
+    /// [`MAX_MARKERS`] cap the oldest marker is evicted first. A
+    /// main-screen marker drops the stored alternate-screen ones (that
+    /// screen was left).
     ///
     /// Returns the new marker's ID (always `Some`; the `Option` is kept
     /// for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: MarkerAtLine) -> Option<usize> {
+        if !entry.alt {
+            self.drop_alternate();
+        }
         if self.markers.len() >= MAX_MARKERS
             && let Some((_, oldest)) = self.markers.pop_first()
         {
             self.total_bytes -= oldest.byte_cost();
+            self.alt -= usize::from(oldest.alt);
         }
         let id = self.next_id;
         self.next_id += 1;
         self.total_bytes += entry.byte_cost();
+        self.alt += usize::from(entry.alt);
         self.markers.insert(id, entry);
         Some(id)
+    }
+
+    /// Drop the alternate-screen markers (that screen's session ended);
+    /// returns how many were dropped.
+    pub fn drop_alternate(&mut self) -> usize {
+        let dropped = std::mem::take(&mut self.alt);
+        if dropped > 0 {
+            let total = &mut self.total_bytes;
+            self.markers.retain(|_, e| {
+                if e.alt {
+                    *total -= e.byte_cost();
+                }
+                !e.alt
+            });
+        }
+        dropped
     }
 
     /// The number of stored markers.
@@ -288,7 +350,7 @@ impl MarkerStore {
     }
 
     /// The stored markers, to move their lines (a resize that reflowed
-    /// the screen). Their byte costs do not change.
+    /// the screen). Their byte costs and screens must not change.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MarkerAtLine> + '_ {
         self.markers.values_mut()
     }
@@ -297,6 +359,7 @@ impl MarkerStore {
     pub fn delete(&mut self, id: usize) -> Option<MarkerAtLine> {
         let entry = self.markers.remove(&id)?;
         self.total_bytes -= entry.byte_cost();
+        self.alt -= usize::from(entry.alt);
         Some(entry)
     }
 
@@ -304,6 +367,7 @@ impl MarkerStore {
     pub fn clear(&mut self) -> usize {
         let n = self.markers.len();
         self.total_bytes = 0;
+        self.alt = 0;
         self.markers.clear();
         n
     }
@@ -330,6 +394,8 @@ pub struct HyperlinkAtLine {
     pub scrolled: u64,
     /// The grid's `total_pulled` counter when it was detected.
     pub pulled: u64,
+    /// Whether the alternate screen was shown (see [`MarkerAtLine::alt`]).
+    pub alt: bool,
     /// The hyperlink URI.
     pub uri: String,
 }
@@ -358,6 +424,8 @@ impl HyperlinkAtLine {
 pub struct HyperlinkQueue {
     events: VecDeque<HyperlinkAtLine>,
     total_bytes: usize,
+    /// How many of `events` are alternate-screen entries.
+    alt: usize,
 }
 
 impl HyperlinkQueue {
@@ -367,13 +435,19 @@ impl HyperlinkQueue {
     }
 
     /// Push an entry, evicting the oldest entry(ies) if the total byte
-    /// cost exceeds [`MAX_MARKER_BYTES`].
+    /// cost exceeds [`MAX_MARKER_BYTES`]. A main-screen entry drops the
+    /// queued alternate-screen ones (that screen was left).
     pub fn push(&mut self, entry: HyperlinkAtLine) {
+        if !entry.alt {
+            self.drop_alternate();
+        }
         self.total_bytes += entry.byte_cost();
+        self.alt += usize::from(entry.alt);
         self.events.push_back(entry);
         while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
             if let Some(old) = self.events.pop_front() {
                 self.total_bytes -= old.byte_cost();
+                self.alt -= usize::from(old.alt);
             }
         }
     }
@@ -381,11 +455,29 @@ impl HyperlinkQueue {
     /// Drain the queue, returning all entries in order (oldest first).
     pub fn drain(&mut self) -> Vec<HyperlinkAtLine> {
         self.total_bytes = 0;
+        self.alt = 0;
         self.events.drain(..).collect()
     }
 
+    /// Drop the alternate-screen entries (that screen's session ended);
+    /// returns how many were dropped.
+    pub fn drop_alternate(&mut self) -> usize {
+        let dropped = std::mem::take(&mut self.alt);
+        if dropped > 0 {
+            let total = &mut self.total_bytes;
+            self.events.retain(|e| {
+                if e.alt {
+                    *total -= e.byte_cost();
+                }
+                !e.alt
+            });
+        }
+        dropped
+    }
+
     /// The queued entries, oldest first, to move their lines (a resize
-    /// that reflowed the screen). Their byte costs do not change.
+    /// that reflowed the screen). Their byte costs and screens must not
+    /// change.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HyperlinkAtLine> + '_ {
         self.events.iter_mut()
     }
@@ -408,6 +500,7 @@ impl HyperlinkQueue {
         self.events = kept;
         if let Some(entry) = removed {
             self.total_bytes = self.total_bytes.saturating_sub(entry.byte_cost());
+            self.alt -= usize::from(entry.alt);
             Some(entry)
         } else {
             None
@@ -442,6 +535,8 @@ pub struct HyperlinkStore {
     links: BTreeMap<usize, HyperlinkAtLine>,
     total_bytes: usize,
     next_id: usize,
+    /// How many of `links` are alternate-screen hyperlinks.
+    alt: usize,
 }
 
 impl Default for HyperlinkStore {
@@ -457,26 +552,50 @@ impl HyperlinkStore {
             links: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
+            alt: 0,
         }
     }
 
     /// Store a hyperlink, auto-assigning the next 1-based ID. At the
     /// [`MAX_MARKERS`] cap the oldest hyperlink is evicted first (the
-    /// newest output is where links are clicked).
+    /// newest output is where links are clicked). A main-screen
+    /// hyperlink drops the stored alternate-screen ones (that screen was
+    /// left).
     ///
     /// Returns the new hyperlink's ID (always `Some`; the `Option` is
     /// kept for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: HyperlinkAtLine) -> Option<usize> {
+        if !entry.alt {
+            self.drop_alternate();
+        }
         if self.links.len() >= MAX_MARKERS
             && let Some((_, oldest)) = self.links.pop_first()
         {
             self.total_bytes -= oldest.byte_cost();
+            self.alt -= usize::from(oldest.alt);
         }
         let id = self.next_id;
         self.next_id += 1;
         self.total_bytes += entry.byte_cost();
+        self.alt += usize::from(entry.alt);
         self.links.insert(id, entry);
         Some(id)
+    }
+
+    /// Drop the alternate-screen hyperlinks (that screen's session
+    /// ended); returns how many were dropped.
+    pub fn drop_alternate(&mut self) -> usize {
+        let dropped = std::mem::take(&mut self.alt);
+        if dropped > 0 {
+            let total = &mut self.total_bytes;
+            self.links.retain(|_, e| {
+                if e.alt {
+                    *total -= e.byte_cost();
+                }
+                !e.alt
+            });
+        }
+        dropped
     }
 
     /// The number of stored hyperlinks.
@@ -500,7 +619,8 @@ impl HyperlinkStore {
     }
 
     /// The stored hyperlinks, to move their lines (a resize that
-    /// reflowed the screen). Their byte costs do not change.
+    /// reflowed the screen). Their byte costs and screens must not
+    /// change.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HyperlinkAtLine> + '_ {
         self.links.values_mut()
     }
@@ -509,6 +629,7 @@ impl HyperlinkStore {
     pub fn delete(&mut self, id: usize) -> Option<HyperlinkAtLine> {
         let entry = self.links.remove(&id)?;
         self.total_bytes -= entry.byte_cost();
+        self.alt -= usize::from(entry.alt);
         Some(entry)
     }
 
@@ -516,6 +637,7 @@ impl HyperlinkStore {
     pub fn clear(&mut self) -> usize {
         let n = self.links.len();
         self.total_bytes = 0;
+        self.alt = 0;
         self.links.clear();
         n
     }
