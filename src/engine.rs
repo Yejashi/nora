@@ -578,6 +578,73 @@ pub struct SearchHit {
     pub end_line_id: i64,
 }
 
+/// How a resize that reflowed the main screen (a width change that joins
+/// or splits soft-wrapped rows) moved its text, for the line anchors that
+/// a single global shift cannot follow (the vendored grid's
+/// `ReflowMap`, `// nora:`). [`Engine::resize`] applies it to every anchor
+/// it keeps; a caller holding a [`SearchHit`] of the shown screen maps it
+/// with [`LineRemap::search_hit`]. Its size is bounded by the number of
+/// rows the reflow joined or split.
+#[derive(Debug, Clone)]
+pub struct LineRemap {
+    map: alacritty_terminal::grid::resize::ReflowMap,
+}
+
+impl LineRemap {
+    /// The main screen's [`line_shift`] after the resize.
+    fn shift(&self) -> i64 {
+        self.map.total_scrolled() as i64 - self.map.total_pulled() as i64
+    }
+
+    /// Where the cell at grid `line`, `col` (main screen, counters after
+    /// the resize) is now: a cell on a split row lands on the new row
+    /// holding it, one on joined rows on the joined row with its column
+    /// moved. Lines past the history stay past it.
+    fn grid_point(&self, line: i64, col: usize) -> (i64, usize) {
+        let line = line.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let (line, col) = self.map.map(line, col);
+        (i64::from(line), col)
+    }
+
+    /// [`LineRemap::grid_point`] for a `(line id, col)` point.
+    fn id_point(&self, (id, col): (i64, usize)) -> (i64, usize) {
+        let shift = self.shift();
+        let (line, col) = self.grid_point(id - shift, col);
+        (line + shift, col)
+    }
+
+    /// Move an anchor recorded as `line` under `scrolled`/`pulled`
+    /// counters (a prompt marker or hyperlink), with column `col`, onto
+    /// its text: rebased to the counters after the resize. An anchor whose
+    /// line is out of range is left alone.
+    fn rebase(&self, line: &mut i32, scrolled: &mut u64, pulled: &mut u64, col: usize) -> usize {
+        let delta = self.map.total_scrolled().saturating_sub(*scrolled) as i64;
+        let back = self.map.total_pulled().saturating_sub(*pulled) as i64;
+        let now = i64::from(*line) - delta + back;
+        let (new, col) = self.grid_point(now, col);
+        let Ok(new) = i32::try_from(new) else {
+            return col;
+        };
+        *line = new;
+        *scrolled = self.map.total_scrolled();
+        *pulled = self.map.total_pulled();
+        col
+    }
+
+    /// `hit` (found on the shown screen before the resize) on its text
+    /// now: both of its ends move with their cells.
+    pub fn search_hit(&self, hit: SearchHit) -> SearchHit {
+        let (line_id, start) = self.id_point((hit.line_id, hit.start));
+        let (end_line_id, end) = self.id_point((hit.end_line_id, hit.end));
+        SearchHit {
+            line_id,
+            start,
+            end,
+            end_line_id,
+        }
+    }
+}
+
 /// `total_scrolled - total_pulled`: adding it to a grid line gives the
 /// line's stable id (see [`SearchHit`]).
 fn line_shift(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>) -> i64 {
@@ -664,14 +731,71 @@ impl Engine {
     /// next [`Engine::snapshot`] reports [`Damage::Full`]. Each axis is at
     /// least 1 (the pinned grid panics on an empty axis), and the stored
     /// geometry is the grid's, so snapshots stay consistent.
-    pub fn resize(&mut self, rows: usize, cols: usize) {
+    ///
+    /// A width change reflows the main screen's soft-wrapped lines; every
+    /// line anchor the engine keeps (prompt markers, hyperlinks, the
+    /// selection, image placements) moves with its text. The returned
+    /// [`LineRemap`], when the shown screen reflowed, does the same for
+    /// [`SearchHit`]s the caller holds.
+    pub fn resize(&mut self, rows: usize, cols: usize) -> Option<LineRemap> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let size = Size { rows, cols };
         let mut term = self.term.lock();
         term.resize(size);
+        let remap = term.take_reflow_map().map(|map| LineRemap { map });
+        let shown = !alt_screen(&term);
+        if let Some(remap) = &remap {
+            // The PTY thread queues markers and hyperlinks and places
+            // images under the term lock, with the counters of the moment:
+            // those queued before this resize move now, before any later
+            // one is queued. All are bounded (byte-capped queues, image
+            // store limits).
+            for m in self.lock_markers().iter_mut() {
+                remap.rebase(&mut m.line, &mut m.scrolled, &mut m.pulled, 0);
+            }
+            for h in self.lock_hyperlinks().iter_mut() {
+                h.col = remap.rebase(&mut h.line, &mut h.scrolled, &mut h.pulled, h.col);
+            }
+            self.graphics().reflow_main(
+                remap.map.total_scrolled(),
+                remap.map.total_pulled(),
+                |line, col| remap.grid_point(line, col),
+            );
+            let mut selection = self
+                .selection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(sel) = selection.as_mut().filter(|sel| !sel.alt) {
+                let (a, b) = (remap.id_point(sel.lo), remap.id_point(sel.hi));
+                sel.anchor = remap.id_point(sel.anchor);
+                sel.lo = a.min(b);
+                sel.hi = a.max(b);
+            }
+        }
         drop(term);
+        if let Some(remap) = &remap {
+            for m in self.marker_store.iter_mut() {
+                remap.rebase(&mut m.line, &mut m.scrolled, &mut m.pulled, 0);
+            }
+            for h in self.hyperlink_store.iter_mut() {
+                h.col = remap.rebase(&mut h.line, &mut h.scrolled, &mut h.pulled, h.col);
+            }
+        }
         self.rows = rows;
         self.cols = cols;
+        remap.filter(|_| shown)
+    }
+
+    fn lock_markers(&self) -> std::sync::MutexGuard<'_, crate::prompt_marker::MarkerQueue> {
+        self.marker_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_hyperlinks(&self) -> std::sync::MutexGuard<'_, crate::prompt_marker::HyperlinkQueue> {
+        self.hyperlink_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Viewport height in rows.

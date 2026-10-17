@@ -716,6 +716,29 @@ impl GraphicsState {
     }
 
     /// Drop the alternate screen's placements (it was left).
+    /// Move the main screen's placements after a resize reflowed it:
+    /// `map` takes a top-left cell's `(grid line, col)` under the counters
+    /// `scrolled`/`pulled` (the main screen's, after the resize) to where
+    /// that cell's text is now. The alternate screen does not reflow.
+    pub fn reflow_main(
+        &mut self,
+        scrolled: u64,
+        pulled: u64,
+        map: impl Fn(i64, usize) -> (i64, usize),
+    ) {
+        let mut moved = false;
+        for p in self.placements.iter_mut().filter(|p| !p.alt) {
+            let now = (p.line_now(scrolled, pulled), p.col);
+            let (line, col) = map(now.0, now.1);
+            moved |= (line, col) != now;
+            let line = line.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            (p.line, p.col, p.scrolled, p.pulled) = (line, col, scrolled, pulled);
+        }
+        if moved {
+            self.version += 1;
+        }
+    }
+
     pub fn leave_alternate_screen(&mut self) {
         let before = self.placements.len();
         self.placements.retain(|p| !p.alt);

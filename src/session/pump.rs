@@ -1558,7 +1558,12 @@ pub fn pump_thread(
                         eprintln!("debug: pump: resize {pane:?} {rows}x{cols}");
                     }
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        pane_pump.session.resize(rows as u16, cols as u16);
+                        let remap = pane_pump.session.resize(rows as u16, cols as u16);
+                        // The match shown stays the one to step from.
+                        if let (Some(remap), Some((_, Some(hit)))) = (remap, &mut pane_pump.search)
+                        {
+                            *hit = remap.search_hit(*hit);
+                        }
                     }
                 }
                 PumpMsg::Input { pane, bytes, seq } => {

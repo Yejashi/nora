@@ -192,6 +192,12 @@ impl MarkerQueue {
         self.events.drain(..).collect()
     }
 
+    /// The queued entries, oldest first, to move their lines (a resize
+    /// that reflowed the screen). Their byte costs do not change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MarkerAtLine> + '_ {
+        self.events.iter_mut()
+    }
+
     /// The current total byte cost of the queue.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
@@ -279,6 +285,12 @@ impl MarkerStore {
     /// Iterate over all stored markers as `(id, &MarkerAtLine)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (usize, &MarkerAtLine)> + '_ {
         self.markers.iter().map(|(id, entry)| (*id, entry))
+    }
+
+    /// The stored markers, to move their lines (a resize that reflowed
+    /// the screen). Their byte costs do not change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MarkerAtLine> + '_ {
+        self.markers.values_mut()
     }
 
     /// Delete a marker by ID, returning it if present.
@@ -370,6 +382,12 @@ impl HyperlinkQueue {
     pub fn drain(&mut self) -> Vec<HyperlinkAtLine> {
         self.total_bytes = 0;
         self.events.drain(..).collect()
+    }
+
+    /// The queued entries, oldest first, to move their lines (a resize
+    /// that reflowed the screen). Their byte costs do not change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HyperlinkAtLine> + '_ {
+        self.events.iter_mut()
     }
 
     /// Remove and return the entry at `index`, or `None` if out of range.
@@ -479,6 +497,12 @@ impl HyperlinkStore {
     /// Iterate over all stored hyperlinks as `(id, &HyperlinkAtLine)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (usize, &HyperlinkAtLine)> + '_ {
         self.links.iter().map(|(id, entry)| (*id, entry))
+    }
+
+    /// The stored hyperlinks, to move their lines (a resize that
+    /// reflowed the screen). Their byte costs do not change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HyperlinkAtLine> + '_ {
+        self.links.values_mut()
     }
 
     /// Delete a hyperlink by ID, returning it if present.

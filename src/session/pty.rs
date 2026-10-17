@@ -453,22 +453,26 @@ impl PtySession {
     /// anything is applied — if the retained pair equals the current
     /// geometry, the resize is a no-op; the engine and the PTY never see
     /// a zero.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    ///
+    /// Returns how a width change reflowed the shown screen, for the
+    /// caller's search hits (see [`Engine::resize`]).
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Option<crate::engine::LineRemap> {
         let rows = if rows == 0 { self.size.num_lines } else { rows };
         let cols = if cols == 0 { self.size.num_cols } else { cols };
         if (rows, cols) == (self.size.num_lines, self.size.num_cols) {
-            return;
+            return None;
         }
         self.size = WindowSize {
             num_lines: rows,
             num_cols: cols,
             ..self.size
         };
-        self.engine().resize(rows as usize, cols as usize);
+        let remap = self.engine().resize(rows as usize, cols as usize);
         // Tell the child: the loop applies TIOCSWINSZ on the master, and
         // the kernel delivers SIGWINCH to the foreground process group.
         // A send failure means the loop already ended (child gone).
         let _ = self.sender.send(Msg::Resize(self.size));
+        remap
     }
 
     /// This session's generation identity.
