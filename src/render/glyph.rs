@@ -340,4 +340,25 @@ mod tests {
         cache.begin_frame(MAX_GLYPH_CACHE_ENTRIES - 1);
         assert!(cache.is_empty());
     }
+
+    /// An underlined or struck-through space shapes to a decoration span,
+    /// so a decorated blank cell draws its line (the scene keeps such
+    /// spaces as draw cells).
+    #[test]
+    fn decorated_space_has_a_decoration_span() {
+        let mut fs = FontSystem::new();
+        let metrics = Metrics::new(20.0, 24.0);
+        for (underline, strike) in [
+            (UnderlineStyle::Single, false),
+            (UnderlineStyle::None, true),
+        ] {
+            let buffer = shape_cell(&mut fs, " ", metrics, false, false, underline, strike);
+            let run = buffer.layout_runs().next().expect("one layout run");
+            assert_eq!(
+                run.decorations.len(),
+                1,
+                "underline {underline:?} strike {strike}"
+            );
+        }
+    }
 }

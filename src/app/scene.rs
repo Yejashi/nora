@@ -105,7 +105,14 @@ impl Scene {
                     });
                 }
                 // Unicode placeholders show image tiles (ADR-014), never a glyph.
-                if cell.ch == ' ' || style.conceal || cell.ch == nora::graphics_image::PLACEHOLDER {
+                // A plain space draws nothing, but one carrying an underline,
+                // a strikethrough or combining marks is shaped: decorations
+                // come only from shaped cells.
+                let blank = cell.ch == ' '
+                    && cell.zerowidth.is_empty()
+                    && style.underline == UnderlineStyle::None
+                    && !style.strikethrough;
+                if blank || style.conceal || cell.ch == nora::graphics_image::PLACEHOLDER {
                     continue;
                 }
                 // The cluster: the character plus its combining marks.
@@ -423,6 +430,57 @@ mod tests {
             .map(|c| (c.col, c.text.as_str()))
             .collect();
         assert_eq!(left, vec![(2, "日"), (5, "a")]);
+    }
+
+    /// A snapshot of `bytes` fed to a fresh engine, colors overlaid with the
+    /// default palette as the app does. Returns it with the frame color.
+    fn pane(bytes: &[u8], rows: usize, cols: usize) -> (Snapshot, [u8; 3]) {
+        let mut engine = nora::engine::Engine::new(rows, cols);
+        engine.feed(bytes);
+        let mut snap = engine.snapshot();
+        let palette = nora::render::palette::Palette::default();
+        snap.colors = palette.overlay(&snap.colors);
+        let bg = palette.background();
+        (snap, [bg.r, bg.g, bg.b])
+    }
+
+    const LAYOUT: TermLayout = TermLayout {
+        cell_w: 10.0,
+        cell_h: 20.0,
+        font_size: 16.0,
+    };
+
+    /// `\e[4mfoo bar`: the space between the words is still drawn, so its
+    /// underline joins the two; an unstyled space is not.
+    #[test]
+    fn decorated_spaces_are_drawn() {
+        let (snap, frame_bg) = pane(b"\x1b[4mfoo bar\x1b[0m x \x1b[9m \x1b[0m", 1, 20);
+        let mut scene = Scene::default();
+        scene.add_pane(&snap, 0, 0, frame_bg, None, &LAYOUT);
+        let cols: Vec<u32> = scene.cells.iter().map(|c| c.col).collect();
+        assert_eq!(cols, vec![0, 1, 2, 3, 4, 5, 6, 8, 10]);
+        let space = scene.cells.iter().find(|c| c.col == 3).unwrap();
+        assert_eq!(space.text.as_str(), " ");
+        assert_eq!(space.style.underline, UnderlineStyle::Single);
+        assert!(
+            scene
+                .cells
+                .iter()
+                .find(|c| c.col == 10)
+                .unwrap()
+                .style
+                .strikethrough
+        );
+    }
+
+    /// A combining mark on a space keeps its cell.
+    #[test]
+    fn combining_mark_on_a_space_is_drawn() {
+        let (snap, frame_bg) = pane(" \u{301}".as_bytes(), 1, 10);
+        let mut scene = Scene::default();
+        scene.add_pane(&snap, 0, 0, frame_bg, None, &LAYOUT);
+        let texts: Vec<&str> = scene.cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec![" \u{301}"]);
     }
 
     #[test]
