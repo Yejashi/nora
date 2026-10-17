@@ -1097,6 +1097,7 @@ impl WinApp {
         ) {
             self.resize_all_panes();
         }
+        self.report_pane_focus(prev_active_pane);
     }
 
     /// Split the active pane (N24b): mint a new pane in the active layout,
@@ -1127,7 +1128,8 @@ impl WinApp {
         // state (its snapshot slot above all) first, as a focus change
         // does; otherwise the old pane's slot is lost and it stops
         // updating.
-        if let Some(prev) = self.active_pane_key() {
+        let prev = self.active_pane_key();
+        if let Some(prev) = prev {
             self.save_active_pane(prev);
         }
         let new_pane_id = if vertical {
@@ -1145,6 +1147,7 @@ impl WinApp {
         self.resize_all_panes();
         // The new pane becomes active; load its (fresh) state.
         self.load_active_pane(new_pane);
+        self.report_pane_focus(prev);
     }
 
     /// Close the active pane (N24b): collapse the layout, reap its session,
@@ -1172,6 +1175,8 @@ impl WinApp {
         };
         if self.layout.has_pane(new_active) {
             self.load_active_pane(new_pane);
+            // The closed pane is gone; only the new one hears focus in.
+            self.report_pane_focus(Some(closed));
         } else {
             // The layout is empty: reset the single fields to a fresh pane.
             self.slot = Arc::new(Mutex::new(None));
@@ -1551,6 +1556,30 @@ impl WinApp {
         self.layout.focus_pane(target);
         self.save_active_pane(PaneKey { tab, pane: active });
         self.load_active_pane(PaneKey { tab, pane: target });
+        self.report_pane_focus(Some(PaneKey { tab, pane: active }));
+    }
+
+    /// After the active pane changed from `prev`, report focus out to
+    /// `prev` and focus in to the new active pane, each only when its
+    /// application enabled focus reporting (`FOCUS_IN_OUT`) and only while
+    /// the window itself has focus (otherwise neither pane had it).
+    fn report_pane_focus(&mut self, prev: Option<PaneKey>) {
+        let window_focused = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.has_focus());
+        let with_modes = |pane: Option<PaneKey>| {
+            pane.filter(|pane| self.pane_is_live(pane))
+                .map(|pane| (pane, self.modes_of(pane)))
+        };
+        let reports = focus_switch_reports(
+            window_focused,
+            with_modes(prev),
+            with_modes(self.active_pane_key()),
+        );
+        for (pane, bytes) in reports {
+            self.send_input(pane, bytes);
+        }
     }
 
     fn focus_pane_direction(&mut self, dir: FocusDir) -> bool {
@@ -1569,6 +1598,7 @@ impl WinApp {
         let next_pane = PaneKey { tab, pane: target };
         self.save_active_pane(prev_pane);
         self.load_active_pane(next_pane);
+        self.report_pane_focus(Some(prev_pane));
         true
     }
 
@@ -2994,6 +3024,29 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 }
 
+/// The focus reports for moving the active pane from `prev` to `next`
+/// (each with its modes): `CSI O` to the old pane, then `CSI I` to the new
+/// one, each only when its application enabled `FOCUS_IN_OUT`. Nothing
+/// while the window is unfocused (neither pane had focus) or when the
+/// pane did not change.
+fn focus_switch_reports(
+    window_focused: bool,
+    prev: Option<(PaneKey, TermMode)>,
+    next: Option<(PaneKey, TermMode)>,
+) -> Vec<(PaneKey, Vec<u8>)> {
+    if !window_focused || prev.map(|(pane, _)| pane) == next.map(|(pane, _)| pane) {
+        return Vec::new();
+    }
+    [(prev, false), (next, true)]
+        .into_iter()
+        .filter_map(|(pane, focused)| {
+            let (pane, modes) = pane?;
+            let seq = encode_focus_event(modes.contains(TermMode::FOCUS_IN_OUT), focused)?;
+            Some((pane, seq.into_bytes()))
+        })
+        .collect()
+}
+
 /// Whether clipboard text read for a paste is worth sending to the pump:
 /// not empty and within the paste cap (normalizing newlines never grows
 /// it; the pump checks the exact size with bracket markers).
@@ -3151,5 +3204,46 @@ mod focus_tests {
             Some(PaneId(1))
         );
         assert_eq!(adjacent_pane(&tree, PaneId(1), FocusDir::Up), None);
+    }
+}
+
+#[cfg(test)]
+mod focus_report_tests {
+    use super::{PaneId, PaneKey, TabId, TermMode, focus_switch_reports};
+
+    fn pane(tab: u32, pane: u32) -> PaneKey {
+        PaneKey {
+            tab: TabId(tab),
+            pane: PaneId(pane),
+        }
+    }
+
+    const ON: TermMode = TermMode::FOCUS_IN_OUT;
+    const OFF: TermMode = TermMode::SHOW_CURSOR;
+
+    #[test]
+    fn a_pane_switch_reports_out_then_in() {
+        let (a, b) = (pane(0, 0), pane(0, 1));
+        assert_eq!(
+            focus_switch_reports(true, Some((a, ON)), Some((b, ON))),
+            vec![(a, b"\x1b[O".to_vec()), (b, b"\x1b[I".to_vec())]
+        );
+        // Only panes whose application asked for reports hear them.
+        assert_eq!(
+            focus_switch_reports(true, Some((a, OFF)), Some((b, ON))),
+            vec![(b, b"\x1b[I".to_vec())]
+        );
+        assert_eq!(
+            focus_switch_reports(true, Some((a, ON)), None),
+            vec![(a, b"\x1b[O".to_vec())],
+            "a switch to an empty layout still reports focus out"
+        );
+    }
+
+    #[test]
+    fn nothing_without_window_focus_or_a_change() {
+        let (a, b) = (pane(0, 0), pane(1, 0));
+        assert!(focus_switch_reports(false, Some((a, ON)), Some((b, ON))).is_empty());
+        assert!(focus_switch_reports(true, Some((a, ON)), Some((a, ON))).is_empty());
     }
 }
