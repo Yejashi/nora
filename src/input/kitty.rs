@@ -431,7 +431,7 @@ fn is_modifier_key(number: u32) -> bool {
 }
 
 /// The character at `key` on a US layout (the protocol's base layout).
-fn us_layout(key: KeyCode) -> Option<char> {
+pub(crate) fn us_layout(key: KeyCode) -> Option<char> {
     use KeyCode::*;
     let c = match key {
         KeyA => 'a',

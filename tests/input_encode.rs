@@ -415,3 +415,50 @@ fn xterm_legacy_keys_encode_exactly() {
         "Ctrl+digit without a C0 mapping sends the digit"
     );
 }
+
+#[test]
+fn ctrl_on_a_non_latin_layout_uses_the_us_key_position() {
+    // winit's logical key ignores Ctrl: on a Russian layout Ctrl+C arrives
+    // as Cyrillic `с` on the physical C key and must still send ETX.
+    let ctrl = ModifiersState::CONTROL;
+    let ru = |text: &str, code: KeyCode, mods| {
+        enc(Key::Character(text.into()), PhysicalKey::Code(code), mods)
+    };
+    assert_eq!(
+        ru("с", KeyCode::KeyC, ctrl),
+        Some(send(vec![0x03])),
+        "Ctrl+C"
+    );
+    assert_eq!(
+        ru("д", KeyCode::KeyL, ctrl),
+        Some(send(vec![0x0c])),
+        "Ctrl+L"
+    );
+    assert_eq!(
+        ru("С", KeyCode::KeyC, ctrl | ModifiersState::SHIFT),
+        Some(send(vec![0x03])),
+        "Ctrl+Shift+C"
+    );
+    assert_eq!(
+        ru("х", KeyCode::BracketLeft, ctrl),
+        Some(send(vec![0x1b])),
+        "Ctrl+[ is ESC"
+    );
+    assert_eq!(
+        ru("с", KeyCode::KeyC, ctrl | ModifiersState::ALT),
+        Some(send(vec![0x1b, 0x03])),
+        "Alt keeps its ESC prefix"
+    );
+    // Without Ctrl the layout's text is sent.
+    assert_eq!(
+        ru("с", KeyCode::KeyC, ModifiersState::empty()),
+        Some(send("с".as_bytes().to_vec()))
+    );
+    // An ASCII character keeps its own meaning (AZERTY `a` on US `q`).
+    assert_eq!(ru("a", KeyCode::KeyQ, ctrl), Some(send(vec![0x01])));
+    // A non-ASCII character on a key with no control byte is sent as is.
+    assert_eq!(
+        ru("ж", KeyCode::Semicolon, ctrl),
+        Some(send("ж".as_bytes().to_vec()))
+    );
+}

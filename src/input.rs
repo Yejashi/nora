@@ -72,7 +72,8 @@ pub fn encode(
                 _ => None,
             };
             if mods.control_key()
-                && let Some(byte) = single.and_then(ctrl_byte)
+                && let Some(byte) =
+                    single.and_then(|c| ctrl_byte(c).or_else(|| us_ctrl_byte(c, physical)))
             {
                 return send(alt_prefixed(vec![byte], mods));
             }
@@ -218,6 +219,21 @@ fn keypad_key(
         vec![plain]
     };
     Some(InputAction::Send(alt_prefixed(bytes, mods)))
+}
+
+/// The control byte for a Ctrl chord whose layout character `c` has none:
+/// winit's logical key ignores Ctrl, so on a non-Latin layout Ctrl+C
+/// arrives as `с`. A non-ASCII character falls back to the key at the same
+/// position on a US layout (as foot and kitty do), so Ctrl+C still sends
+/// ETX. ASCII characters keep their own meaning.
+fn us_ctrl_byte(c: char, physical: &PhysicalKey) -> Option<u8> {
+    if c.is_ascii() {
+        return None;
+    }
+    match physical {
+        PhysicalKey::Code(code) => kitty::us_layout(*code).and_then(ctrl_byte),
+        PhysicalKey::Unidentified(_) => None,
+    }
 }
 
 /// The C0 control byte Ctrl+`c` produces, per xterm: letters to 0x01-0x1a,

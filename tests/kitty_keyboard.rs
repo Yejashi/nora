@@ -306,6 +306,12 @@ fn alternate_keys() {
         encode(&key(&a, &a, KeyCode::KeyQ, CTRL, Press, None), D | A),
         send("\x1b[97::113;5u")
     );
+    // A Russian layout: Ctrl+C types `с`; the base-layout key is `c`.
+    let es = ch("с");
+    assert_eq!(
+        encode(&key(&es, &es, KeyCode::KeyC, CTRL, Press, None), D | A),
+        send("\x1b[1089::99;5u")
+    );
 }
 
 #[test]
