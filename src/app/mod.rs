@@ -1106,6 +1106,23 @@ impl WinApp {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
+        // A pane too small to halve is not split (no-op): the new pane
+        // would get no room for a session and swallow the keystrokes
+        // typed into it. With no known area yet (minimized), the split
+        // goes ahead and the new pane spawns once it has room.
+        let direction = if vertical {
+            SplitDirection::Vertical
+        } else {
+            SplitDirection::Horizontal
+        };
+        if let Some((cols, rows)) = self.pane_area()
+            && !self.layout.can_split(direction, cols, rows)
+        {
+            if debug_enabled() {
+                eprintln!("debug: split refused: the active pane is too small");
+            }
+            return;
+        }
         // The new pane becomes active: park the current pane's per-pane
         // state (its snapshot slot above all) first, as a focus change
         // does; otherwise the old pane's slot is lost and it stops

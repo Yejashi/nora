@@ -4,7 +4,37 @@
 //! binary split tree, focus, collapse and the integer rectangle allocation
 //! without any I/O, PTY or window dependency.
 
-use nora::layout::{Layout, PaneId};
+use nora::layout::{Layout, PaneId, SplitDirection};
+
+#[test]
+fn split_is_refused_when_a_pane_would_be_under_two_cells() {
+    let mut layout = Layout::new();
+    // 4 columns halve into 2 + 2; 3 would leave a 1-column pane.
+    assert!(layout.can_split(SplitDirection::Horizontal, 4, 1));
+    assert!(!layout.can_split(SplitDirection::Horizontal, 3, 24));
+    assert!(!layout.can_split(SplitDirection::Horizontal, 1, 24));
+    assert!(!layout.can_split(SplitDirection::Vertical, 80, 3));
+    assert!(layout.can_split(SplitDirection::Vertical, 80, 4));
+    // The check is on the active pane's own rectangle: in a 10-column
+    // area, after one split the active (right) pane has 5 columns, which
+    // halve into 2 + 3; the new active 3-column pane cannot be split again.
+    layout.split_horizontal();
+    assert!(layout.can_split(SplitDirection::Horizontal, 10, 24));
+    layout.split_horizontal();
+    let active = layout.active_pane();
+    let rect = layout
+        .compute_rectangles(10, 24)
+        .into_iter()
+        .find(|r| r.0 == active)
+        .expect("active pane laid out");
+    assert_eq!(rect.3, 3);
+    assert!(!layout.can_split(SplitDirection::Horizontal, 10, 24));
+    assert!(layout.can_split(SplitDirection::Vertical, 10, 24));
+    // An empty layout re-roots on a split.
+    let mut empty = Layout::new();
+    empty.close_pane(PaneId(0));
+    assert!(empty.can_split(SplitDirection::Horizontal, 1, 1));
+}
 
 /// Assert that the rectangles are pairwise nonoverlapping, fit inside the
 /// total area, and tile it exactly (their areas sum to the total area).

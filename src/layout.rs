@@ -16,6 +16,10 @@
 
 use std::collections::HashMap;
 
+/// The fewest cells each pane of a new split gets in the split direction
+/// ([`Layout::can_split`]).
+pub const MIN_SPLIT_CELLS: u16 = 2;
+
 /// A unique identifier for a pane in the layout tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaneId(pub u32);
@@ -147,6 +151,31 @@ impl Layout {
     /// Returns the new pane ID.
     pub fn split_vertical(&mut self) -> PaneId {
         self.split(SplitDirection::Vertical)
+    }
+
+    /// Whether splitting the active pane in `direction`, with the layout
+    /// filling `width` x `height` cells, leaves both resulting panes at
+    /// least [`MIN_SPLIT_CELLS`] wide (horizontal) or tall (vertical). A
+    /// split of a pane too small for that would make a pane with no room
+    /// for a session, so callers refuse it. An empty layout (the split
+    /// re-roots it) can always be split.
+    pub fn can_split(&self, direction: SplitDirection, width: u16, height: u16) -> bool {
+        if !self.panes.contains_key(&self.active_pane) {
+            return true;
+        }
+        let Some((_, _, _, w, h)) = self
+            .compute_rectangles(width, height)
+            .into_iter()
+            .find(|r| r.0 == self.active_pane)
+        else {
+            return false;
+        };
+        let size = match direction {
+            SplitDirection::Horizontal => w,
+            SplitDirection::Vertical => h,
+        };
+        let first = split_size(size, 0.5);
+        first >= MIN_SPLIT_CELLS && size - first >= MIN_SPLIT_CELLS
     }
 
     /// Split the active pane in `direction`, minting a new pane that
