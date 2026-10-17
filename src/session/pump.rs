@@ -276,6 +276,30 @@ pub enum PasteApply {
     TooLarge { size: usize, max: usize },
 }
 
+/// Length of each bracketed-paste marker (`CSI 200 ~` / `CSI 201 ~`) that
+/// [`validate_paste`] wraps a bracketed paste in.
+const BRACKET_MARKER_LEN: usize = 6;
+
+/// The in-flight paste within a pane's `pending_input` (N17b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteBlock {
+    /// Start of the not-yet-fed part, as an index into `pending_input`.
+    pub start: usize,
+    /// End (exclusive) of the block in `pending_input`.
+    pub end: usize,
+    /// Bytes of the block already fed to the session.
+    pub fed: usize,
+    /// Whether the block is wrapped in bracketed-paste markers.
+    pub bracketed: bool,
+}
+
+impl PasteBlock {
+    /// The block's total length as validated (fed plus pending bytes).
+    fn total(&self) -> usize {
+        self.fed + (self.end - self.start)
+    }
+}
+
 /// Apply a paste to the pump's input state (N17b): validate with
 /// [`validate_paste`], and on success append the bytes to
 /// `pending_input` and record the in-flight block as the half-open range
@@ -286,49 +310,80 @@ pub enum PasteApply {
 /// recent paste is cancellable.
 pub fn apply_paste(
     pending_input: &mut Vec<u8>,
-    paste_block: &mut Option<(usize, usize)>,
+    paste_block: &mut Option<PasteBlock>,
     text: &str,
     bracketed: bool,
 ) -> PasteApply {
     match validate_paste(text, bracketed) {
-        PasteValidation::Ok { bytes, .. } => {
+        PasteValidation::Ok { bytes, bracketed } => {
             let start = pending_input.len();
             pending_input.extend_from_slice(&bytes);
-            *paste_block = Some((start, pending_input.len()));
+            *paste_block = Some(PasteBlock {
+                start,
+                end: pending_input.len(),
+                fed: 0,
+                bracketed,
+            });
             PasteApply::Queued(bytes.len())
         }
         PasteValidation::TooLarge { size, max } => PasteApply::TooLarge { size, max },
     }
 }
 
-/// Cancel the in-flight paste (N17b): remove its bytes from
+/// Cancel the in-flight paste (N17b): remove its not-yet-fed text from
 /// `pending_input` and clear the block. Keystrokes are unaffected.
 /// Returns the count of bytes dropped.
-pub fn cancel_paste(
-    pending_input: &mut Vec<u8>,
-    paste_block: &mut Option<(usize, usize)>,
-) -> usize {
-    match paste_block.take() {
-        Some((start, end)) => {
-            let dropped = end - start;
-            pending_input.drain(start..end);
-            dropped
-        }
-        None => 0,
+///
+/// A block nothing of which was fed is dropped whole. Once part of it
+/// reached the child, the bytes needed to leave the child consistent
+/// stay queued: the rest of a started start marker, the rest of a cut
+/// UTF-8 character, and the end marker of a bracketed paste (dropping it
+/// would leave the application in paste mode).
+pub fn cancel_paste(pending_input: &mut Vec<u8>, paste_block: &mut Option<PasteBlock>) -> usize {
+    let Some(block) = paste_block.take() else {
+        return 0;
+    };
+    if block.fed == 0 {
+        pending_input.drain(block.start..block.end);
+        return block.end - block.start;
     }
+    // Offsets below are within the block as validated.
+    let total = block.total();
+    let (text_start, text_end) = if block.bracketed {
+        (BRACKET_MARKER_LEN, total.saturating_sub(BRACKET_MARKER_LEN))
+    } else {
+        (0, total)
+    };
+    let at = |offset: usize| block.start + offset - block.fed;
+    let mut cut = block.fed.max(text_start);
+    // Complete a character the fed part cut (continuation bytes).
+    while cut < text_end && (pending_input[at(cut)] & 0xC0) == 0x80 {
+        cut += 1;
+    }
+    if cut >= text_end {
+        return 0;
+    }
+    pending_input.drain(at(cut)..at(text_end));
+    text_end - cut
 }
 
 /// Advance the in-flight paste block after `drained` bytes were fed from
 /// the front of `pending_input` (N17b). The block shifts left by
 /// `drained`; when it is fully drained it becomes `None`.
-pub fn advance_paste_block(paste_block: &mut Option<(usize, usize)>, drained: usize) {
-    if let Some((start, end)) = *paste_block {
-        let start = start.saturating_sub(drained);
-        let end = end.saturating_sub(drained);
+pub fn advance_paste_block(paste_block: &mut Option<PasteBlock>, drained: usize) {
+    if let Some(block) = *paste_block {
+        let start = block.start.saturating_sub(drained);
+        let end = block.end.saturating_sub(drained);
+        let fed = block.fed + (drained.min(block.end) - drained.min(block.start));
         *paste_block = if start == end {
             None
         } else {
-            Some((start, end))
+            Some(PasteBlock {
+                start,
+                end,
+                fed,
+                ..block
+            })
         };
     }
 }
@@ -396,7 +451,7 @@ pub const MAX_PENDING_INPUT: usize = 2 * 1024 * 1024;
 pub fn feed_pending(
     session: &mut PtySession,
     pending_input: &mut Vec<u8>,
-    paste_block: &mut Option<(usize, usize)>,
+    paste_block: &mut Option<PasteBlock>,
 ) -> usize {
     let mut fed = 0;
     while !pending_input.is_empty() {
@@ -436,7 +491,7 @@ struct PanePump {
     pending_input: Vec<u8>,
     /// The in-flight paste block within `pending_input`, as a half-open
     /// byte range `[start, end)` (N17b); `None` when no paste is in flight.
-    paste_block: Option<(usize, usize)>,
+    paste_block: Option<PasteBlock>,
     /// The last published engine `TermMode` (N10b); `None` until the first
     /// tick, so the first tick always publishes.
     last_modes: Option<TermMode>,

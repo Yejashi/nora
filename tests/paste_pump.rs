@@ -27,21 +27,88 @@ use nora::input::paste::MAX_PASTE_SIZE;
 use nora::session::io::WriterConfig;
 use nora::session::pty::{LaunchSpec, PtySession};
 use nora::session::pump::{
-    PasteApply, advance_paste_block, apply_paste, cancel_paste, feed_pending, pump_tick,
+    PasteApply, PasteBlock, advance_paste_block, apply_paste, cancel_paste, feed_pending, pump_tick,
 };
 
 // --- pure state helpers ---------------------------------------------------
+
+/// The block's pending span `[start, end)`.
+fn span(block: &Option<PasteBlock>) -> Option<(usize, usize)> {
+    block.map(|b| (b.start, b.end))
+}
+
+/// An unbracketed block nothing of which was fed yet.
+fn unfed(start: usize, end: usize) -> PasteBlock {
+    PasteBlock {
+        start,
+        end,
+        fed: 0,
+        bracketed: false,
+    }
+}
+
+/// Cancelling a bracketed paste whose start marker was already fed keeps
+/// the end marker queued, so the application leaves paste mode.
+#[test]
+fn cancel_started_bracketed_paste_keeps_the_end_marker() {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut block: Option<PasteBlock> = None;
+    apply_paste(&mut pending, &mut block, "hello world", true);
+    pending.extend_from_slice(b"K");
+    // The start marker and "he" reached the child.
+    pending.drain(..8);
+    advance_paste_block(&mut block, 8);
+    let dropped = cancel_paste(&mut pending, &mut block);
+    assert_eq!(dropped, "llo world".len());
+    assert_eq!(pending, b"\x1b[201~K".to_vec());
+    assert_eq!(block, None);
+}
+
+/// A cancel never cuts a UTF-8 character the fed part started, and keeps
+/// the rest of a partly fed start marker.
+#[test]
+fn cancel_completes_a_cut_character_and_marker() {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut block: Option<PasteBlock> = None;
+    apply_paste(&mut pending, &mut block, "\u{e9}tude", true);
+    // ESC [ 200 ~ (6) + the first byte of U+00E9 (2 bytes).
+    pending.drain(..7);
+    advance_paste_block(&mut block, 7);
+    cancel_paste(&mut pending, &mut block);
+    assert_eq!(pending, [&[0xA9u8][..], b"\x1b[201~"].concat());
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut block: Option<PasteBlock> = None;
+    apply_paste(&mut pending, &mut block, "abc", true);
+    pending.drain(..3);
+    advance_paste_block(&mut block, 3);
+    cancel_paste(&mut pending, &mut block);
+    assert_eq!(pending, b"00~\x1b[201~".to_vec());
+}
+
+/// An unbracketed paste cut mid-character keeps the character's rest.
+#[test]
+fn cancel_unbracketed_keeps_the_cut_character() {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut block: Option<PasteBlock> = None;
+    apply_paste(&mut pending, &mut block, "a\u{20ac}b", false);
+    pending.drain(..2);
+    advance_paste_block(&mut block, 2);
+    let dropped = cancel_paste(&mut pending, &mut block);
+    assert_eq!(dropped, 1);
+    assert_eq!(pending, vec![0x82, 0xAC]);
+}
 
 /// `apply_paste` with `bracketed=false`: the bytes are appended to the
 /// pending input and the block spans exactly them.
 #[test]
 fn apply_paste_queues_and_tracks_block() {
     let mut pending: Vec<u8> = Vec::new();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     let applied = apply_paste(&mut pending, &mut block, "hello", false);
     assert_eq!(applied, PasteApply::Queued(5));
     assert_eq!(pending, b"hello".to_vec());
-    assert_eq!(block, Some((0, 5)));
+    assert_eq!(span(&block), Some((0, 5)));
 }
 
 /// `apply_paste` with `bracketed=true`: the bracket markers are part of the
@@ -49,7 +116,7 @@ fn apply_paste_queues_and_tracks_block() {
 #[test]
 fn apply_paste_bracketed_includes_markers() {
     let mut pending: Vec<u8> = Vec::new();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     let applied = apply_paste(&mut pending, &mut block, "hello", true);
     let expected = [
         b"\x1b[200~".as_ref(),
@@ -59,7 +126,7 @@ fn apply_paste_bracketed_includes_markers() {
     .concat();
     assert_eq!(applied, PasteApply::Queued(expected.len()));
     assert_eq!(pending, expected);
-    assert_eq!(block, Some((0, expected.len())));
+    assert_eq!(span(&block), Some((0, expected.len())));
 }
 
 /// `apply_paste` appends after existing keystrokes; the block starts after
@@ -67,18 +134,18 @@ fn apply_paste_bracketed_includes_markers() {
 #[test]
 fn apply_paste_appends_after_keystrokes() {
     let mut pending: Vec<u8> = b"AB".to_vec();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     let applied = apply_paste(&mut pending, &mut block, "hello", false);
     assert_eq!(applied, PasteApply::Queued(5));
     assert_eq!(pending, b"ABhello".to_vec());
-    assert_eq!(block, Some((2, 7)));
+    assert_eq!(span(&block), Some((2, 7)));
 }
 
 /// An oversized paste is rejected and leaves the state unchanged.
 #[test]
 fn apply_paste_too_large_leaves_state_unchanged() {
     let mut pending: Vec<u8> = b"AB".to_vec();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     let big = "x".repeat(MAX_PASTE_SIZE + 1);
     let applied = apply_paste(&mut pending, &mut block, &big, false);
     assert_eq!(
@@ -97,13 +164,13 @@ fn apply_paste_too_large_leaves_state_unchanged() {
 #[test]
 fn apply_paste_replaces_previous_block() {
     let mut pending: Vec<u8> = Vec::new();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     apply_paste(&mut pending, &mut block, "first", false);
-    assert_eq!(block, Some((0, 5)));
+    assert_eq!(span(&block), Some((0, 5)));
     apply_paste(&mut pending, &mut block, "second", false);
     assert_eq!(pending, b"firstsecond".to_vec());
     assert_eq!(
-        block,
+        span(&block),
         Some((5, 11)),
         "the new block spans only the new paste"
     );
@@ -114,11 +181,11 @@ fn apply_paste_replaces_previous_block() {
 #[test]
 fn cancel_paste_drops_only_the_paste() {
     let mut pending: Vec<u8> = b"AB".to_vec();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     apply_paste(&mut pending, &mut block, "hello", false);
     pending.extend_from_slice(b"CD");
     assert_eq!(pending, b"ABhelloCD".to_vec());
-    assert_eq!(block, Some((2, 7)));
+    assert_eq!(span(&block), Some((2, 7)));
 
     let dropped = cancel_paste(&mut pending, &mut block);
     assert_eq!(dropped, 5);
@@ -131,7 +198,7 @@ fn cancel_paste_drops_only_the_paste() {
 #[test]
 fn cancel_paste_without_block_is_a_noop() {
     let mut pending: Vec<u8> = b"AB".to_vec();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     let dropped = cancel_paste(&mut pending, &mut block);
     assert_eq!(dropped, 0);
     assert_eq!(pending, b"AB".to_vec());
@@ -142,21 +209,25 @@ fn cancel_paste_without_block_is_a_noop() {
 /// front.
 #[test]
 fn advance_paste_block_shifts_left() {
-    let mut block = Some((2, 7));
+    let mut block = Some(unfed(2, 7));
     advance_paste_block(&mut block, 2);
-    assert_eq!(block, Some((0, 5)));
+    assert_eq!(span(&block), Some((0, 5)));
     advance_paste_block(&mut block, 3);
-    assert_eq!(block, Some((0, 2)));
+    assert_eq!(span(&block), Some((0, 2)));
 }
 
 /// `advance_paste_block` clears the block once every byte up to and
 /// including its end has drained from the front.
 #[test]
 fn advance_paste_block_clears_when_drained() {
-    let mut block = Some((2, 7));
+    let mut block = Some(unfed(2, 7));
     // Draining 5 bytes leaves the block's last two bytes (indices 5, 6).
     advance_paste_block(&mut block, 5);
-    assert_eq!(block, Some((0, 2)), "partially drained block shifts left");
+    assert_eq!(
+        span(&block),
+        Some((0, 2)),
+        "partially drained block shifts left"
+    );
     // Draining the remaining 7 total bytes clears it.
     advance_paste_block(&mut block, 2);
     assert_eq!(block, None, "fully drained block is cleared");
@@ -165,7 +236,7 @@ fn advance_paste_block_clears_when_drained() {
 /// `advance_paste_block` with no block is a no-op.
 #[test]
 fn advance_paste_block_without_block_is_a_noop() {
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     advance_paste_block(&mut block, 3);
     assert_eq!(block, None);
 }
@@ -244,12 +315,12 @@ fn paste_streams_to_pty_in_order() {
     // Build the pending input exactly as the pump thread would: keystrokes,
     // then the validated paste, then more keystrokes.
     let mut pending: Vec<u8> = Vec::new();
-    let mut block: Option<(usize, usize)> = None;
+    let mut block: Option<PasteBlock> = None;
     pending.extend_from_slice(b"AB");
     apply_paste(&mut pending, &mut block, "hello", false);
     pending.extend_from_slice(b"CD");
     assert_eq!(pending, b"ABhelloCD".to_vec());
-    assert_eq!(block, Some((2, 7)));
+    assert_eq!(span(&block), Some((2, 7)));
 
     // Feed through the bounded writer, advancing the block as bytes drain.
     let fed = feed_pending(&mut session, &mut pending, &mut block);
