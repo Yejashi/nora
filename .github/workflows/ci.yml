@@ -236,6 +236,11 @@ jobs:
   cross-platform:
     name: ${{ matrix.os }} (build + headless tests)
     runs-on: ${{ matrix.os }}
+    # macOS and Windows work is deferred (owner decision 2026-10-17,
+    # docs/14-production-roadmap.md M5): the jobs still run and report, but
+    # do not fail the workflow. Known: on macOS a fast-exiting child's
+    # output is intermittently missing (PTY tests), cause not investigated.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
