@@ -7,7 +7,7 @@ This record re-establishes acceptance per roadmap milestone
 **accepted** (acceptance criteria met, evidence in CI or recorded),
 **partial** (some criteria open, listed), **open**.
 
-Evidence sources: `scripts/e2e-x11.sh` (31 scenarios in a real X11 window
+Evidence sources: `scripts/e2e-x11.sh` (34 scenarios in a real X11 window
 with real key and mouse events, run in CI job `e2e-x11`), the test suite
 (about 600 tests), `scripts/perf.sh`, and the audit table of fixes
 (docs/audit/2026-10-15-runtime-audit.md).
@@ -17,7 +17,7 @@ with real key and mouse events, run in CI job `e2e-x11`), the test suite
 | M0 evidence harness | accepted | e2e-x11 CI job; mutation checks show the redraw, selection, flood and input-bound scenarios fail without their fixes | — |
 | M1.1 colors | accepted | e2e `render`, palette tests | — |
 | M1.2 PTY | accepted | e2e `tty`, `resize`; headless exit status; PTY tests | — |
-| M1.3 keyboard | accepted | e2e `keys` (byte-exact), `kitty` (protocol flags 1, 2 and 8 byte-exact, stack pop back to legacy), `nvim` (Neovim enables the protocol; Ctrl+I distinct from Tab), encoder tests (all five flags) | — |
+| M1.3 keyboard | accepted | e2e `keys` (byte-exact), `layout` (German keymap: ü, ß, dead acute + e, AltGr+q, z byte-exact), `kitty` (protocol flags 1, 2 and 8 byte-exact, stack pop back to legacy), `nvim` (Neovim enables the protocol; Ctrl+I distinct from Tab), encoder tests (all five flags) | — |
 | M1.4 mouse | accepted | e2e `mouse` (byte-exact SGR), encoder tests | — |
 | M1.5 frames | accepted | e2e `redraw`, `selection`, `idle` (fully and partly scrolled back: 0 frames idle), `viewlat` (view change on an idle pane 7-9 ms), `atlas` (about 32 000 distinct CJK/Hangul glyphs in two passes at two zoom levels: no failed frame, text visible, second pass +5-6 MiB; +144 MiB with the trim removed) | — |
 | M1.6 fonts and metrics | accepted | e2e `zoom`, `scale` (forced X11 scale 1, 1.25, 2: grid 24x80 at each, window and text area scale with the factor; fixed 2026-10-17: at 1.25 the window was sized from scale-1 cells and lost a row), metric tests | — |

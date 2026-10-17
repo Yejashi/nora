@@ -187,42 +187,53 @@ scenario_keys() {
     pass keys
 }
 
-# A non-US keyboard (v0.1 acceptance 4): the German layout under Xvfb.
-# Layout letters, a dead key composed by Xlib's built-in input method,
-# AltGr and a moved letter arrive byte-exact.
+# A non-US keyboard (v0.1 acceptance 4): German. Xvfb applies runtime
+# keymap uploads (setxkbmap) inconsistently, so this scenario runs its own
+# Xvfb whose default keymap is German: an XKB directory of links to the
+# system data, with `symbols/us` including `de`. Layout letters, a dead
+# key composed by Xlib's built-in input method, AltGr and the moved z
+# arrive byte-exact.
 scenario_layout() {
-    have setxkbmap layout || return
-    have xmodmap layout || return
-    local dir="$OUT/layout"; mkdir -p "$dir"
+    local system_xkb=/usr/share/X11/xkb
+    [ -d "$system_xkb/symbols" ] || { echo "SKIP layout: no $system_xkb"; return; }
+    local dir="$OUT/layout"; rm -rf "$dir"; mkdir -p "$dir/xkb/symbols"
+    local entry
+    for entry in "$system_xkb"/*; do
+        [ "$(basename "$entry")" = symbols ] || ln -s "$entry" "$dir/xkb/$(basename "$entry")"
+    done
+    for entry in "$system_xkb"/symbols/*; do
+        [ "$(basename "$entry")" = us ] || ln -s "$entry" "$dir/xkb/symbols/$(basename "$entry")"
+    done
+    printf 'default partial alphanumeric_keys modifier_keys\nxkb_symbols "basic" {\n    include "de(basic)"\n};\n' \
+        >"$dir/xkb/symbols/us"
+    local outer=$DISPLAY display=":$((DISPLAY_NUM + 1))"
+    Xvfb "$display" -screen 0 1024x700x24 -nolisten tcp -xkbdir "$dir/xkb" >"$dir/xvfb.log" 2>&1 &
+    local xvfb=$!
+    export DISPLAY=$display
+    for _ in $(seq 1 50); do xdotool getmouselocation >/dev/null 2>&1 && break; sleep 0.1; done
+    restore() { kill "$xvfb" 2>/dev/null; export DISPLAY=$outer; }
+    if ! xdotool key --help >/dev/null 2>&1 || ! xmodmap -pke 2>/dev/null | grep -qE '^keycode +34 = udiaeresis'; then
+        restore
+        fail layout "the German keymap is not active on $display"
+        return
+    fi
     cat >"$dir/child.sh" <<CHILD
 #!/bin/sh
 stty raw -echo
 echo 1 >"$dir/ready"
-timeout 10 head -c 9 >"$dir/bytes.raw"; od -An -tx1 "$dir/bytes.raw" >"$dir/bytes.txt"
+timeout --foreground 10 head -c 8 >"$dir/bytes.raw"; od -An -tx1 "$dir/bytes.raw" >"$dir/bytes.txt"
 stty sane
 sleep 30
 CHILD
     chmod +x "$dir/child.sh"
-    setxkbmap -layout de || { fail layout "setxkbmap -layout de failed"; return; }
-    # Some Xvfb builds accept a keymap upload but never apply it (seen on
-    # Arch 21.1.25): skip there, but never in CI, where it must run.
-    if ! xmodmap -pke 2>/dev/null | grep -qE '^keycode +34 = udiaeresis'; then
-        setxkbmap -layout us
-        [ -n "${GITHUB_ACTIONS:-}" ] && { fail layout "the German keymap was not applied"; return; }
-        echo "SKIP layout: this X server did not apply the German keymap"
-        return
-    fi
-    launch layout "$dir/child.sh"
-    local launched=$?
-    if [ "$launched" -eq 0 ] && wait_file "$dir/ready"; then
+    if launch layout "$dir/child.sh" && wait_file "$dir/ready"; then
         sleep 0.3
         # ü, ß, dead acute + e, AltGr+q (@), and z (the US y key).
         xdotool key udiaeresis ssharp dead_acute e ISO_Level3_Shift+q z
         wait_file "$dir/bytes.txt"
     fi
     finish
-    setxkbmap -layout us
-    [ "$launched" -eq 0 ] || { fail layout "no window"; return; }
+    restore
     local got
     got=$(tr -s ' \n' ' ' <"$dir/bytes.txt" 2>/dev/null | sed 's/^ //; s/ $//')
     echo "  bytes: $got"
