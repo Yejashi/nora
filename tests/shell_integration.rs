@@ -309,9 +309,11 @@ fn bash_array_prompt_command_keeps_hook_last() {
     );
 }
 
-/// The DEBUG trap leaves `$_` alone, with and without a DEBUG trap set
-/// before the script (chained): `mkdir -p d && cd $_` used to `cd` into
-/// `__nora_command_start`.
+/// The script leaves `$_` alone on both paths, and the DEBUG trap path
+/// with a DEBUG trap set before the script too (chained, and restoring the
+/// `$_` that trap clobbers): `mkdir -p d && cd $_` used to `cd` into
+/// `__nora_command_start`. The PS0 path sets no trap, so a user's DEBUG
+/// trap there behaves as without the script.
 #[test]
 fn bash_debug_trap_keeps_last_argument() {
     let Some(bash) = bash() else {
@@ -319,10 +321,20 @@ fn bash_debug_trap_keeps_last_argument() {
         return;
     };
     let prior = "trap 'prev=$((prev + 1))' DEBUG\n";
-    for (name, prior_trap) in [("plain", ""), ("chained", prior)] {
+    let debug = BASH_PATHS[1].1;
+    for (name, setup) in [
+        ("plain-ps0", String::new()),
+        ("plain-debug", debug.to_string()),
+        ("chained-debug", format!("{debug}{prior}")),
+    ] {
         let dir = Scratch::new(&format!("bash-underscore-{name}"));
+        let prior_trap = if name.starts_with("chained") {
+            prior
+        } else {
+            ""
+        };
         let rc = format!(
-            "PS1='$ '\n{prior_trap}source {}\n",
+            "PS1='$ '\n{setup}source {}\n",
             script("nora-bash.sh").display()
         );
         let mut shell = Shell::bash(bash.clone(), &dir, &rc);
@@ -344,15 +356,30 @@ fn bash_debug_trap_keeps_last_argument() {
 /// The bash markers go to the terminal even when the command line's first
 /// command runs under a redirection (the DEBUG trap runs inside it), and
 /// the terminal fd they use is not inherited by the user's commands.
+/// Run with PS0 (bash 4.4+) and without it (`shopt -u promptvars`, the
+/// DEBUG trap path).
 #[test]
 fn bash_markers_bypass_redirections_and_stay_private() {
     let Some(bash) = bash() else {
         eprintln!("bash not found; skipping");
         return;
     };
-    let dir = Scratch::new("bash-redirect");
-    let rc = format!("PS1='$ '\nsource {}\n", script("nora-bash.sh").display());
-    let mut shell = Shell::bash(bash, &dir, &rc);
+    for (name, setup) in BASH_PATHS {
+        bash_markers_bypass_redirections(&bash, name, setup);
+    }
+}
+
+/// The bash script's two ways to mark a command start: PS0 (bash 4.4+)
+/// and, with `promptvars` off (or before 4.4), the DEBUG trap.
+const BASH_PATHS: [(&str, &str); 2] = [("ps0", ""), ("debug", "shopt -u promptvars\n")];
+
+fn bash_markers_bypass_redirections(bash: &str, name: &str, setup: &str) {
+    let dir = Scratch::new(&format!("bash-redirect-{name}"));
+    let rc = format!(
+        "PS1='$ '\n{setup}source {}\n",
+        script("nora-bash.sh").display()
+    );
+    let mut shell = Shell::bash(bash.to_string(), &dir, &rc);
     shell.wait("first prompt", |grid, _| grid.contains('$'));
     shell.run(
         "{ echo a; echo b; } > group.txt; if true; then echo c; fi > if.txt; echo ran-$((1 + 1))",
@@ -376,7 +403,7 @@ fn bash_markers_bypass_redirections_and_stay_private() {
     assert_eq!(
         out.kinds(),
         vec![A, B, C, D, A, B, C, D, A, B, C],
-        "grid:\n{}",
+        "{name} grid:\n{}",
         out.grid
     );
     let fds = std::fs::read_to_string(dir.path("fds.txt")).expect("fds.txt");
@@ -384,50 +411,119 @@ fn bash_markers_bypass_redirections_and_stay_private() {
         .lines()
         .filter(|line| line.starts_with("/dev/pts/"))
         .count();
-    assert_eq!(terminal_fds, 2, "the child's fds:\n{fds}");
+    assert_eq!(terminal_fds, 2, "{name}: the child's fds:\n{fds}");
 }
 
 /// bash sends `D` only after a command line ran, carrying its exit status
 /// (`133;D;<status>`), even with a PROMPT_COMMAND entry before nora's that
-/// resets `$?`; an empty or blank Enter gets a new prompt (`A`) only.
+/// resets `$?`; an empty or blank Enter gets a new prompt (`A`) only. The
+/// DEBUG trap path (no PS0) takes every Enter for a command.
 #[test]
 fn bash_command_end_carries_status_and_skips_empty_lines() {
     let Some(bash) = bash() else {
         eprintln!("bash not found; skipping");
         return;
     };
-    let dir = Scratch::new("bash-status");
-    let log = dir.path("markers.log");
-    // Log every marker's parameters (then send it as before).
+    for (name, setup) in BASH_PATHS {
+        let dir = Scratch::new(&format!("bash-status-{name}"));
+        let log = dir.path("markers.log");
+        // Log the parameters of every A and D (then send it as before);
+        // on the PS0 path, B and C do not go through `__nora_osc133`.
+        let rc = format!(
+            "PS1='$ '\nPROMPT_COMMAND='history -a'\n{setup}source {}\n\
+             eval \"__nora_test_osc133() $(declare -f __nora_osc133 | tail -n +2)\"\n\
+             __nora_osc133() {{ printf '%s\\n' \"$1\" >> {}; __nora_test_osc133 \"$1\"; }}\n",
+            script("nora-bash.sh").display(),
+            log.display()
+        );
+        let mut shell = Shell::bash(bash.clone(), &dir, &rc);
+        shell.wait("first prompt", |grid, _| grid.contains('$'));
+        shell.send(b"false\n\n   \n(exit 7)\ntrue\n");
+        let out = shell.exit();
+        let logged = std::fs::read_to_string(&log).expect("markers.log");
+        let logged: Vec<&str> = logged
+            .lines()
+            .filter(|line| !matches!(*line, "B" | "C"))
+            .collect();
+        let (expected_log, expected_kinds) = if name == "ps0" {
+            (
+                &[
+                    "A", // first prompt
+                    "D;1", "A", // false
+                    "A", "A", // empty and blank lines
+                    "D;7", "A", // (exit 7)
+                    "D;0", "A", // true
+                ][..],
+                vec![A, B, C, D, A, A, A, B, C, D, A, B, C, D, A, B, C],
+            )
+        } else {
+            (
+                &[
+                    "A", "D;1", "A", // false
+                    "D;1", "A", "D;1", "A", // empty and blank lines
+                    "D;7", "A", "D;0", "A", // (exit 7), true
+                ][..],
+                vec![
+                    A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C,
+                ],
+            )
+        };
+        assert_eq!(logged, expected_log, "{name} grid:\n{}", out.grid);
+        assert_eq!(out.kinds(), expected_kinds, "{name}");
+    }
+}
+
+/// On the PS0 path bash keeps no terminal fd of nora's open: a `( … )`
+/// subshell (which runs no DEBUG trap in the shell), a backgrounded one (a
+/// daemon would keep the pty open after the pane closed) and a command
+/// substitution in PS1 (run while the prompt is drawn) each see only
+/// their own standard fds on the terminal.
+#[test]
+fn bash_commands_do_not_inherit_the_marker_fd() {
+    let Some(bash) = bash() else {
+        eprintln!("bash not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("bash-fd");
+    // `nora_fds FILE`: a child lists each of its fds and where it points.
     let rc = format!(
-        "PS1='$ '\nPROMPT_COMMAND='history -a'\nsource {}\n\
-         eval \"__nora_test_osc133() $(declare -f __nora_osc133 | tail -n +2)\"\n\
-         __nora_osc133() {{ printf '%s\\n' \"$1\" >> {}; __nora_test_osc133 \"$1\"; }}\n",
-        script("nora-bash.sh").display(),
-        log.display()
+        "if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 404 )); then echo OLD-BASH; fi\n\
+         nora_fds() {{ sh -c 'for f in /proc/$$/fd/*; do printf \"%s %s\\n\" \"${{f##*/}}\" \"$(readlink \"$f\")\"; done' > \"$1\"; }}\n\
+         PS1='$(nora_fds ps1.txt)$ '\nsource {}\n",
+        script("nora-bash.sh").display()
     );
     let mut shell = Shell::bash(bash, &dir, &rc);
     shell.wait("first prompt", |grid, _| grid.contains('$'));
-    shell.send(b"false\n\n   \n(exit 7)\ntrue\n");
+    if shell.grid().contains("OLD-BASH") {
+        eprintln!("bash older than 4.4 has no PS0; skipping");
+        return;
+    }
+    shell.run("( nora_fds sub.txt ); echo ran-$((1 + 1))", "ran-2");
+    shell.run("(nora_fds bg.txt &); echo ran-$((2 + 1))", "ran-3");
+    shell.wait("the background subshell", |_, _| {
+        std::fs::read_to_string(dir.path("bg.txt")).is_ok_and(|fds| fds.ends_with('\n'))
+    });
     let out = shell.exit();
-    let logged = std::fs::read_to_string(&log).expect("markers.log");
-    let logged: Vec<&str> = logged.lines().collect();
-    assert_eq!(
-        logged,
-        [
-            "A", // first prompt
-            "B", "C", "D;1", "A", // false
-            "A", "A", // empty and blank lines
-            "B", "C", "D;7", "A", // (exit 7)
-            "B", "C", "D;0", "A", // true
-            "B", "C", // exit
-        ],
-        "grid:\n{}",
-        out.grid
-    );
+    for file in ["ps1.txt", "sub.txt", "bg.txt"] {
+        let fds = std::fs::read_to_string(dir.path(file)).expect(file);
+        assert!(
+            fds.lines().any(|line| line.starts_with("1 ")),
+            "{file}:\n{fds}"
+        );
+        let extra: Vec<&str> = fds
+            .lines()
+            .filter(|line| {
+                let (fd, target) = line.split_once(' ').unwrap_or((line, ""));
+                fd.parse::<u32>().is_ok_and(|fd| fd > 2) && target.starts_with("/dev/pts/")
+            })
+            .collect();
+        assert!(extra.is_empty(), "{file}: an extra terminal fd:\n{fds}");
+    }
     assert_eq!(
         out.kinds(),
-        vec![A, B, C, D, A, A, A, B, C, D, A, B, C, D, A, B, C]
+        vec![A, B, C, D, A, B, C, D, A, B, C],
+        "grid:\n{}",
+        out.grid
     );
 }
 

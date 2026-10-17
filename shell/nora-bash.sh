@@ -10,27 +10,32 @@
 #       output, before the next prompt; only when a command line ran)
 #
 # Safe to source in a normal bash session: it adds one entry before and
-# one after the existing PROMPT_COMMAND, appends an empty expansion to PS0
-# (bash 4.4+, to tell a command line from an empty Enter) and, at the
-# first prompt, adds to the DEBUG trap (a DEBUG trap set before that keeps
-# running first); it does not source anything else. Sourcing it twice in
-# the same shell is a no-op; it does nothing in a non-interactive shell.
+# one after the existing PROMPT_COMMAND and appends one expansion to PS0
+# (bash 4.4+), which marks each command line's start; on that path it
+# opens no file descriptor and sets no trap. Only on bash older than 4.4
+# (or under `shopt -u promptvars`) does it instead add, at a prompt, to
+# the DEBUG trap (a DEBUG trap set before that keeps running first). It
+# does not source anything else. Sourcing it twice in the same shell is a
+# no-op; it does nothing in a non-interactive shell.
 #
 # Keep `__nora_prompt_start` the last PROMPT_COMMAND entry (hooks such as
 # direnv, zoxide and starship prepend themselves, which is fine as long as
-# they keep `$?`, which the exit status is read from): the first command
-# after a command line is entered is taken as the user's command.
+# they keep `$?`, which the exit status is read from): on the DEBUG trap
+# path, the first command after a command line is entered is taken as the
+# user's command.
 
 [[ $- == *i* ]] || return 0
 [[ -n ${__nora_bash_loaded-} ]] && return 0
 __nora_bash_loaded=1
 
-# The terminal, as the fd the markers are written to. The DEBUG trap runs
-# with the command's redirections in effect (`{ echo a; } > out.txt`), so
-# B and C written to stdout would land in the file. The fd is dup'ed from
-# stdout (the terminal) at each prompt and closed as the command line's
-# first command starts, so commands never inherit it (a background daemon
-# holding it would keep the terminal open).
+# The terminal, as the fd the markers are written to on the DEBUG trap
+# path. The DEBUG trap runs with the command's redirections in effect
+# (`{ echo a; } > out.txt`), so B and C written to stdout would land in
+# the file. The fd is dup'ed from stdout (the terminal) at each prompt and
+# closed as the command line's first command starts. Bash runs no DEBUG
+# trap in the shell for a `( … )` subshell, nor while editing, so such a
+# subshell, a command substitution in PS1 or a completion helper inherits
+# it: hence the PS0 path, which never opens it, wherever bash has PS0.
 __nora_fd=
 
 # Open the terminal fd afresh (stdout at prompt time is the terminal).
@@ -65,8 +70,8 @@ __nora_osc7() {
     printf '\033]7;file://%s%s\033\\' "${HOSTNAME-}" "$out" >&"${__nora_fd:-1}"
 }
 
-# Set once a command line is entered (or, without PS0, once a prompt is
-# drawn), cleared by the first command after it.
+# DEBUG trap path: set once a prompt is drawn, cleared by the first
+# command after it.
 __nora_at_prompt=
 # Set while a command line's output is open (C sent, D not yet).
 __nora_running=
@@ -74,21 +79,40 @@ __nora_running=
 # PROMPT_COMMAND entry.
 __nora_status=0
 
-# PS0 (bash 4.4+) is expanded only after a non-empty command line is read,
-# so it tells a command from an empty Enter: this expansion sets
-# __nora_at_prompt (an arithmetic subscript side effect) and expands to
-# nothing.
-__nora_ps0='${__nora_ps0_flag[__nora_at_prompt=1]-}'
+# PS0 (bash 4.4+) is expanded, in the shell itself, only after a
+# non-empty command line is read, and written to the terminal (stderr)
+# before the line runs, outside any of its redirections. So it marks the
+# command start (B) and the output start (C) once per command line, and
+# never for an empty Enter, a completion or a `bind -x` widget: this
+# expansion sets __nora_running (an arithmetic subscript side effect) and,
+# the array never being set, expands to the two markers.
+__nora_bc=$'\e]133;B\e\\\e]133;C\e\\'
+__nora_ps0='${__nora_ps0_flag[__nora_running=1]-$__nora_bc}'
 (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404 )) || __nora_ps0=
+# Set while the next prompt should install the DEBUG trap: PS0 cannot be
+# used and the trap is not installed yet.
+__nora_trap_wanted=
+[[ -n $__nora_ps0 ]] && shopt -q promptvars || __nora_trap_wanted=1
 
 # Runs before each prompt is drawn (via PROMPT_COMMAND).
 # Closes the previous command's output (D with its status) when one ran
-# and opens the new prompt (A). Until the DEBUG trap is installed, `$1` is
+# and opens the new prompt (A). While the DEBUG trap is wanted, `$1` is
 # the `trap -p DEBUG` output taken by the PROMPT_COMMAND entry itself (a
 # function cannot see it).
 __nora_prompt_start() {
-    [[ -n ${__nora_debug_installed-} ]] || __nora_install_debug_trap "$1"
-    __nora_open_fd
+    if [[ -n $__nora_trap_wanted && -z ${__nora_debug_installed-} ]]; then
+        __nora_install_debug_trap "$1"
+    fi
+    __nora_trap_wanted=
+    local ps0=
+    [[ -n $__nora_ps0 ]] && shopt -q promptvars && ps0=1
+    # The PS0 path writes to stdout (the terminal here) and keeps no fd
+    # open; the DEBUG trap path needs its fd for B and C.
+    if [[ -n $ps0 || -z ${__nora_debug_installed-} ]]; then
+        __nora_close_fd
+    else
+        __nora_open_fd
+    fi
     if [[ -n $__nora_running ]]; then
         __nora_osc133 "D;$__nora_status"
         __nora_running=
@@ -96,19 +120,23 @@ __nora_prompt_start() {
     __nora_osc7
     __nora_osc133 A
     __nora_at_prompt=
-    if [[ -n $__nora_ps0 ]] && shopt -q promptvars; then
+    if [[ -n $ps0 ]]; then
         # Re-add the PS0 hook when PS0 was replaced since.
         [[ ${PS0-} == *"$__nora_ps0"* ]] || PS0+=$__nora_ps0
-    else
+    elif [[ -n ${__nora_debug_installed-} ]]; then
         # No PS0: every prompt counts, so an empty Enter reads as a command.
         __nora_at_prompt=1
+    else
+        # PS0 became unusable (promptvars was turned off): install the
+        # DEBUG trap at the next prompt.
+        __nora_trap_wanted=1
     fi
 }
 
-# Runs before each simple command (via the DEBUG trap); `$1` is the
-# status to return (the chained DEBUG trap's, so `extdebug` users keep
-# its verdict) and `$2` the command's `$_`: as the call's last argument
-# it is what `$_` holds after the trap (`mkdir -p d && cd $_`).
+# Runs before each simple command (via the DEBUG trap, on that path only);
+# `$1` is the status to return (the chained DEBUG trap's, so `extdebug`
+# users keep its verdict) and `$2` the command's `$_`: as the call's last
+# argument it is what `$_` holds after the trap (`mkdir -p d && cd $_`).
 #
 # Marks the command start (B) and the output start (C) once per command
 # line: only the first command after it was entered counts, so loops and
@@ -145,8 +173,8 @@ __nora_save_underscore() {
 
 # Chain onto the DEBUG trap `$1` (`trap -p DEBUG` output) instead of
 # replacing it: it runs first (it sees the command's `$_` and `$?`), then
-# ours. Done at the first prompt with the trap read at the top level:
-# without `set -T`, both a sourced file and a function see no DEBUG trap.
+# ours. Done at a prompt with the trap read at the top level: without
+# `set -T`, both a sourced file and a function see no DEBUG trap.
 __nora_install_debug_trap() {
     __nora_debug_installed=1
     __nora_trap_text "$1"
@@ -160,13 +188,13 @@ __nora_install_debug_trap() {
 
 # Wrap the existing PROMPT_COMMAND (preserving any the user already set):
 # first take the exit status (`$?` is the command line's only before the
-# other entries run), last our hook. The trap is read only while not yet
-# installed (one command substitution, at the first prompt). An array
-# PROMPT_COMMAND (bash 5.1+) gets new first and last elements; a string
-# one gets new lines, which are valid after any text (`history -a;` or
-# `cmd &` would make a `; ` join a syntax error).
+# other entries run), last our hook. The trap is read only while it is
+# wanted (one command substitution, at the prompt that installs it). An
+# array PROMPT_COMMAND (bash 5.1+) gets new first and last elements; a
+# string one gets new lines, which are valid after any text (`history
+# -a;` or `cmd &` would make a `; ` join a syntax error).
 __nora_status_hook='__nora_status=$?'
-__nora_prompt_hook='__nora_prompt_start "${__nora_debug_installed:-$(trap -p DEBUG)}"'
+__nora_prompt_hook='__nora_prompt_start "${__nora_trap_wanted:+$(trap -p DEBUG)}"'
 case "${PROMPT_COMMAND[*]-}" in
     *__nora_prompt_start*) ;;
     *)
