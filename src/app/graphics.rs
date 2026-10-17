@@ -19,8 +19,8 @@ use std::sync::Arc;
 use super::glyphs;
 use super::images::Band;
 use glyphon::{
-    Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
-    Viewport,
+    Cache, Color, ColorMode, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport,
 };
 use wgpu::{
     Adapter, BlendState, BufferDescriptor, BufferUsages, ColorTargetState, CommandEncoder,
@@ -138,16 +138,41 @@ pub struct CellFill {
     pub color: [u8; 4],
 }
 
+/// The presentation format: Rgba8UnormSrgb (the N02 offscreen default),
+/// else Bgra8UnormSrgb (radv), else any other `*Srgb` format, and only then
+/// the adapter's first (linear) format. Fills, the clear color, images and
+/// glyphs all encode for the chosen format (see [`atlas_color_mode`]).
+fn pick_surface_format(formats: &[TextureFormat]) -> Option<TextureFormat> {
+    [TextureFormat::Rgba8UnormSrgb, TextureFormat::Bgra8UnormSrgb]
+        .into_iter()
+        .find(|f| formats.contains(f))
+        .or_else(|| formats.iter().copied().find(|f| f.is_srgb()))
+        .or_else(|| formats.first().copied())
+}
+
+/// The glyphon color mode for a render target: `Accurate` decodes the sRGB
+/// glyph colors to linear, which only an `*Srgb` target re-encodes; on a
+/// linear target `Web` keeps them in sRGB, as the fill shader and the clear
+/// color do.
+fn atlas_color_mode(format: TextureFormat) -> ColorMode {
+    if format.is_srgb() {
+        ColorMode::Accurate
+    } else {
+        ColorMode::Web
+    }
+}
+
 /// The glyphon atlas for `format` and the text renderer bound to it. Used at
 /// startup and again whenever the font system is replaced, so both paths
-/// build the same pipeline.
+/// build the same pipeline (same format, same color mode).
 fn text_pipeline(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cache: &Cache,
     format: TextureFormat,
 ) -> (TextAtlas, TextRenderer) {
-    let mut atlas = TextAtlas::new(device, queue, cache, format);
+    let mut atlas =
+        TextAtlas::with_color_mode(device, queue, cache, format, atlas_color_mode(format));
     let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
     (atlas, renderer)
 }
@@ -475,16 +500,9 @@ impl Graphics {
         // Negotiate the presentation format before creating the
         // glyphon atlas: glyphon's `TextAtlas` builds the render
         // pipeline from the atlas format, which must match the
-        // surface's render pass. Prefer Rgba8UnormSrgb (the N02
-        // offscreen default); otherwise take the adapter's preferred
-        // format (e.g. Bgra8UnormSrgb on radv).
+        // surface's render pass. See `pick_surface_format`.
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .find(|f| **f == TextureFormat::Rgba8UnormSrgb)
-            .copied()
-            .or_else(|| caps.formats.first().copied())
+        let format = pick_surface_format(&caps.formats)
             .ok_or("surface reports no usable texture formats")?;
 
         let (device, queue) = adapter
@@ -1047,6 +1065,36 @@ impl Graphics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An sRGB target is preferred in either channel order; a linear one is
+    /// taken only when nothing else is offered.
+    #[test]
+    fn surface_format_prefers_srgb() {
+        use TextureFormat::*;
+        assert_eq!(
+            pick_surface_format(&[Bgra8Unorm, Bgra8UnormSrgb]),
+            Some(Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            pick_surface_format(&[Bgra8UnormSrgb, Rgba8UnormSrgb]),
+            Some(Rgba8UnormSrgb)
+        );
+        assert_eq!(
+            pick_surface_format(&[Rgb10a2Unorm, Bgra8Unorm]),
+            Some(Rgb10a2Unorm)
+        );
+        assert_eq!(pick_surface_format(&[]), None);
+    }
+
+    /// Glyph colors are decoded to linear only for an sRGB target.
+    #[test]
+    fn atlas_color_mode_matches_the_target() {
+        assert_eq!(
+            atlas_color_mode(TextureFormat::Bgra8UnormSrgb),
+            ColorMode::Accurate
+        );
+        assert_eq!(atlas_color_mode(TextureFormat::Bgra8Unorm), ColorMode::Web);
+    }
 
     /// Clusters up to 15 bytes stay inline; longer ones use the heap; both
     /// read back exactly.
