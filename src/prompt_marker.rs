@@ -593,6 +593,12 @@ impl PromptMarkerFilter {
                         // first one has no effect: drop it, hold the new
                         // one (forwarding it could pair it with bytes after
                         // a suppressed frame).
+                    } else if matches!(byte, 0x00..=0x17 | 0x19 | 0x1C..=0x1F) {
+                        // vte executes a C0 control inside an escape and
+                        // stays in it (`ESC NUL ]` starts an OSC). Executed
+                        // before the ESC it has the same effect, so forward
+                        // it and keep holding the ESC.
+                        out.push(byte);
                     } else {
                         // Not an OSC: forward the held ESC and this byte.
                         out.push(0x1B);

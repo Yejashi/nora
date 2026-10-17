@@ -239,7 +239,11 @@ impl GraphicsFilter {
                         signals.push((i, GraphicsSignal::Reset));
                         self.state = FilterState::Pass;
                     }
-                    0x1B => {}
+                    // As vte 0.15's escape state: CAN and SUB end the
+                    // sequence; other C0 controls are executed inside it,
+                    // and a second ESC, DEL and 8-bit bytes leave it as is.
+                    0x18 | 0x1A => self.state = FilterState::Pass,
+                    0x00..=0x1F | 0x7F..=0xFF => {}
                     _ => self.state = FilterState::Pass,
                 },
                 FilterState::Csi => match byte {
@@ -267,9 +271,11 @@ impl GraphicsFilter {
                         self.state = FilterState::Pass;
                     }
                     0x1B => self.state = FilterState::SawEsc,
-                    // C0 controls execute inside a CSI without ending it.
-                    0x00..=0x1F => {}
-                    _ => self.state = FilterState::Pass,
+                    // As vte 0.15: CAN and SUB abort the sequence; other
+                    // C0 controls execute inside it without ending it, and
+                    // DEL and 8-bit bytes are ignored.
+                    0x18 | 0x1A => self.state = FilterState::Pass,
+                    0x00..=0x1F | 0x7F..=0xFF => {}
                 },
                 // vte 0.15 ends an APC only at CAN, SUB or ESC; the 8-bit
                 // ST (0x9C) is data there, as in UTF-8 text.
