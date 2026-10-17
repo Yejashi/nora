@@ -75,6 +75,12 @@ Support levels are stated exactly: "verified" only for a platform whose
 interactive path ran under a real display with recorded evidence;
 "builds and passes headless tests in CI" otherwise.
 
+**Deferred (owner decision, 2026-10-17).** Linux is the only target for
+now. The macOS and Windows CI build and headless tests stay as they are,
+but interactive verification, packaging and fixes specific to those
+platforms are left for a later release; they do not block M6 or the
+Linux release.
+
 ## M6 — Autocomplete
 
 Research and ADR first (shell-cooperative design: the shell's line
