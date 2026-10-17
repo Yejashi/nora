@@ -249,3 +249,23 @@ fn ime_drop_composition_clears_preedit_but_stays_enabled() {
     ime.update_preedit("ご");
     assert_eq!(ime.commit(), Some("ご".to_string()));
 }
+
+/// A non-empty preedit (re)activates composition: `Ime::Enabled` arrives
+/// once per focus, so the second composition's empty-commit fallback must
+/// still commit its tracked preedit. An empty preedit (sent after a
+/// commit) does not reactivate.
+#[test]
+fn ime_preedit_reactivates_after_a_commit() {
+    let mut ime = ImeState::new();
+    ime.start_composition(); // `Ime::Enabled`, once
+    ime.update_preedit("ni");
+    assert_eq!(ime.commit().as_deref(), Some("ni"));
+
+    ime.update_preedit(""); // cleared after the commit
+    assert!(!ime.is_active());
+    assert_eq!(ime.commit(), None);
+
+    ime.update_preedit("hao");
+    assert!(ime.is_active());
+    assert_eq!(ime.commit().as_deref(), Some("hao"));
+}

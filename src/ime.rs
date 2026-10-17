@@ -28,9 +28,14 @@ impl ImeState {
         self.committed.clear();
     }
 
-    /// Update the preedit text.
+    /// Update the preedit text. A non-empty preedit (re)activates the
+    /// composition: `Ime::Enabled` arrives once, while each later
+    /// composition starts with its first preedit.
     pub fn update_preedit(&mut self, preedit: &str) {
         self.preedit = preedit.to_string();
+        if !preedit.is_empty() {
+            self.active = true;
+        }
     }
 
     /// Commit the current composition.
