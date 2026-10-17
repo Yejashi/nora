@@ -79,7 +79,8 @@ codegen-units = 1
 # in-flight input counter, deferring a `pty_read` error until already-read
 # bytes are parsed and woken for (no lost final output), `pty_read`
 # returning the bytes it parsed and the exit drain repeating it (bounded),
-# no redraw while a synchronized update is pending (`with_sync_pending`),
+# no redraw while a synchronized update is pending (`with_sync_pending`)
+# and ending an update at its own deadline under continuous output,
 # the filter's `needs_unlocked`/`run_unlocked` hooks (file media read with
 # the lock released), `send` accepting a queued message whatever the waker
 # reports, the DA1 reply (`?62;22c`), and `grow_lines` not counting its
