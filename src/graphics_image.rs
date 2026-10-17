@@ -579,10 +579,11 @@ impl GraphicsState {
             {
                 candidates.push(image);
             }
-            if what == 'R' {
+            // An empty range (`y < x`) names no image.
+            if what == 'R' && x <= y {
                 candidates.extend(
                     self.images
-                        .range(x..=y.max(x))
+                        .range(x..=y)
                         .filter(|(_, image)| !image.internal)
                         .map(|(id, _)| *id),
                 );

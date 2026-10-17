@@ -244,6 +244,20 @@ fn deletes() {
     assert!(g.image(1).is_some());
 }
 
+/// `d=R` frees the images with ids in `x..=y`; `y < x` is an empty range.
+#[test]
+fn an_empty_id_range_frees_nothing() {
+    let mut g = GraphicsState::new();
+    for id in 3..=6 {
+        g.handle(&cmd(&format!("a=t,s=1,v=1,i={id}"), &rgba(1, 1)), &at(0, 0));
+    }
+    g.handle(&cmd("a=d,d=R,x=5,y=3", &[]), &at(0, 0));
+    assert_eq!(g.image_count(), 4, "y < x names no image");
+    g.handle(&cmd("a=d,d=R,x=4,y=5", &[]), &at(0, 0));
+    assert!(g.image(4).is_none() && g.image(5).is_none());
+    assert!(g.image(3).is_some() && g.image(6).is_some());
+}
+
 #[test]
 fn replacing_an_image_drops_its_placements() {
     let mut g = GraphicsState::new();
