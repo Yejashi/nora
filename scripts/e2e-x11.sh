@@ -946,6 +946,35 @@ CHILD
     pass graphics
 }
 
+# Real kitty-graphics clients (ADR-014): kitten icat (its support
+# detection, then whatever transfer it picks) and chafa draw a 200x100
+# image and exit 0. Each is skipped when not installed.
+scenario_imagetools() {
+    local dir="$OUT/imagetools"; mkdir -p "$dir"
+    "${IM_CONVERT[@]}" -size 200x100 gradient:'#FF0000-#0000FF' "$dir/img.png"
+    local tool ran=0
+    for tool in "kitten icat" "chafa -f kitty"; do
+        local name=${tool%% *}
+        command -v "$name" >/dev/null 2>&1 || { echo "  $name not installed"; continue; }
+        ran=1
+        rm -f "$dir/$name.status"
+        launch "imagetools" sh -c "$tool '$dir/img.png'; echo \$? >'$dir/$name.status'; sleep 30" \
+            || { fail imagetools "no window for $name"; return; }
+        wait_file "$dir/$name.status"
+        sleep 0.5
+        shot "$dir/$name.png"
+        finish
+        local colored
+        colored=$("${IM_CONVERT[@]}" "$dir/$name.png" -fuzz 10% -fill black -opaque black \
+            -fill white +opaque black -format '%[fx:round(mean*w*h)]' info:)
+        echo "  $name: exit $(cat "$dir/$name.status" 2>/dev/null), image px $colored"
+        [ "$(cat "$dir/$name.status" 2>/dev/null)" = 0 ] || { fail imagetools "$name did not exit 0"; return; }
+        [ "$colored" -gt 19000 ] || { fail imagetools "$name drew no image"; return; }
+    done
+    [ "$ran" = 1 ] || { echo "SKIP imagetools: neither kitten nor chafa installed"; return; }
+    pass imagetools
+}
+
 # Glyph atlas soak (audit R8): about 32 000 distinct CJK and Hangul
 # glyphs, one new screenful at a time, drawn in two passes at two zoom
 # levels. The atlas must trim glyphs a frame no longer uses: no frame may
@@ -1303,7 +1332,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

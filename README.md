@@ -280,8 +280,8 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   tests, but no one has used the window on them yet, and there are no
   installers; work on them is deferred. See
   [docs/15-platforms.md](docs/15-platforms.md).
-- **Not supported yet:** font ligatures; kitty graphics animation, shared
-  memory transfer and Unicode placeholders (images themselves are shown).
+- **Not supported yet:** font ligatures; kitty graphics animation and
+  Unicode placeholders (images themselves are shown).
 - **Input methods.** Composition is checked end to end with ibus over
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
   Wayland text-input path and the drawing of a candidate window have not

@@ -98,7 +98,7 @@ Images are handled on the reader thread at their place in the output
 | Area | Behavior | Proof |
 | --- | --- | --- |
 | Actions | `t` store, `T` store and display, `p` display a stored image (by `i`, or the newest with `I`), `q` check without storing, `d` delete | `tests/graphics_image.rs` |
-| Data | formats 24 (RGB), 32 (RGBA), 100 (PNG); `o=z` zlib; media `d` (inline, chunked with `m`), `f` and `t` (regular files only; `/proc`, `/sys`, `/dev` refused; one `EBADF` for every failure; `t` removes only temp files whose path contains `tty-graphics-protocol`) | `tests/graphics_image.rs` |
+| Data | formats 24 (RGB), 32 (RGBA), 100 (PNG); `o=z` zlib; media `d` (inline, chunked with `m`), `f` and `t` (regular files only; `/proc`, `/sys` and `/dev` other than `/dev/shm` refused; one `EBADF` for every failure; `t` removes only temp files whose path contains `tty-graphics-protocol`), `s` (a POSIX shared-memory object, `/dev/shm/<name>`, unlinked once it decoded as the image) | `tests/graphics_image.rs` |
 | Limits | 64 MiB per decoded image, 256 MiB in all (unplaced images evicted first), 8192 px per side, 64 MiB per transfer, 1024 placements | `tests/graphics_image.rs` |
 | Replies | `ESC _ G i=..[,I=..][,p=..];OK ESC \` or `;CODE:message`, only for commands naming an image; `q=1` drops OK, `q=2` errors; ordered with the parser's replies (a query then `CSI c` answers in that order) | `tests/graphics_protocol.rs` |
 | Placement | at the cursor; size from `c`/`r` (aspect kept for one of them) or the image's pixels; source rectangle `x,y,w,h`; offset `X,Y` inside the cell; scales with the cell on zoom | `tests/graphics_image.rs`; e2e `graphics` |
@@ -107,10 +107,13 @@ Images are handled on the reader thread at their place in the output
 | Layers | z below -1 073 741 824 under cell backgrounds, other negative z under the text, z >= 0 over it | e2e `graphics` (z=-1 and z=0 checked) |
 | Deletes and clears | `d=` a i n c p q x y z r (uppercase frees unused images); `CSI 2 J` deletes the screen's placements, `CSI 3 J` the scrollback's, `ESC c` everything; the alternate screen has its own placements, dropped when it is left | `tests/graphics_image.rs`, `tests/graphics_protocol.rs` |
 
-Not implemented (an error reply where one is due): shared memory (`t=s`),
-animation (`a=f`, `a=a`, `a=c`), relative placements (`P`, `Q`, `H`,
-`V`), Unicode placeholders (`U=1`). Tools that probe for shared memory
-fall back to direct transfer.
+Not implemented (an error reply where one is due): animation (`a=f`, `a=a`, `a=c`), relative placements (`P`, `Q`, `H`,
+`V`), Unicode placeholders (`U=1`).
+
+Real clients: `kitten icat` (support detection, then shared memory, file or
+stream transfer) and `chafa -f kitty` draw their images (e2e `imagetools`;
+CI runs chafa, icat ran locally). The detection needs a DA1 reply longer
+than `?6c`: nora answers `CSI ? 62 ; 22 c` (VT220, ANSI color).
 
 ## Paste
 
