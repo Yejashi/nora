@@ -868,9 +868,20 @@ fn read_shared_memory(keys: &Keys) -> Result<Vec<u8>, Failure> {
 }
 
 /// Read `S` bytes at offset `O` (all after it when `S` is 0) of a regular
-/// file.
+/// file. The type is checked before opening, and the open does not block,
+/// so a FIFO (whose open waits for a writer) never stalls the reader
+/// thread, which holds the terminal lock here.
 fn read_path(path: &std::path::Path, keys: &Keys) -> Result<Vec<u8>, Failure> {
-    let file = std::fs::File::open(path).map_err(|_| EBADF)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::fs::metadata(path).map_err(|_| EBADF)?.is_file() {
+        return Err(EBADF);
+    }
+    // Checked again on the open file: the path may have changed since.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| EBADF)?;
     let meta = file.metadata().map_err(|_| EBADF)?;
     if !meta.is_file() {
         return Err(EBADF);

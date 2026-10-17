@@ -358,6 +358,59 @@ fn shared_memory_media() {
     std::fs::remove_file(&file).unwrap();
 }
 
+/// Make a FIFO at `path` (nobody opens it for writing).
+fn mkfifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `name` is a valid NUL-terminated path for the call.
+    let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}", path.display());
+}
+
+/// Handle `command` on another thread; its reply, or `None` if it did not
+/// finish within five seconds (it blocked).
+fn reply_within_timeout(command: GraphicsEvent) -> Option<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut g = GraphicsState::new();
+        let out = g.handle(&command, &at(0, 0));
+        let _ = tx.send(reply(&out));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+}
+
+/// A FIFO with no writer is refused at once: opening it for reading would
+/// block the PTY reader thread (holding the terminal lock) forever.
+#[test]
+fn a_fifo_is_refused_without_blocking() {
+    let dir = std::env::temp_dir().join(format!("nora-graphics-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe");
+    let _ = std::fs::remove_file(&fifo);
+    mkfifo(&fifo);
+    let path = fifo.to_string_lossy().into_owned();
+    let ebadf = Some("\x1b_Gi=1;EBADF:Failed to read image data\x1b\\".to_string());
+    for medium in ["f", "t"] {
+        let command = cmd(&format!("a=t,t={medium},s=1,v=1,i=1"), path.as_bytes());
+        assert_eq!(
+            reply_within_timeout(command),
+            Some(ebadf.clone()),
+            "t={medium}"
+        );
+    }
+    assert!(fifo.exists(), "not a protocol temp file: kept");
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::path::Path::new("/dev/shm").is_dir() {
+        let name = format!("/nora-graphics-fifo-{}", std::process::id());
+        let shm = std::path::PathBuf::from(format!("/dev/shm{name}"));
+        let _ = std::fs::remove_file(&shm);
+        mkfifo(&shm);
+        let command = cmd("a=t,t=s,s=1,v=1,i=1", name.as_bytes());
+        assert_eq!(reply_within_timeout(command), Some(ebadf), "t=s");
+        let _ = std::fs::remove_file(&shm);
+    }
+}
+
 /// Client sizes (`c`, `r`) are clamped, so no size arithmetic overflows
 /// (a debug build used to panic on the PTY thread).
 #[test]
