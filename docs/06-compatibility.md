@@ -237,6 +237,8 @@ The search bar is a local UI overlay: it never sends anything to the PTY, and th
 | Search scope | bounded to the last presented visible area (a character snapshot refreshed on every presented frame); scrollback search is a later slice | wiring in `src/app/mod.rs` |
 | Re-search on content change | while a search is active, each presented frame re-runs the query against the refreshed visible-area snapshot, so matches track scrolling content | wiring in `src/app/mod.rs` |
 
+The engine's scrollback search (`Engine::search_text`, used by the pump) scans the history and the screen in bounded lock-hold chunks and keeps the newest `MAX_SEARCH_HITS` matches. It joins soft-wrapped rows, so a match may continue onto following rows (it is reported on its first row and ends at `end_line_id`; the highlight spans the rows), never across a hard line break; combining marks are part of the text; a lowercase query ignores case. Proof: the `search_*` tests in `tests/scrollback.rs`.
+
 ## Native clipboard and IME
 
 Wayland clipboard ownership is a platform integration issue. Prefer a winit-compatible native Wayland helper such as `smithay-clipboard` after verifying the pinned handle/API; use a tested X11 backend for X11 [S25, S26]. Do not quietly start an X11 clipboard path in a native Wayland session. Test ownership lifetime, delayed requests and selection transfer after focus changes. PRIMARY selection is optional and documented independently from ordinary copy/paste.

@@ -515,11 +515,14 @@ const SEARCH_CHUNK_LINES: usize = 256;
 /// plus the lines scrolled into history minus the lines pulled back by
 /// resizes since the terminal started. [`Engine::search_hit_line`] maps it
 /// to the current grid line (0 = top screen row, negative = scrollback).
+/// A match that continues past a soft wrap ends on a later row:
+/// `end` is a column of the row `end_line_id` (`line_id` otherwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchHit {
     pub line_id: i64,
     pub start: usize,
     pub end: usize,
+    pub end_line_id: i64,
 }
 
 /// `total_scrolled - total_pulled`: adding it to a grid line gives the
@@ -1068,8 +1071,9 @@ impl Engine {
 
     /// Every occurrence of `query` in the scrollback and the screen, top
     /// to bottom: the newest [`MAX_SEARCH_HITS`] when there are more.
-    /// Matching is per line; it ignores case unless the query has an
-    /// uppercase letter.
+    /// Matching follows soft wraps (a match may continue onto the next
+    /// row; it is reported on the row it starts on) and includes combining
+    /// marks; it ignores case unless the query has an uppercase letter.
     ///
     /// The scan runs bottom-up and copies [`SEARCH_CHUNK_LINES`] lines per
     /// hold of the terminal lock, so a long history never stalls the PTY
@@ -1090,11 +1094,19 @@ impl Engine {
             }
         };
         let needle: Vec<char> = query.chars().map(norm).collect();
+        // One searchable character: (char, stable line id, first column,
+        // last column). A wide char spans two columns; combining marks
+        // share their base cell's columns.
+        type ScanChar = (char, i64, usize, usize);
+        // The row below the one being matched, when that row soft-wraps
+        // into it: its id and the first `needle.len() - 1` characters from
+        // it on (all a match starting above can reach).
+        let mut below: Option<(i64, Vec<ScanChar>)> = None;
         // Stable id of the next line to scan (moving up), once started.
         let mut next: Option<i64> = None;
         'scan: loop {
-            // (stable line id, [(char, first column, last column)]).
-            type ScanLine = (i64, Vec<(char, usize, usize)>);
+            // (stable line id, characters, soft-wraps into the next row).
+            type ScanLine = (i64, Vec<ScanChar>, bool);
             let mut lines: Vec<ScanLine> = Vec::new();
             {
                 let term = self.term.lock();
@@ -1106,17 +1118,27 @@ impl Engine {
                 let mut line = next.map_or(bottom, |id| (id - shift).min(bottom));
                 while line >= top && lines.len() < SEARCH_CHUNK_LINES {
                     let row = &grid[Line(line as i32)];
-                    // Characters with their first and last columns (a wide
-                    // char spans two), skipping wide-char spacers.
-                    let chars = (0..cols)
-                        .filter_map(|c| {
-                            let cell = &row[Column(c)];
-                            let last = c + usize::from(cell.flags.contains(Flags::WIDE_CHAR));
-                            (!cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                                .then(|| (norm(cell.c), c, last.min(cols - 1)))
-                        })
-                        .collect();
-                    lines.push((line + shift, chars));
+                    let id = line + shift;
+                    let mut chars = Vec::with_capacity(cols);
+                    for c in 0..cols {
+                        let cell = &row[Column(c)];
+                        // Skip wide-char spacers, including the one that
+                        // pads a row whose wide char wrapped to the next.
+                        if cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                        {
+                            continue;
+                        }
+                        let last =
+                            (c + usize::from(cell.flags.contains(Flags::WIDE_CHAR))).min(cols - 1);
+                        chars.push((norm(cell.c), id, c, last));
+                        for &mark in cell.zerowidth().unwrap_or_default() {
+                            chars.push((norm(mark), id, c, last));
+                        }
+                    }
+                    let wraps = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+                    lines.push((id, chars, wraps));
                     line -= 1;
                 }
                 next = Some(line + shift);
@@ -1124,29 +1146,52 @@ impl Engine {
             if lines.is_empty() {
                 break;
             }
-            for (line_id, chars) in &lines {
-                if chars.len() < needle.len() {
-                    continue;
-                }
-                // Right to left, so a full result keeps the newest.
-                for start in (0..=chars.len() - needle.len()).rev() {
-                    if chars[start..start + needle.len()]
-                        .iter()
-                        .zip(&needle)
-                        .all(|((c, ..), n)| c == n)
-                    {
-                        // `end` covers a final wide char's right half
-                        // (audit RV10).
-                        hits.push(SearchHit {
-                            line_id: *line_id,
-                            start: chars[start].1,
-                            end: chars[start + needle.len() - 1].2,
-                        });
-                        if hits.len() >= MAX_SEARCH_HITS {
-                            break 'scan;
+            for (line_id, chars, wraps) in lines {
+                // The characters a match starting on this row may run into.
+                let tail: &[ScanChar] = match &below {
+                    Some((id, tail)) if wraps && *id == line_id + 1 => tail,
+                    _ => &[],
+                };
+                let total = chars.len() + tail.len();
+                let at = |i: usize| {
+                    if i < chars.len() {
+                        &chars[i]
+                    } else {
+                        &tail[i - chars.len()]
+                    }
+                };
+                if total >= needle.len() {
+                    // Right to left, so a full result keeps the newest.
+                    let last_start = (total - needle.len()).min(chars.len().saturating_sub(1));
+                    for start in (0..=last_start).rev() {
+                        if start >= chars.len() {
+                            continue;
+                        }
+                        if (0..needle.len()).all(|k| at(start + k).0 == needle[k]) {
+                            // `end` covers a final wide char's right half
+                            // (audit RV10).
+                            let end = at(start + needle.len() - 1);
+                            hits.push(SearchHit {
+                                line_id,
+                                start: chars[start].2,
+                                end: end.3,
+                                end_line_id: end.1,
+                            });
+                            if hits.len() >= MAX_SEARCH_HITS {
+                                break 'scan;
+                            }
                         }
                     }
                 }
+                // This row (and what it wraps into) is the tail of the row
+                // above, if that one wraps.
+                let keep = needle.len() - 1;
+                let mut tail_above: Vec<ScanChar> = chars.into_iter().take(keep).collect();
+                if tail_above.len() < keep {
+                    let more = keep - tail_above.len();
+                    tail_above.extend(tail.iter().take(more).copied());
+                }
+                below = Some((line_id, tail_above));
             }
         }
         hits.reverse();
@@ -1189,7 +1234,15 @@ impl Engine {
                 }
             }
         };
-        self.select((row, hit.start), (row, hit.end));
+        // A wrapped match ends on a later row; past the bottom of the view
+        // the highlight stops at the last cell.
+        let end_row = row + hit.end_line_id.saturating_sub(hit.line_id).max(0) as usize;
+        let end = if end_row < self.rows {
+            (end_row, hit.end)
+        } else {
+            (self.rows - 1, self.cols - 1)
+        };
+        self.select((row, hit.start), end);
     }
 
     /// Set the selection to the range `start..=end` in viewport

@@ -756,3 +756,100 @@ fn idle_terminal_scrolled_back_reports_no_damage() {
         "idle while scrolled back must be a no-op: {damage:?} {cursor:?}"
     );
 }
+
+/// A word split by a soft wrap is found; it is reported on the row it
+/// starts on and ends on the next row, and the highlight covers both
+/// parts.
+#[test]
+fn search_follows_soft_wraps() {
+    let mut engine = Engine::with_history(5, 10, 50);
+    engine.feed(b"0123456needle tail\r\n");
+    let hits = engine.search_text("needle");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = hits[0];
+    assert_eq!(
+        (hit.start, hit.end, hit.end_line_id),
+        (7, 2, hit.line_id + 1)
+    );
+    engine.show_search_hit(hit);
+    let snap = engine.snapshot();
+    let selected: String = snap
+        .cells
+        .iter()
+        .zip(&snap.selected)
+        .filter(|(_, s)| **s)
+        .map(|(c, _)| c.ch)
+        .collect();
+    assert_eq!(selected, "needle");
+}
+
+/// A hard line break does not join rows.
+#[test]
+fn search_does_not_join_hard_line_breaks() {
+    let mut engine = Engine::with_history(5, 10, 50);
+    engine.feed(b"0123456nee\r\ndle\r\n");
+    assert!(engine.search_text("needle").is_empty());
+}
+
+/// A match may span several wrapped rows of a narrow pane.
+#[test]
+fn search_spans_several_wrapped_rows() {
+    let mut engine = Engine::with_history(5, 3, 50);
+    engine.feed(b"xxneedle\r\n");
+    let hits = engine.search_text("needle");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = hits[0];
+    assert_eq!(
+        (hit.start, hit.end, hit.end_line_id),
+        (2, 1, hit.line_id + 2)
+    );
+}
+
+/// A wide char moved to the next row by a wrap still matches.
+#[test]
+fn search_wide_char_after_wrap() {
+    let mut engine = Engine::with_history(5, 5, 50);
+    engine.feed("abcd日本\r\n".as_bytes());
+    let hits = engine.search_text("d日");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = hits[0];
+    assert_eq!(
+        (hit.start, hit.end, hit.end_line_id),
+        (3, 1, hit.line_id + 1)
+    );
+}
+
+/// Combining marks are part of the searchable text.
+#[test]
+fn search_includes_combining_marks() {
+    let mut engine = Engine::with_history(5, 20, 50);
+    engine.feed("cafe\u{301} x\r\n".as_bytes());
+    let hits = engine.search_text("cafe\u{301}");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((hits[0].start, hits[0].end), (0, 3));
+    assert_eq!(engine.search_text("e\u{301} x").len(), 1);
+}
+
+/// A wrapped match whose rows land in different lock chunks is found once.
+#[test]
+fn search_wrap_across_scan_chunks() {
+    let mut engine = Engine::with_history(5, 10, 1000);
+    let mut stream = b"0123456needle\r\n".to_vec();
+    for _ in 0..254 {
+        stream.extend_from_slice(b"x\r\n");
+    }
+    engine.feed(&stream);
+    let hits = engine.search_text("needle");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].end_line_id, hits[0].line_id + 1);
+    // Also with the boundary one row lower and higher.
+    for extra in [253, 255] {
+        let mut engine = Engine::with_history(5, 10, 1000);
+        let mut stream = b"0123456needle\r\n".to_vec();
+        for _ in 0..extra {
+            stream.extend_from_slice(b"x\r\n");
+        }
+        engine.feed(&stream);
+        assert_eq!(engine.search_text("needle").len(), 1, "extra {extra}");
+    }
+}
