@@ -515,16 +515,28 @@ fn common_extension<'a>(
     (!extension.is_empty() && !extension.chars().any(char::is_control)).then_some(extension)
 }
 
+/// Most directory entries read across all of `PATH` when listing
+/// executables, and most names kept. Past either, the listing is incomplete
+/// and [`path_executables`] offers nothing (a completion from part of the
+/// names could be wrong).
+pub const MAX_PATH_ENTRIES: usize = 262_144;
+pub const MAX_PATH_EXECUTABLES: usize = 65_536;
+
 /// Executable file names in the directories of `path_var` (a `PATH`
-/// value), sorted and deduplicated, at most [`MAX_DIR_ENTRIES`] read per
-/// directory.
+/// value), sorted and deduplicated; empty when `PATH` holds more than
+/// [`MAX_PATH_ENTRIES`] entries or [`MAX_PATH_EXECUTABLES`] executables.
 pub fn path_executables(path_var: &std::ffi::OsStr) -> Vec<String> {
     let mut names = Vec::new();
+    let mut read = 0usize;
     for dir in std::env::split_paths(path_var) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.take(MAX_DIR_ENTRIES).flatten() {
+        for entry in entries.flatten() {
+            read += 1;
+            if read > MAX_PATH_ENTRIES || names.len() >= MAX_PATH_EXECUTABLES {
+                return Vec::new();
+            }
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
