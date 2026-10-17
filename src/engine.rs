@@ -205,14 +205,27 @@ fn event_record_cost(record: &EventRecord) -> usize {
     }
 }
 
+/// Whether a record becomes bytes written back to the application (the
+/// session resolves the request records into replies).
+fn is_reply(record: &EventRecord) -> bool {
+    matches!(
+        record,
+        EventRecord::PtyWrite(_)
+            | EventRecord::ColorRequest(..)
+            | EventRecord::TextAreaSizeRequest(_)
+            | EventRecord::ClipboardLoad(..)
+    )
+}
+
 /// Ordered event sink shared between the engine, its owner, and any PTY
 /// event loop driven against the engine's term.
 ///
 /// Pending state is bounded: at most [`MAX_RECORDS`] records and
-/// [`MAX_RECORD_BYTES`] String-owned bytes (drop-oldest FIFO). Replaceable
-/// presentation state coalesces before eviction: a new title replaces a
-/// pending undrained title (latest wins), and a bell while one is pending
-/// is skipped.
+/// [`MAX_RECORD_BYTES`] String-owned bytes (drop-oldest FIFO, replies to
+/// the application last). Replaceable presentation state coalesces before
+/// eviction: a new title replaces a pending undrained title (latest wins),
+/// and a bell, wakeup or mouse-cursor update while one is pending is
+/// skipped.
 #[derive(Clone, Default)]
 pub struct Recorder {
     events: Arc<Mutex<RecorderState>>,
@@ -260,27 +273,36 @@ impl Recorder {
                     return;
                 }
             }
-            EventRecord::Bell if state.events.iter().any(|r| matches!(r, EventRecord::Bell)) => {
+            // A pending bell, redraw request or mouse-cursor update already
+            // says everything a second one would.
+            EventRecord::Bell | EventRecord::Wakeup | EventRecord::MouseCursorDirty
+                if state
+                    .events
+                    .iter()
+                    .any(|r| std::mem::discriminant(r) == std::mem::discriminant(&record)) =>
+            {
                 return;
             }
             _ => {}
         }
 
-        // Bounded retention: drop oldest first. A single record over the
-        // byte cap evicts everything else and remains alone.
         state.bytes += event_record_cost(&record);
         state.events.push(record);
-        // Never evict the last remaining record: a single record over the
-        // byte cap evicts everything else and remains alone.
-        // The child's exit record is never evicted: losing it loses the
-        // exit status (audit P9). Everything else drops oldest-first.
+        // Bounded retention, oldest first. Never evict the last remaining
+        // record: a single record over the byte cap evicts everything else
+        // and remains alone. The child's exit record is never evicted:
+        // losing it loses the exit status (audit P9). Replies to the
+        // application are evicted only when nothing else is left to evict
+        // (a reply flood), so presentation records can never push out a
+        // pending reply.
         while state.events.len() > 1
             && (state.events.len() > MAX_RECORDS || state.bytes > MAX_RECORD_BYTES)
         {
             let Some(index) = state
                 .events
                 .iter()
-                .position(|r| !matches!(r, EventRecord::ChildExit(_)))
+                .position(|r| !is_reply(r) && !matches!(r, EventRecord::ChildExit(_)))
+                .or_else(|| state.events.iter().position(is_reply))
             else {
                 break;
             };

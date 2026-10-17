@@ -348,3 +348,56 @@ fn osc52_load_query_is_denied_when_disabled() {
     );
     assert_eq!(engine.replies(), Vec::<String>::new());
 }
+
+/// Redraw and mouse-cursor notifications coalesce: a burst of them leaves
+/// one pending record each, after the reply that came first.
+#[test]
+fn wakeups_coalesce_and_keep_pending_replies() {
+    use alacritty_terminal::event::{Event, EventListener};
+    let mut engine = Engine::new(4, 8);
+    engine.feed(b"\x1b[6n");
+    let recorder = engine.recorder();
+    for _ in 0..1000 {
+        recorder.send_event(Event::Wakeup);
+        recorder.send_event(Event::MouseCursorDirty);
+    }
+    assert_eq!(
+        engine.events(),
+        vec![
+            EventRecord::PtyWrite("\x1b[1;1R".to_string()),
+            EventRecord::Wakeup,
+            EventRecord::MouseCursorDirty,
+        ]
+    );
+}
+
+/// Presentation records over the cap are evicted before any pending reply.
+#[test]
+fn eviction_spares_pending_replies() {
+    use alacritty_terminal::event::{Event, EventListener};
+    let mut engine = Engine::new(4, 8);
+    engine.feed(b"\x1b[6n");
+    let recorder = engine.recorder();
+    for _ in 0..1000 {
+        recorder.send_event(Event::ResetTitle);
+    }
+    engine.feed(b"\x1b[5n");
+    assert_eq!(engine.events().len(), 256);
+    assert_eq!(
+        engine.replies(),
+        vec!["\x1b[1;1R".to_string(), "\x1b[0n".to_string()]
+    );
+}
+
+/// A reply flood stays bounded: the newest replies are kept.
+#[test]
+fn reply_flood_stays_bounded() {
+    let mut engine = Engine::new(4, 8);
+    for _ in 0..1000 {
+        engine.feed(b"\x1b[5n");
+    }
+    engine.feed(b"\x1b[6n");
+    let replies = engine.replies();
+    assert_eq!(replies.len(), 256);
+    assert_eq!(replies.last().map(String::as_str), Some("\x1b[1;1R"));
+}
