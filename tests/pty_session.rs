@@ -1386,6 +1386,11 @@ fn pty_bash_shell_integration_marker_order() {
         .join("shell/nora-bash.sh");
     let rc = std::env::temp_dir().join(format!("nora-bash-rc-{}", std::process::id()));
     std::fs::write(&rc, format!("source {}\n", script.display())).expect("write the rcfile");
+    let cwd = std::env::temp_dir()
+        .canonicalize()
+        .expect("the temp dir resolves")
+        .join(format!("nora bash cwd \u{e9} {}", std::process::id()));
+    std::fs::create_dir_all(&cwd).expect("create the cwd");
 
     // bash is in the nix store on this cluster; fall back to PATH.
     let bash = [
@@ -1408,7 +1413,8 @@ fn pty_bash_shell_integration_marker_order() {
                 rc.to_string_lossy().into_owned(),
                 "-i".to_string(),
             ],
-            cwd: None,
+            // A directory whose name needs percent-encoding in OSC 7.
+            cwd: Some(cwd.clone()),
             env: Vec::new(),
         },
         24,
@@ -1457,9 +1463,15 @@ fn pty_bash_shell_integration_marker_order() {
          (second prompt), B C before the second command — with no spurious \
          B C pair between D and A; got {kinds:?}"
     );
+    assert_eq!(
+        session.engine().cwd().as_deref(),
+        Some(cwd.to_str().expect("UTF-8 temp dir")),
+        "the prompt reports the cwd (OSC 7), percent-decoded"
+    );
 
     session.close();
     let _ = std::fs::remove_file(&rc);
+    let _ = std::fs::remove_dir(&cwd);
 }
 
 /// `shell/nora-bash.sh` emits one `B C` pair per command line: a loop

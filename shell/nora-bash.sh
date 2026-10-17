@@ -27,6 +27,21 @@ __nora_osc133() {
     printf '\033]133;%s\033\\' "$1"
 }
 
+# Report the working directory: `ESC ] 7 ; file://<host><path> ST`, the
+# path percent-encoded byte by byte. The host names the machine the path
+# is on (over ssh, the remote).
+__nora_osc7() {
+    local LC_ALL=C s=$PWD out= ch hex i
+    for (( i = 0; i < ${#s}; i++ )); do
+        ch=${s:i:1}
+        case $ch in
+            [A-Za-z0-9._~/-]) out+=$ch ;;
+            *) printf -v hex '%%%02X' "'$ch"; out+=$hex ;;
+        esac
+    done
+    printf '\033]7;file://%s%s\033\\' "${HOSTNAME-}" "$out"
+}
+
 # Set once a prompt is drawn, cleared by the first command after it.
 __nora_at_prompt=
 
@@ -37,6 +52,7 @@ __nora_at_prompt=
 __nora_prompt_start() {
     [[ -n ${__nora_debug_installed-} ]] || __nora_install_debug_trap "$1"
     __nora_osc133 D
+    __nora_osc7
     __nora_osc133 A
     __nora_at_prompt=1
 }
