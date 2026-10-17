@@ -797,13 +797,20 @@ pub fn pump_thread(
         // (2) Drain commands, routing each to its pane's session.
         let pending = first
             .into_iter()
-            .chain(std::iter::from_fn(|| commands.try_recv().ok()));
+            .map(|msg| (true, msg))
+            .chain(std::iter::from_fn(|| {
+                commands.try_recv().ok().map(|msg| (false, msg))
+            }));
         let mut commanded = false;
-        for msg in pending {
-            commanded |= !matches!(msg, PumpMsg::Wake);
+        for (before_tick, msg) in pending {
+            // A wake that arrived after this pass's tick announces output
+            // the tick may not have seen (a shell writes its buffer report
+            // and then the echo, microseconds apart): tick again at once.
+            // Draining it silently left that output undrawn until the next
+            // key or the 500 ms heartbeat.
+            commanded |= !before_tick || !matches!(msg, PumpMsg::Wake);
             match msg {
-                // The wake only ended the wait; the tick above already
-                // picked up the new output.
+                // The wake that ended the wait: the tick above ran after it.
                 PumpMsg::Wake => {}
                 // The PTY filter queues prompt markers; fold them into the
                 // engine's store before navigating by them.

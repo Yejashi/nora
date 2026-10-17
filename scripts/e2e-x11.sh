@@ -785,6 +785,38 @@ RC
     pass zshell
 }
 
+# Typing with the zsh integration: each key is drawn on its own, at once.
+# The hook writes the buffer report just before zsh echoes the key, so the
+# output comes in two bursts microseconds apart; the pump once swallowed
+# the second burst's wake and drew the key only at the next one.
+scenario_echo() {
+    have zsh echo || return
+    local dir="$OUT/echo"; rm -rf "$dir"; mkdir -p "$dir/zdot"
+    cat >"$dir/zdot/.zshrc" <<RC
+PROMPT='%% '
+source "$ROOT/shell/nora-zsh.zsh"
+RC
+    ZDOTDIR="$dir/zdot" NORA_TRACE_LATENCY=1 NORA_TRACE_SHELL=1 launch echo zsh -d -i \
+        || { fail echo "no window"; return; }
+    for _ in $(seq 1 100); do
+        grep -q '^shell: buffer "" cursor 0' "$OUT/echo/nora.log" && break
+        sleep 0.1
+    done
+    local before
+    before=$(grep -c 'key-to-present' "$OUT/echo/nora.log")
+    xdotool type --delay 120 "echo abcdefghijklmno"
+    sleep 0.5
+    finish
+    local frames worst
+    frames=$(( $(grep -c 'key-to-present' "$OUT/echo/nora.log") - before ))
+    worst=$(grep -o 'key-to-present [0-9.]*' "$OUT/echo/nora.log" | tail -n "$frames" \
+        | awk '{print $2}' | sort -n | tail -1)
+    echo "  20 keys: $frames frames, slowest key to frame ${worst} ms"
+    [ "$frames" -eq 20 ] || { fail echo "only $frames of 20 keys drew a frame of their own"; return; }
+    awk -v w="$worst" 'BEGIN { exit !(w < 50) }' || { fail echo "a key took ${worst} ms to show"; return; }
+    pass echo
+}
+
 # Inline suggestions (ADR-013 step 4): a command run once is suggested
 # (dim ghost text) for a prefix; Right types it, and the shell runs
 # exactly the suggestion. SIGTERM then closes nora in order, and the
@@ -1434,7 +1466,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell suggest prompts ime vim nvim less ssh a11y tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell echo suggest prompts ime vim nvim less ssh a11y tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
