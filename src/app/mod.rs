@@ -2879,8 +2879,14 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 // A press in another pane of the visible tab focuses it
-                // first; the click then belongs to that pane.
+                // first; the click then belongs to that pane. Not while
+                // another button is held or a press holds the grab: the
+                // pane that took that press keeps the events up to its
+                // release (a right-click over B during a left-drag in A
+                // must not strand A's release).
                 if state == ElementState::Pressed
+                    && self.pressed_buttons.is_empty()
+                    && self.mouse_grab.is_none()
                     && let Some((target, _)) = self.pane_at(self.cursor.0, self.cursor.1)
                     && target != self.layout.active_pane()
                 {
