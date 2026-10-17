@@ -493,3 +493,42 @@ fn zsh_ksh_arrays_keeps_the_line_hooks() {
         out.executed
     );
 }
+
+/// zsh's terminal fd for the line-editor hooks is open only while editing:
+/// a command (or a daemon it starts) inherits only its own terminal fds,
+/// and the markers and buffer reports still arrive.
+#[test]
+fn zsh_commands_do_not_inherit_the_marker_fd() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("zsh-fd");
+    let rc = format!("PS1='$ '\nsource {}\n", script("nora-zsh.zsh").display());
+    let mut shell = Shell::zsh(zsh, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    // stdin and stderr are the terminal, stdout is the file; a third
+    // terminal fd would be nora's.
+    shell.run(
+        "sh -c 'for f in /proc/$$/fd/*; do readlink \"$f\"; done' > fds.txt; echo ran-$((1 + 1))",
+        "ran-2",
+    );
+    let out = shell.exit();
+    let fds = std::fs::read_to_string(dir.path("fds.txt")).expect("fds.txt");
+    let terminal_fds = fds
+        .lines()
+        .filter(|line| line.starts_with("/dev/pts/"))
+        .count();
+    assert_eq!(terminal_fds, 2, "the child's fds:\n{fds}");
+    assert_eq!(
+        out.kinds(),
+        vec![A, B, C, D, A, B, C],
+        "grid:\n{}",
+        out.grid
+    );
+    assert!(
+        out.executed.iter().any(|line| line.starts_with("sh -c")),
+        "got {:?}",
+        out.executed
+    );
+}

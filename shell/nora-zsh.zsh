@@ -16,11 +16,17 @@
 (( ${+__nora_zsh_loaded} )) && return 0
 typeset -g __nora_zsh_loaded=1
 
-# The terminal, as an fd that stays valid inside line-editor widgets.
-exec {__nora_fd}>&1
+# The terminal for the line-editor hooks, as an fd that stays valid when
+# a widget runs zle under a redirection (`zle reset-prompt >/dev/null`
+# would otherwise send the buffer reports there). zsh cannot mark it
+# close-on-exec, so it is dup'ed from stdout (the terminal) when editing
+# starts and closed when editing ends: commands, and daemons they start,
+# never inherit it. precmd and preexec run outside the editor and write
+# to stdout.
+typeset -g __nora_fd=
 
 __nora_osc() {
-    builtin print -rnu $__nora_fd -- $'\e]'"$1"$'\e\\'
+    builtin print -rnu ${__nora_fd:-1} -- $'\e]'"$1"$'\e\\'
 }
 
 # Percent-encode $1 (UTF-8 bytes) into REPLY, keeping unreserved and `/`.
@@ -97,6 +103,7 @@ __nora_preexec() {
 typeset -g __nora_last_report=
 
 __nora_line_init() {
+    [[ -n $__nora_fd ]] || exec {__nora_fd}>&1
     __nora_osc "133;B"
     __nora_last_report=
     __nora_line_report
@@ -114,6 +121,10 @@ __nora_line_report() {
 __nora_line_finish() {
     __nora_osc "6973;end"
     __nora_last_report=
+    if [[ -n $__nora_fd ]]; then
+        exec {__nora_fd}>&-
+        __nora_fd=
+    fi
 }
 
 autoload -Uz add-zsh-hook add-zle-hook-widget
