@@ -100,10 +100,10 @@ struct GlyphKey {
 /// identical buffer. This cache retains the shaped [`Buffer`] and reuses it on
 /// a hit, skipping the per-cell cosmic-text shaping (Unicode segmentation,
 /// font lookup and layout); the renderer borrows the retained buffer rather
-/// than cloning it. It is bounded: a frame that could exceed
-/// [`MAX_GLYPH_CACHE_ENTRIES`] distinct styled cells clears it first (a
-/// one-time re-shape), keeping memory bounded by the cap (or by one
-/// frame's cells, if larger).
+/// than cloning it. It is bounded: once misses fill it to
+/// [`MAX_GLYPH_CACHE_ENTRIES`] distinct styled cells, the next frame starts
+/// by clearing it (a one-time re-shape), keeping memory bounded by the cap
+/// plus one frame's distinct cells.
 pub struct GlyphCache {
     /// Key → index into `buffers`.
     entries: HashMap<GlyphKey, usize>,
@@ -129,12 +129,15 @@ impl GlyphCache {
         }
     }
 
-    /// Start a frame that will [`prepare`](Self::prepare) up to `cells`
-    /// cells: clears the cache first if they might not fit under the cap,
-    /// so no slot handed out during the frame is invalidated. A frame with
-    /// more cells than the cap holds them all until the next frame.
-    pub fn begin_frame(&mut self, cells: usize) {
-        if self.entries.len() + cells > MAX_GLYPH_CACHE_ENTRIES {
+    /// Start a frame of [`prepare`](Self::prepare) calls. Entries are
+    /// distinct styled clusters, not cells (a dense grid repeats few), so
+    /// the cache clears only once earlier misses filled it to the cap; it
+    /// never clears mid-frame, so no slot handed out during a frame is
+    /// invalidated. A frame's own misses may take it past the cap until
+    /// the next frame starts, bounding memory by the cap plus one frame's
+    /// distinct cells.
+    pub fn begin_frame(&mut self) {
+        if self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES {
             self.entries.clear();
             self.buffers.clear();
         }
@@ -196,7 +199,7 @@ impl GlyphCache {
         strikethrough: bool,
         size: f32,
     ) -> Buffer {
-        self.begin_frame(1);
+        self.begin_frame();
         let slot = self.prepare(
             fs,
             metrics,
@@ -325,7 +328,7 @@ mod tests {
             )
         };
 
-        cache.begin_frame(2);
+        cache.begin_frame();
         let a = prepare(&mut cache, "a");
         let b = prepare(&mut cache, "b");
         assert_ne!(a, b);
@@ -333,12 +336,31 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert!(cache.buffer(a).layout_runs().next().is_some());
 
-        // A frame that fits keeps the entries; one that might not clears
-        // them before handing out slots.
-        cache.begin_frame(MAX_GLYPH_CACHE_ENTRIES - 2);
-        assert_eq!(cache.len(), 2);
-        cache.begin_frame(MAX_GLYPH_CACHE_ENTRIES - 1);
-        assert!(cache.is_empty());
+        // A large dense frame repeats the same few clusters: they stay
+        // retained across frames however many cells draw them.
+        for _ in 0..3 {
+            cache.begin_frame();
+            for _ in 0..(MAX_GLYPH_CACHE_ENTRIES + 100) {
+                assert_eq!(prepare(&mut cache, "a"), a);
+            }
+            assert_eq!(cache.len(), 2, "hits never clear the cache");
+        }
+
+        // Misses past the cap inside a frame keep every slot valid; the
+        // next frame starts empty.
+        cache.begin_frame();
+        let first = prepare(&mut cache, "first");
+        for i in 0..MAX_GLYPH_CACHE_ENTRIES {
+            prepare(&mut cache, &i.to_string());
+        }
+        assert!(cache.len() > MAX_GLYPH_CACHE_ENTRIES);
+        assert_eq!(prepare(&mut cache, "a"), a, "earlier slots stay valid");
+        assert_eq!(prepare(&mut cache, "first"), first);
+        cache.begin_frame();
+        assert!(
+            cache.is_empty(),
+            "the next frame starts from an empty cache"
+        );
     }
 
     /// An underlined or struck-through space shapes to a decoration span,

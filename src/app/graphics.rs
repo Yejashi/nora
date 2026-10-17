@@ -705,7 +705,7 @@ impl Graphics {
         // an unchanged cell (same text, bold/italic/underline/strike and
         // zoom-scaled size) instead of re-running cosmic-text's shaping, and
         // the areas borrow its buffers rather than cloning them (audit R12).
-        self.glyph_cache.begin_frame(cells.len());
+        self.glyph_cache.begin_frame();
         let slots: Vec<usize> = cells
             .iter()
             .map(|cell| {
