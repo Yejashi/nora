@@ -566,6 +566,11 @@ struct WinApp {
     /// Each pane's inline suggestion (ADR-013): the text after the cursor
     /// the pump computed for the shell's last reported buffer.
     suggestions: std::collections::HashMap<PaneKey, String>,
+    /// The number of the last `PumpMsg::Input` sent (to any pane), and
+    /// per pane the number of its last one: a suggestion tagged with an
+    /// older number answers a buffer the latest input already changed.
+    input_seq: u64,
+    pane_input_seq: std::collections::HashMap<PaneKey, u64>,
     /// Set by the wgpu device-lost callback; the next render exits.
     device_lost: Arc<AtomicBool>,
     /// `NORA_TRACE_LATENCY`: when the oldest key event not yet followed by
@@ -778,6 +783,8 @@ pub fn run_windowed(
         full_fonts: None,
         pane_last: std::collections::HashMap::new(),
         suggestions: std::collections::HashMap::new(),
+        input_seq: 0,
+        pane_input_seq: std::collections::HashMap::new(),
         device_lost: Arc::new(AtomicBool::new(false)),
         trace_key_at: None,
         trace_fresh_key_at: None,
@@ -863,6 +870,7 @@ impl WinApp {
     fn drop_pane_state(&mut self, pane: PaneKey) {
         self.pane_last.remove(&pane);
         self.suggestions.remove(&pane);
+        self.pane_input_seq.remove(&pane);
         self.pane_titles.remove(&pane);
         self.pane_slots.remove(&pane);
         self.pane_spawned.remove(&pane);
@@ -1397,11 +1405,18 @@ impl WinApp {
             return false;
         };
         let text = if word { next_word(&suffix) } else { &suffix };
-        let _ = self.pump_commands.send(PumpMsg::Input {
-            pane,
-            bytes: text.as_bytes().to_vec(),
-        });
+        let bytes = text.as_bytes().to_vec();
+        self.send_input(pane, bytes);
         true
+    }
+
+    /// Send input bytes to `pane`, numbered (ADR-013): a suggestion is
+    /// kept only when tagged with the number of the pane's latest input.
+    fn send_input(&mut self, pane: PaneKey, bytes: Vec<u8>) {
+        self.input_seq += 1;
+        let seq = self.input_seq;
+        self.pane_input_seq.insert(pane, seq);
+        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes, seq });
     }
 
     /// Paste the clipboard into the active pane (bracketed when the
@@ -1654,7 +1669,14 @@ impl WinApp {
             }
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged | AppEvent::Terminate => {}
-            AppEvent::Suggestion { pane, suffix } => {
+            AppEvent::Suggestion { pane, suffix, seq } => {
+                // Computed before the pane's latest input reached the
+                // shell: it answers an older buffer ("git s" -> "tatus"
+                // after "t" was typed), so it must not be shown or
+                // accepted.
+                if !suggestion_is_current(seq, self.pane_input_seq.get(&pane).copied()) {
+                    return Action::Skip;
+                }
                 let shown = suffix.is_some();
                 let changed = match suffix {
                     Some(suffix) => self.suggestions.insert(pane, suffix.clone()) != Some(suffix),
@@ -1794,7 +1816,7 @@ impl WinApp {
         let event = MouseEvent { col, row, ..*event };
         let encoding = MouseEncoding::from_term_mode(self.modes);
         if let Some(bytes) = encode_mouse_event(mode, encoding, &event, rect.2, rect.3) {
-            let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+            self.send_input(pane, bytes);
         }
     }
 
@@ -2529,7 +2551,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         if kitty::active(modes)
                             && let Kitty::Send(bytes) = self.encode_kitty(&event, modes)
                         {
-                            let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                            self.send_input(pane, bytes);
                         }
                     }
                     return;
@@ -2639,7 +2661,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                 // suggestion must not be accepted before
                                 // the shell reports the new one.
                                 self.suggestions.remove(&pane);
-                                let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                                self.send_input(pane, bytes);
                             }
                         }
                         InputAction::Quit => {
@@ -2712,7 +2734,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                             &[0x1b, b'[', key]
                         };
                         let bytes = one.repeat(lines.unsigned_abs() as usize);
-                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                        self.send_input(pane, bytes);
                     }
                     return;
                 }
@@ -2885,10 +2907,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         }
                         if let Some(pane) = self.active_pane_key() {
                             self.suggestions.remove(&pane);
-                            let _ = self.pump_commands.send(PumpMsg::Input {
-                                pane,
-                                bytes: committed.into_bytes(),
-                            });
+                            self.send_input(pane, committed.into_bytes());
                         }
                     }
                 }
@@ -2912,15 +2931,19 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     encode_focus_event(self.modes.contains(TermMode::FOCUS_IN_OUT), focused)
                     && let Some(pane) = self.active_pane_key()
                 {
-                    let _ = self.pump_commands.send(PumpMsg::Input {
-                        pane,
-                        bytes: seq.into_bytes(),
-                    });
+                    self.send_input(pane, seq.into_bytes());
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Whether a suggestion tagged `seq` (the last input the pump had fed to
+/// the pane's PTY when it read the buffer) answers the pane's latest input
+/// (`last_sent`; `None` = the window never sent the pane input).
+fn suggestion_is_current(seq: u64, last_sent: Option<u64>) -> bool {
+    seq == last_sent.unwrap_or(0)
 }
 
 /// The next word of an inline suggestion: leading spaces, then up to the
@@ -2941,6 +2964,18 @@ mod suggestion_tests {
         assert_eq!(super::next_word(" --short"), " --short");
         assert_eq!(super::next_word("  a b"), "  a");
         assert_eq!(super::next_word("x"), "x");
+    }
+
+    #[test]
+    fn suggestion_for_an_older_input_is_stale() {
+        use super::suggestion_is_current;
+        // A pane the window never typed into: the pump's tag is 0.
+        assert!(suggestion_is_current(0, None));
+        // "git s" was input 4; "t" (input 5) is sent; the report for
+        // "git s" arrives tagged 4 and must be dropped.
+        assert!(!suggestion_is_current(4, Some(5)));
+        // The echo of "t" is read after input 5 was fed.
+        assert!(suggestion_is_current(5, Some(5)));
     }
 }
 

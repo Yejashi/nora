@@ -130,10 +130,13 @@ pub enum AppEvent {
     Bell { pane: PaneKey },
     /// The inline suggestion for the pane's shell editor buffer (ADR-013):
     /// the text to show after the cursor, or `None` for none. Sent on every
-    /// buffer change.
+    /// buffer change. `seq` is the last [`PumpMsg::Input`] number fully
+    /// fed to the PTY when the buffer report was processed: the window
+    /// keeps the suggestion only if it equals the last number it sent.
     Suggestion {
         pane: PaneKey,
         suffix: Option<String>,
+        seq: u64,
     },
     /// The pane's search position: match `current` (1-based; 0 = none)
     /// of `total`.
@@ -181,8 +184,15 @@ pub enum PumpMsg {
         cols: usize,
     },
     /// Encoded keystroke bytes for the pane; window→PTY, ordered after
-    /// earlier messages.
-    Input { pane: PaneKey, bytes: Vec<u8> },
+    /// earlier messages. `seq` is the window's number for this input
+    /// (increasing; ADR-013): suggestions are tagged with the last one fed
+    /// to the PTY, so the window can drop one computed before its latest
+    /// input.
+    Input {
+        pane: PaneKey,
+        bytes: Vec<u8>,
+        seq: u64,
+    },
     /// Scroll the engine's viewport for the pane (N14a); applied on the
     /// next tick.
     Scroll { pane: PaneKey, scroll: Scroll },
@@ -438,6 +448,11 @@ struct PanePump {
     /// Whether the terminal was in password input at the last buffer
     /// check (ADR-013), for change detection.
     password_input: bool,
+    /// The number of the last [`PumpMsg::Input`] received for this pane.
+    input_seq: u64,
+    /// The number of the last input whose bytes were all fed to the
+    /// session (every earlier input's too); tags suggestions.
+    fed_seq: u64,
 }
 
 impl PanePump {
@@ -455,6 +470,8 @@ impl PanePump {
             exit_status: None,
             shell_buffer: None,
             password_input: false,
+            input_seq: 0,
+            fed_seq: 0,
         }
     }
 }
@@ -691,7 +708,13 @@ fn update_suggestion(
     }
     pane_pump.shell_buffer = buffer;
     pane_pump.password_input = password_input;
-    let _ = events.send_event(AppEvent::Suggestion { pane, suffix });
+    // The tag says which input the buffer reflects. Residual race: a
+    // report the shell wrote before it read the latest key, but that the
+    // engine parsed only after the key was fed, is tagged with the key's
+    // number although it shows the older buffer; the next report (the
+    // key's echo) replaces it.
+    let seq = pane_pump.fed_seq;
+    let _ = events.send_event(AppEvent::Suggestion { pane, suffix, seq });
 }
 
 fn tick_pane(
@@ -1038,8 +1061,11 @@ pub fn pump_thread(
                         pane_pump.session.resize(rows as u16, cols as u16);
                     }
                 }
-                PumpMsg::Input { pane, bytes } => {
+                PumpMsg::Input { pane, bytes, seq } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        // A refused input counts as fed once the bytes
+                        // before it are: it never changes the buffer.
+                        pane_pump.input_seq = seq;
                         // Refused (never accepted, then dropped) when the
                         // pane's queue is full: the child stopped reading.
                         if pane_pump.pending_input.len() + bytes.len() <= MAX_PENDING_INPUT {
@@ -1155,6 +1181,11 @@ pub fn pump_thread(
                     &mut pane_pump.pending_input,
                     &mut pane_pump.paste_block,
                 );
+            }
+            // Every queued input reached the session: the shell's next
+            // buffer report can reflect the latest one.
+            if pane_pump.pending_input.is_empty() {
+                pane_pump.fed_seq = pane_pump.input_seq;
             }
             let _ = pane_pump.session.flush(1024 * 1024);
         }

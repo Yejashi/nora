@@ -156,7 +156,13 @@ Option 4, with these parts:
    finished commands, and sends `AppEvent::Suggestion` on every buffer
    change. The window draws it through the preedit path (foreground 2/5
    of the way from the background) and drops it as soon as other input
-   goes to the shell, so a stale suggestion is never typed. Bindings
+   goes to the shell, so a stale suggestion is never typed. Each
+   `PumpMsg::Input` carries a window sequence number and each suggestion
+   the number of the last input fed to the PTY when its buffer was read;
+   the window keeps a suggestion only if that is its latest number for the
+   pane, so one computed for the previous buffer cannot arrive late and be
+   accepted (residual race: a report the shell wrote before reading the
+   key but the pump parsed after feeding it; the echo replaces it). Bindings
    `accept_suggestion` (Right, End) and `accept_suggestion_word`
    (Alt+Right) fall through when there is none. e2e `suggest`: ghost
    drawn, Right then Enter runs exactly the suggested command, history
