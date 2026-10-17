@@ -7,7 +7,7 @@ This record re-establishes acceptance per roadmap milestone
 **accepted** (acceptance criteria met, evidence in CI or recorded),
 **partial** (some criteria open, listed), **open**.
 
-Evidence sources: `scripts/e2e-x11.sh` (25 scenarios in a real X11 window
+Evidence sources: `scripts/e2e-x11.sh` (26 scenarios in a real X11 window
 with real key and mouse events, run in CI job `e2e-x11`), the test suite
 (about 600 tests), `scripts/perf.sh`, and the audit table of fixes
 (docs/audit/2026-10-15-runtime-audit.md).
@@ -23,11 +23,11 @@ with real key and mouse events, run in CI job `e2e-x11`), the test suite
 | M1.6 fonts and metrics | accepted | e2e `zoom`, metric tests | fractional scale verified by unit geometry only |
 | M1.7 bounds and latency | accepted | e2e `flood` (+5.5 MiB under a 200 MiB OSC flood), input-bound test, close escalation test; key-to-present ~1 ms | — |
 | M1.8 reports and environment | accepted | e2e `reports`, `hyperlink`; OSC 7 decoder byte-safe (RV-OSC7) | prompt navigation has unit tests only (needs the bash integration in e2e) |
-| M2 multi-pane UI | accepted | e2e `panes`, `tinysplit`, `paneexit`, `search` (scrollback, chords), `title`; review RV3, RV4, RV6, RV8-RV10 fixed | IME preedit and candidate placement unverified with a real input method (manual check under fcitx5/ibus) |
+| M2 multi-pane UI | accepted | e2e `panes`, `tinysplit`, `paneexit`, `search` (scrollback, chords), `title`; review RV3, RV4, RV6, RV8-RV10 fixed | candidate-window placement not verified: nora reports the cursor area (`set_ime_cursor_area`), but the e2e engine (ibus simple) shows no candidates; preedit and commit are verified by e2e `ime` |
 | M3 performance | accepted (baseline recorded) | docs/performance/2026-10-15-baseline.md, input latency record | window-path throughput ~56 MiB/s vs ~110 MiB/s headless (snapshot under the terminal lock, audit P8); per-frame allocations not measured |
 | M4 customization | accepted | e2e `config` (startup, live reload incl. palette repaint of an idle pane, invalid edit), schema tests; RV5, RV7 fixed | — |
 | M5 cross-platform | deferred (Linux only for now; partial) | Linux X11/Wayland verified; Windows: build + headless tests green in CI; macOS: build, unit, platform-neutral and PTY tests green in CI (first full green run `80047545`) | `cwd_is_honored` failed once on macOS (suspected flaky; panic messages now reach CI annotations); macOS/Windows interactive use untested; no macOS/Windows packaging |
-| M6 autocomplete | partial (prototype plan steps 1-5 done) | `tests/shell_input.rs`, `tests/suggest.rs`, PTY test; e2e `zshell` (buffer follows typing, completion, kill/yank, history recall), `suggest` (ghost text, Right runs exactly the suggestion, path completion, history saved on SIGTERM); password-input check (`password_input_follows_the_child_line_discipline`, `pty_zsh_editing_is_not_password_input`); docs/performance/2026-10-16-suggestions.md | IME case unverified with a real input method; zsh only (bash needs ble.sh, fish not enabled) |
+| M6 autocomplete | accepted | `tests/shell_input.rs`, `tests/suggest.rs`, PTY test; e2e `zshell` (buffer follows typing, completion, kill/yank, history recall), `suggest` (ghost text, Right runs exactly the suggestion, path completion, history saved on SIGTERM); `ime` (real ibus over XIM: preedit drawn, ghost text hidden while composing, commit reaches the shell once); password-input check (`password_input_follows_the_child_line_discipline`, `pty_zsh_editing_is_not_password_input`); docs/performance/2026-10-16-suggestions.md | zsh only, by design (ADR-013): fish and bash with ble.sh draw their own autosuggestions, plain bash cannot report its editor buffer |
 
 Real applications exercised end to end: vim (insert, Escape, `:wq`), tmux
 (status line and pane), htop (colors and meters).

@@ -734,6 +734,67 @@ RC
     pass suggest
 }
 
+# IME with a real input method (ibus over XIM, the simple engine's
+# Ctrl+Shift+U hex entry): the preedit is drawn and hides the inline
+# suggestion while composing, and the commit reaches the shell once.
+scenario_ime() {
+    have ibus-daemon ime || return
+    have dbus-daemon ime || return
+    have zsh ime || return
+    local dir="$OUT/ime"; rm -rf "$dir"; mkdir -p "$dir/zdot" "$dir/ibus"
+    cat >"$dir/zdot/.zshrc" <<RC
+PROMPT='%% '
+bindkey -e
+source "$ROOT/shell/nora-zsh.zsh"
+RC
+    # A private session bus and ibus with an isolated configuration; the
+    # abstract socket avoids the 108-byte limit on socket paths.
+    local bus_info bus_pid ibus_pid
+    bus_info=$(dbus-daemon --session --fork --print-address=1 --print-pid=1)
+    bus_pid=$(echo "$bus_info" | sed -n 2p)
+    export DBUS_SESSION_BUS_ADDRESS=$(echo "$bus_info" | sed -n 1p)
+    HOME="$dir/ibus" XDG_CONFIG_HOME="$dir/ibus/.config" XDG_CACHE_HOME="$dir/ibus/.cache" \
+        ibus-daemon --xim --panel=disable --replace \
+        --address="unix:abstract=nora-e2e-ibus-$$" >"$dir/ibus.log" 2>&1 &
+    ibus_pid=$!
+    local engine=""
+    for _ in $(seq 1 50); do
+        engine=$(HOME="$dir/ibus" XDG_CONFIG_HOME="$dir/ibus/.config" \
+            ibus engine xkb:us::eng 2>/dev/null && echo set) && break
+        sleep 0.1
+    done
+    stop_ime() { kill "$ibus_pid" "$bus_pid" 2>/dev/null; unset DBUS_SESSION_BUS_ADDRESS; }
+    [ "$engine" = set ] || { stop_ime; fail ime "ibus did not start"; return; }
+    XMODIFIERS=@im=ibus ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch ime zsh -d -i \
+        || { stop_ime; fail ime "no window"; return; }
+    for _ in $(seq 1 100); do
+        grep -q '^shell: buffer "" cursor 0' "$OUT/ime/nora.log" && break
+        sleep 0.1
+    done
+    xdotool type --delay 30 "echo ime-beta-1 >> $dir/out.txt"; xdotool key Return; sleep 0.5
+    shot "$dir/plain.png"
+    xdotool type --delay 30 "echo ime"; sleep 0.7
+    shot "$dir/ghost.png"
+    xdotool key ctrl+shift+u; xdotool type --delay 50 "00e9"; sleep 0.5
+    shot "$dir/preedit.png"
+    xdotool key space; sleep 0.3
+    xdotool type --delay 30 " >> $dir/out.txt"; xdotool key Return
+    for _ in $(seq 1 30); do [ "$(wc -l <"$dir/out.txt" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
+    finish
+    stop_ime
+    local plain ghost preedit
+    plain=$(count_color "$dir/plain.png" '#666666')
+    ghost=$(count_color "$dir/ghost.png" '#666666')
+    preedit=$(count_color "$dir/preedit.png" '#666666')
+    echo "  ghost px: before $plain, suggested $ghost, composing $preedit; out: $(tr '\n' '|' <"$dir/out.txt")"
+    grep -q 'IME: preedit = "u00e9"' "$OUT/ime/nora.log" || { fail ime "no preedit from ibus"; return; }
+    [ "$ghost" -gt $((plain + 50)) ] || { fail ime "no ghost text before composing"; return; }
+    [ "$preedit" -le $((plain + 50)) ] || { fail ime "ghost text drawn while composing"; return; }
+    [ "$(cat "$dir/out.txt")" = "$(printf 'ime-beta-1\nimeé')" ] \
+        || { fail ime "committed text differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
+    pass ime
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -773,7 +834,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell suggest vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell suggest ime vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

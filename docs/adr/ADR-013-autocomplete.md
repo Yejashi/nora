@@ -78,8 +78,10 @@ Option 4, with these parts:
   6973 stays.
 - **Shells.** zsh: `zle-line-pre-redraw` and `zle-line-finish` via
   `add-zle-hook-widget`. fish: not enabled by default (fish already
-  autosuggests; showing two would conflict). bash: only with ble.sh hooks;
-  plain bash gets no inline suggestions (documented limitation).
+  autosuggests; showing two would conflict). bash: not enabled; plain bash
+  has no hook that reports its editor buffer, and ble.sh, which could,
+  draws its own auto-complete (the same conflict as fish). Documented
+  limitation (decided 2026-10-17).
 - **Model, local only.** Candidates from (a) the user's executed command
   lines reported by `OSC 133;C;cmdline=`, scored by frecency per working
   directory (OSC 7) and by exit status (OSC 133 D; failures demoted);
@@ -104,8 +106,8 @@ Option 4, with these parts:
 
 ## Consequences
 
-- Works where the shell can report its buffer (zsh today; bash with
-  ble.sh). This is a deliberate trade: correctness over coverage.
+- Works where the shell can report its buffer and has no suggestions of
+  its own: zsh. This is a deliberate trade: correctness over coverage.
 - The shell integration grows a per-keystroke hook; its cost (one OSC
   write per redraw) is measured before enabling it by default.
 - New state and storage: a history file under the user's state directory,

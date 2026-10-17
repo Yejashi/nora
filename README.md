@@ -273,14 +273,17 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
 
 - **macOS and Windows are previews.** They build and pass their automated
   tests, but no one has used the window on them yet, and there are no
-  installers. See [docs/15-platforms.md](docs/15-platforms.md).
+  installers; work on them is deferred. See
+  [docs/15-platforms.md](docs/15-platforms.md).
 - **Not supported yet:**
   - the kitty keyboard protocol (programs get legacy xterm key encodings);
   - drawing images from the kitty graphics protocol (it is parsed, not
     displayed);
   - font ligatures.
-- **Input methods.** Composition (fcitx5, ibus) is implemented but has
-  not been checked with a real input method.
+- **Input methods.** Composition is checked end to end with ibus over
+  X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
+  Wayland text-input path and the placement of a candidate window have
+  not been checked by a test.
 - **Wayland clipboard.** The clipboard goes through XWayland, so it
   needs XWayland running.
 - **Suggestions** need zsh with the integration script.
