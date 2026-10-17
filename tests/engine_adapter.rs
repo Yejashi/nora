@@ -401,3 +401,40 @@ fn reply_flood_stays_bounded() {
     assert_eq!(replies.len(), 256);
     assert_eq!(replies.last().map(String::as_str), Some("\x1b[1;1R"));
 }
+
+/// The snapshot geometry matches the grid the cells come from, even for
+/// the narrowest and shortest panes (an empty axis is clamped to 1, as the
+/// grid cannot hold one).
+#[test]
+fn tiny_resize_keeps_snapshot_consistent() {
+    use alacritty_terminal::grid::Dimensions;
+    for (rows, cols) in [(24, 1), (1, 1), (1, 80), (24, 2), (0, 5), (5, 0)] {
+        let mut engine = Engine::new(24, 80);
+        engine.feed(b"abcdef");
+        engine.resize(rows, cols);
+        let snap = engine.snapshot();
+        let (grid_rows, grid_cols) = {
+            let term = engine.term_handle();
+            let term = term.lock();
+            (term.grid().screen_lines(), term.grid().columns())
+        };
+        assert_eq!(
+            (snap.rows, snap.cols),
+            (grid_rows, grid_cols),
+            "{rows}x{cols}"
+        );
+        assert_eq!((engine.rows(), engine.cols()), (snap.rows, snap.cols));
+        assert_eq!(snap.cells.len(), snap.rows * snap.cols, "{rows}x{cols}");
+        assert_eq!(snap.selected.len(), snap.cells.len());
+        for (i, cell) in snap.cells.iter().enumerate() {
+            assert_eq!((cell.row, cell.col), (i / snap.cols, i % snap.cols));
+        }
+    }
+}
+
+#[test]
+fn empty_geometry_at_creation_is_clamped() {
+    let mut engine = Engine::new(0, 0);
+    let snap = engine.snapshot();
+    assert_eq!((snap.rows, snap.cols, snap.cells.len()), (1, 1, 1));
+}

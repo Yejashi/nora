@@ -552,6 +552,7 @@ impl Engine {
             kitty_keyboard: true,
             ..Default::default()
         };
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let size = Size { rows, cols };
         let recorder = Recorder::default();
         let term = Arc::new(FairMutex::new(Term::new(config, &size, recorder.clone())));
@@ -603,8 +604,11 @@ impl Engine {
     /// Resize the viewport to `rows` × `cols`.
     ///
     /// The pinned `Term::resize` marks the terminal fully damaged, so the
-    /// next [`Engine::snapshot`] reports [`Damage::Full`].
+    /// next [`Engine::snapshot`] reports [`Damage::Full`]. Each axis is at
+    /// least 1 (the pinned grid panics on an empty axis), and the stored
+    /// geometry is the grid's, so snapshots stay consistent.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let size = Size { rows, cols };
         let mut term = self.term.lock();
         term.resize(size);
