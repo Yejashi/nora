@@ -65,9 +65,17 @@ Option 4, with these parts:
   change: `OSC 6973 ; buffer ; <cursor> ; <base64 UTF-8 buffer> ST`, plus
   `OSC 6973 ; end ST` when the editor finishes (accept or abort). nora
   shows suggestions only while the last OSC 133 marker is B (input) and a
-  buffer report is current. (6973 is unassigned in the xterm OSC list;
-  final number to be checked against the kitty/iTerm2/WezTerm registries
-  before release.)
+  buffer report is current. **Number checked 2026-10-17:** no shared
+  registry exists (terminal-wg issue 10 asks for one), so the parsers
+  were read directly. 6973 is not used by xterm (ctlseqs), kitty
+  (`vt-parser.c` `dispatch_osc`, `control-codes.h`), Ghostty
+  (`src/terminal/osc.zig`), foot (`osc.c`), VTE (`parser-osc.hh`),
+  WezTerm (escape-sequence docs), mintty (CtrlSeqs wiki) or Konsole
+  (`Vt102Emulation.cpp`, `Session.h`). Numbers above 1000 in use there:
+  1337, 3008, 5113, 5522, 7501, 77xx (mintty/kitty), 8900, 9001,
+  30001, 30101, 77119. foot and Ghostty were checked to drop an unknown
+  number (their unhandled branch); the others were not checked for it.
+  6973 stays.
 - **Shells.** zsh: `zle-line-pre-redraw` and `zle-line-finish` via
   `add-zle-hook-widget`. fish: not enabled by default (fish already
   autosuggests; showing two would conflict). bash: only with ble.sh hooks;
