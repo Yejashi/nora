@@ -76,11 +76,16 @@ __nora_precmd() {
 }
 
 __nora_preexec() {
+    # A command HISTORY_IGNORE keeps out of the history file is not
+    # reported either, so nora does not record it. The match runs before
+    # `emulate`, under the user's options, as zsh's own match does when it
+    # writes the history file (`(#i)*secret*` needs the user's
+    # EXTENDED_GLOB).
+    local -i __nora_ignored=0
+    [[ -n ${HISTORY_IGNORE-} && $1 == ${~HISTORY_IGNORE} ]] && __nora_ignored=1
     emulate -L zsh
     typeset -g __nora_running=1
-    # A command HISTORY_IGNORE keeps out of the history file is not
-    # reported either, so nora does not record it.
-    if [[ -n ${HISTORY_IGNORE-} && $1 == ${~HISTORY_IGNORE} ]]; then
+    if (( __nora_ignored )); then
         __nora_osc "133;C"
         return
     fi

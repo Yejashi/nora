@@ -34,6 +34,10 @@ fn bash() -> Option<String> {
     ])
 }
 
+fn zsh() -> Option<String> {
+    find_shell(&["/usr/bin/zsh", "/bin/zsh", "/run/current-system/sw/bin/zsh"])
+}
+
 fn script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("shell")
@@ -111,6 +115,21 @@ impl Shell {
         )
     }
 
+    /// Interactive zsh with `rc` as its `.zshrc` (`-d`: no global rc
+    /// files), in `dir`.
+    fn zsh(program: String, dir: &Scratch, rc: &str) -> Self {
+        std::fs::write(dir.path(".zshrc"), rc).expect("write the zshrc");
+        Shell::spawn(
+            program,
+            vec!["-d".to_string(), "-i".to_string()],
+            &dir.0,
+            vec![
+                ("ZDOTDIR".to_string(), dir.0.to_string_lossy().into_owned()),
+                ("HISTFILE".to_string(), "/dev/null".to_string()),
+            ],
+        )
+    }
+
     fn grid(&mut self) -> String {
         let snap = self.session.engine().snapshot();
         let cols = snap.cols.max(1);
@@ -178,8 +197,19 @@ impl Shell {
             .iter()
             .map(|marker| (marker.event.kind, marker.line))
             .collect();
+        let executed = self
+            .session
+            .engine()
+            .take_executed()
+            .into_iter()
+            .map(|command| command.cmdline)
+            .collect();
         self.session.close();
-        Transcript { markers, grid }
+        Transcript {
+            markers,
+            executed,
+            grid,
+        }
     }
 }
 
@@ -188,6 +218,8 @@ struct Transcript {
     /// The OSC 133 markers with the grid line each arrived on (the tests
     /// stay within one screen, so lines are comparable).
     markers: Vec<(MarkerKind, i32)>,
+    /// The command lines the shell reported (`133;C;cmdline_url=`).
+    executed: Vec<String>,
     /// The final screen.
     grid: String,
 }
@@ -396,5 +428,38 @@ fn bash_command_end_carries_status_and_skips_empty_lines() {
     assert_eq!(
         out.kinds(),
         vec![A, B, C, D, A, A, A, B, C, D, A, B, C, D, A, B, C]
+    );
+}
+
+/// zsh: HISTORY_IGNORE is matched with the user's options, so a pattern
+/// that needs the user's EXTENDED_GLOB (`(#i)`) keeps a command
+/// unreported, as it keeps it out of the history file.
+#[test]
+fn zsh_history_ignore_uses_the_users_extended_glob() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("zsh-histignore-extglob");
+    let rc = format!(
+        "PS1='$ '\nsetopt extendedglob\nHISTORY_IGNORE='(#i)*secret*'\nsource {}\n",
+        script("nora-zsh.zsh").display()
+    );
+    let mut shell = Shell::zsh(zsh, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    shell.run("echo MY-SECRET-$((1 + 1))", "MY-SECRET-2");
+    shell.run("echo kept-$((1 + 1))", "kept-2");
+    let out = shell.exit();
+    assert!(
+        out.executed
+            .iter()
+            .any(|line| line.starts_with("echo kept")),
+        "a normal command is reported; got {:?}",
+        out.executed
+    );
+    assert!(
+        !out.executed.iter().any(|line| line.contains("SECRET")),
+        "an ignored command is not reported; got {:?}",
+        out.executed
     );
 }
