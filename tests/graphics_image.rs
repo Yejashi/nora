@@ -463,7 +463,7 @@ fn shared_memory_media() {
     std::fs::write(&file, rgba(2, 1)).unwrap();
     let before = g.image_count();
     let out = g.handle(
-        &cmd("a=T,t=s,f=32,s=2,v=1,C=1,q=2,m=1", name[1..].as_bytes()),
+        &cmd("a=T,t=s,f=32,s=2,v=1,C=1,q=2,m=1", &name.as_bytes()[1..]),
         &at(0, 0),
     );
     assert!(reply(&out).is_none(), "q=2");
