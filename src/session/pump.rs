@@ -148,6 +148,10 @@ pub enum AppEvent {
     /// The background font loader finished the full font system (sent by
     /// the window's own loader thread, not the pump).
     FontsReady,
+    /// The clipboard text read for a paste into `pane` (sent by the
+    /// window's short-lived clipboard reader thread, not the pump): `None`
+    /// when the clipboard was unavailable, empty or over the paste cap.
+    ClipboardText { pane: PaneKey, text: Option<String> },
     /// A termination signal arrived (SIGTERM, SIGHUP, SIGINT): close the
     /// window as if asked to (sent by the signal thread, not the pump).
     Terminate,

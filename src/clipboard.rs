@@ -6,9 +6,9 @@
 //!
 //! `arboard::Clipboard`'s methods take `&mut self`, so the backend wraps
 //! one instance in a [`Mutex`] to expose the shared (`&self`)
-//! [`ClipboardBackend`] interface. `arboard` opens the native clipboard
-//! only for the duration of each transfer and closes it immediately, so
-//! the lock is held briefly.
+//! [`ClipboardBackend`] interface for copies, which are brief. A read
+//! (paste) can wait on the selection owner, so it opens its own handle
+//! instead of holding that lock; the window runs it on a worker thread.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,8 @@ impl std::error::Error for ClipboardError {}
 ///
 /// `Send + Sync` so an `Arc` can cross the UI/worker boundary.
 /// `set_text` is bounded and non-blocking (the backend serves text lazily).
-/// `get_text` is bounded but may block briefly while the backend fetches data.
+/// `get_text` may block while the selection owner sends its data (a slow
+/// or stuck owner, a large clipboard): call it off the UI thread.
 pub trait ClipboardBackend: Send + Sync {
     /// Place `text` on the clipboard, replacing any previous contents.
     fn set_text(&self, text: &str) -> Result<(), ClipboardError>;
@@ -66,10 +67,11 @@ impl ClipboardBackend for ArboardBackend {
     }
 
     fn get_text(&self) -> Result<String, ClipboardError> {
-        let mut cb = self
-            .inner
-            .lock()
-            .expect("clipboard mutex is never poisoned");
+        // A read can wait on the selection owner: it uses its own handle
+        // (arboard shares one native connection per process), so it never
+        // holds the lock a copy on the UI thread needs.
+        let mut cb =
+            arboard::Clipboard::new().map_err(|err| ClipboardError::Connect(err.to_string()))?;
         cb.get_text()
             .map_err(|err| ClipboardError::Get(err.to_string()))
     }

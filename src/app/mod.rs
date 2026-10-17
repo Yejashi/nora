@@ -633,6 +633,9 @@ struct WinApp {
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
+    /// A clipboard read for a paste is running on its thread (at most one;
+    /// cleared when its `AppEvent::ClipboardText` arrives).
+    paste_in_flight: bool,
     /// Current zoom level (N19b): 1.0 = 100%; scales the shaping font
     /// size passed to `draw_frame`.
     zoom: f32,
@@ -762,6 +765,7 @@ pub fn run_windowed(
         pressed_buttons: Vec::new(),
         mouse_grab: None,
         clipboard: create_clipboard(),
+        paste_in_flight: false,
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_config(config),
         bindings: Bindings::with_config(&config.binding_entries()),
@@ -1414,38 +1418,61 @@ impl WinApp {
     }
 
     /// Paste the clipboard into the active pane (bracketed when the
-    /// application enabled DECSET 2004). The pump validates and streams
-    /// the text in order, bounded by the writer's app cap.
+    /// application enabled DECSET 2004), through [`WinApp::paste_text`].
+    ///
+    /// The clipboard is read on a short-lived thread: a slow or stuck
+    /// selection owner must not freeze the window, and text over the paste
+    /// cap is dropped there instead of being carried to the pump. One read
+    /// is in flight at a time; the text arrives as
+    /// [`AppEvent::ClipboardText`] for the pane active at the request.
     fn paste_clipboard(&mut self) {
-        let text = self.clipboard.as_ref().and_then(|cb| cb.get_text().ok());
-        let Some(text) = text else {
+        let (Some(clipboard), Some(pane)) = (self.clipboard.clone(), self.active_pane_key()) else {
             if debug_enabled() {
-                eprintln!("debug: paste: clipboard unavailable or empty");
+                eprintln!("debug: paste: clipboard unavailable");
             }
             return;
         };
+        if self.paste_in_flight {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nora-paste".to_string())
+            .spawn(move || {
+                let text = clipboard.get_text().ok().filter(|text| pasteable(text));
+                let _ = proxy.send_event(AppEvent::ClipboardText { pane, text });
+            });
+        self.paste_in_flight = spawned.is_ok();
+    }
+
+    /// Deliver clipboard text read for a paste into `pane` (bracketed when
+    /// its application enabled DECSET 2004). The pump validates and
+    /// streams the text in order, bounded by the writer's app cap.
+    fn paste_text(&mut self, pane: PaneKey, text: String) {
+        if !self.pane_is_live(&pane) {
+            return;
+        }
         // While searching, a paste is query text, never shell input
         // (audit RV8).
-        if self.search.visible {
-            if self.search.state.push_text(&text)
-                && let Some(pane) = self.active_pane_key()
-            {
+        if self.search.visible && self.active_pane_key() == Some(pane) {
+            if self.search.state.push_text(&text) {
                 let query = self.search.state.query.clone();
                 let _ = self
                     .pump_commands
                     .send(PumpMsg::SearchQuery { pane, query });
             }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
             return;
         }
-        let bracketed = self.modes.contains(TermMode::BRACKETED_PASTE);
-        if let Some(pane) = self.active_pane_key() {
-            self.suggestions.remove(&pane);
-            let _ = self.pump_commands.send(PumpMsg::Paste {
-                pane,
-                text,
-                bracketed,
-            });
-        }
+        let bracketed = self.modes_of(pane).contains(TermMode::BRACKETED_PASTE);
+        self.suggestions.remove(&pane);
+        let _ = self.pump_commands.send(PumpMsg::Paste {
+            pane,
+            text,
+            bracketed,
+        });
     }
 
     /// Live panes across all tabs.
@@ -1663,6 +1690,16 @@ impl WinApp {
             }
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged | AppEvent::Terminate => {}
+            AppEvent::ClipboardText { pane, text } => {
+                self.paste_in_flight = false;
+                match text {
+                    Some(text) => self.paste_text(pane, text),
+                    None if debug_enabled() => {
+                        eprintln!("debug: paste: clipboard unavailable, empty or too large");
+                    }
+                    None => {}
+                }
+            }
             AppEvent::Suggestion { pane, suffix, seq } => {
                 // Computed before the pane's latest input reached the
                 // shell: it answers an older buffer ("git s" -> "tatus"
@@ -2940,6 +2977,20 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 }
 
+/// Whether clipboard text read for a paste is worth sending to the pump:
+/// not empty and within the paste cap (normalizing newlines never grows
+/// it; the pump checks the exact size with bracket markers).
+fn pasteable(text: &str) -> bool {
+    let max = nora::input::paste::MAX_PASTE_SIZE;
+    if text.len() > max && debug_enabled() {
+        eprintln!(
+            "debug: paste rejected: {} byte(s) exceeds max {max}",
+            text.len()
+        );
+    }
+    !text.is_empty() && text.len() <= max
+}
+
 /// Whether a suggestion tagged `seq` (the last input the pump had fed to
 /// the pane's PTY when it read the buffer) answers the pane's latest input
 /// (`last_sent`; `None` = the window never sent the pane input).
@@ -2965,6 +3016,15 @@ mod suggestion_tests {
         assert_eq!(super::next_word(" --short"), " --short");
         assert_eq!(super::next_word("  a b"), "  a");
         assert_eq!(super::next_word("x"), "x");
+    }
+
+    #[test]
+    fn oversized_or_empty_clipboard_text_is_not_pasted() {
+        let max = nora::input::paste::MAX_PASTE_SIZE;
+        assert!(super::pasteable("ls"));
+        assert!(super::pasteable(&"x".repeat(max)));
+        assert!(!super::pasteable(&"x".repeat(max + 1)));
+        assert!(!super::pasteable(""));
     }
 
     #[test]
