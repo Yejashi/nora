@@ -292,3 +292,51 @@ fn copy_joins_soft_wraps_keeps_marks_and_trims_line_ends() {
     engine.select((2, 0), (2, 3));
     assert_eq!(engine.copy_selection().as_deref(), Some("e\u{301}x  "));
 }
+
+/// Once every selected line has left the grid (cleared with its history,
+/// or scrolled past the scrollback limit), copy has nothing to copy: it
+/// returns `None`, so the clipboard is not overwritten with nothing.
+#[test]
+fn copy_is_none_once_the_selected_lines_left_the_grid() {
+    let mut engine = numbered(5, 6);
+    engine.select((1, 0), (1, 2));
+    assert_eq!(engine.copy_selection().as_deref(), Some("L03"));
+    // `clear`: the screen, then its history.
+    engine.feed(b"\x1b[2J\x1b[3J");
+    assert_eq!(engine.copy_selection(), None);
+
+    let mut engine = Engine::with_history(3, 20, 2);
+    for i in 0..3 {
+        engine.feed(format!("L{i:02}\r\n").as_bytes());
+    }
+    // Rows: L01 L02 (blank). Select L01, then push it past the history.
+    engine.select((0, 0), (0, 2));
+    assert_eq!(engine.copy_selection().as_deref(), Some("L01"));
+    for i in 3..10 {
+        engine.feed(format!("L{i:02}\r\n").as_bytes());
+    }
+    assert_eq!(engine.copy_selection(), None);
+}
+
+/// A selection belongs to the screen it was made on: on the other one
+/// (main or alternate) nothing is highlighted or copied, and it is back
+/// when its screen is.
+#[test]
+fn a_selection_is_absent_on_the_other_screen() {
+    let mut engine = numbered(5, 6);
+    engine.select((1, 0), (1, 2));
+    engine.feed(b"\x1b[?1049h\x1b[HALT");
+    assert_eq!(engine.copy_selection(), None);
+    assert!(engine.selection().is_none());
+    assert_eq!(selected_text(&mut engine), "");
+    engine.feed(b"\x1b[?1049l");
+    assert_eq!(engine.copy_selection().as_deref(), Some("L03"));
+    assert_eq!(selected_text(&mut engine), "L03");
+
+    engine.feed(b"\x1b[?1049h\x1b[HALT");
+    engine.select((0, 0), (0, 2));
+    assert_eq!(engine.copy_selection().as_deref(), Some("ALT"));
+    engine.feed(b"\x1b[?1049l");
+    assert_eq!(engine.copy_selection(), None);
+    assert_eq!(selected_text(&mut engine), "");
+}

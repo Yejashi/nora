@@ -393,9 +393,34 @@ struct AnchoredSelection {
     anchor: (i64, usize),
     lo: (i64, usize),
     hi: (i64, usize),
+    /// Whether it was made on the alternate screen. Line ids are per
+    /// screen, so on the other screen the selection is absent (no
+    /// highlight, nothing to copy) until that screen is shown again.
+    alt: bool,
+}
+
+/// Whether `term` shows its alternate screen.
+fn alt_screen<T>(term: &Term<T>) -> bool {
+    term.mode().contains(TermMode::ALT_SCREEN)
 }
 
 impl AnchoredSelection {
+    /// The selection from `start` to `end` (`(line id, col)`, either
+    /// order), started at `start`, on the screen `term` shows.
+    fn new<T>(term: &Term<T>, start: (i64, usize), end: (i64, usize)) -> Self {
+        Self {
+            anchor: start,
+            lo: start.min(end),
+            hi: start.max(end),
+            alt: alt_screen(term),
+        }
+    }
+
+    /// Whether the selection belongs to the screen `term` shows.
+    fn on_screen<T>(&self, term: &Term<T>) -> bool {
+        self.alt == alt_screen(term)
+    }
+
     /// Whether the cell at (`line_id`, `col`) lies in the range.
     fn contains(&self, line_id: i64, col: usize) -> bool {
         (line_id, col) >= self.lo && (line_id, col) <= self.hi
@@ -1304,12 +1329,7 @@ impl Engine {
             let term = self.term.lock();
             let grid = term.grid();
             let anchor = |(row, col): (usize, usize)| (row_line_id(grid, row), col);
-            let (a, b) = (anchor(start), anchor(end));
-            AnchoredSelection {
-                anchor: a,
-                lo: a.min(b),
-                hi: a.max(b),
-            }
+            AnchoredSelection::new(&term, anchor(start), anchor(end))
         };
         *self
             .selection
@@ -1355,6 +1375,9 @@ impl Engine {
             return None;
         }
         let term = self.term.lock();
+        if !sel.on_screen(&term) {
+            return None;
+        }
         let top = row_line_id(term.grid(), 0);
         let bottom = top + self.rows as i64 - 1;
         if sel.hi.0 < top || sel.lo.0 > bottom {
@@ -1376,7 +1399,9 @@ impl Engine {
     /// Copy the selected text (N14b).
     ///
     /// Returns the selected cells' characters joined row-major with `\n`
-    /// between rows, or `None` when there is no selection. Cells are read
+    /// between rows, or `None` when there is no selection, none of its
+    /// lines is still in the grid, or it was made on the other screen
+    /// (main or alternate) than the one shown. Cells are read
     /// from the same grid the snapshot renders (`Term::grid`), so the
     /// copied text always matches the on-screen selection.
     pub fn copy_selection(&self) -> Option<String> {
@@ -1385,12 +1410,19 @@ impl Engine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner))?;
         let term = self.term.lock();
+        if !sel.on_screen(&term) {
+            return None;
+        }
         let grid = term.grid();
         let shift = line_shift(grid);
         let cols = grid.columns();
         let topmost = grid.topmost_line().0 as i64;
         let bottommost = grid.bottommost_line().0 as i64;
         let mut out = String::new();
+        // Whether any selected line is still in the grid: when none is
+        // (cleared with its history, scrolled past the scrollback limit),
+        // there is nothing to copy and the clipboard is left alone.
+        let mut any = false;
         // A newline is due before the next copied row: the previous one
         // ended a line (not soft-wrapped into the next row).
         let mut newline = false;
@@ -1401,6 +1433,7 @@ impl Engine {
             if line < topmost || line > bottommost || cols == 0 {
                 continue;
             }
+            any = true;
             let first = if line_id == sel.lo.0 { sel.lo.1 } else { 0 };
             let last = if line_id == sel.hi.0 {
                 sel.hi.1.min(cols - 1)
@@ -1440,7 +1473,7 @@ impl Engine {
             }
             newline = !wrapped;
         }
-        Some(out)
+        any.then_some(out)
     }
 
     /// Take one owned snapshot of the screen, consuming one damage report.
@@ -1502,7 +1535,7 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let mut selected = vec![false; self.rows * self.cols];
-            if let Some(sel) = sel.as_ref() {
+            if let Some(sel) = sel.as_ref().filter(|sel| sel.on_screen(&term)) {
                 let top = row_line_id(term.grid(), 0);
                 for (row, cells) in selected.chunks_mut(self.cols.max(1)).enumerate() {
                     let line_id = top + row as i64;
