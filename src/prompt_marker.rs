@@ -599,6 +599,9 @@ impl PromptMarkerFilter {
                         // before the ESC it has the same effect, so forward
                         // it and keep holding the ESC.
                         out.push(byte);
+                    } else if byte >= 0x7F {
+                        // vte ignores DEL and 8-bit bytes inside an escape
+                        // and stays in it: drop the byte, keep the ESC.
                     } else {
                         // Not an OSC: forward the held ESC and this byte.
                         out.push(0x1B);

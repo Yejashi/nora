@@ -50,6 +50,11 @@ fn a_c0_control_after_esc_still_starts_an_osc() {
     let (out, events) = filter.process(b"\x1b\x18]133;A\x07");
     assert!(events.is_empty(), "CAN ends the escape");
     assert_eq!(out, b"\x1b\x18]133;A\x07");
+    // vte ignores DEL and 8-bit bytes inside an escape: still an OSC.
+    let mut filter = PromptMarkerFilter::new();
+    let (out, events) = filter.process(b"\x1b\x7f\xc3]133;B\x07y");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(out, b"y");
 }
 
 /// The parser agrees: an image survives `ESC [ CAN 2 J` and is removed by
