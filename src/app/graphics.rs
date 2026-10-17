@@ -138,6 +138,20 @@ pub struct CellFill {
     pub color: [u8; 4],
 }
 
+/// The glyphon atlas for `format` and the text renderer bound to it. Used at
+/// startup and again whenever the font system is replaced, so both paths
+/// build the same pipeline.
+fn text_pipeline(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &Cache,
+    format: TextureFormat,
+) -> (TextAtlas, TextRenderer) {
+    let mut atlas = TextAtlas::new(device, queue, cache, format);
+    let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+    (atlas, renderer)
+}
+
 /// One vertex for the fill/decoration pass: position in normalized device
 /// coordinates (location 0, offset 0), two padding floats, and the resolved
 /// sRGB-space RGBA (location 1, offset 16), in a 32-byte stride.
@@ -409,8 +423,8 @@ pub struct Graphics {
     /// Tracked so a zero-sized `set_size` never reconfigures the swapchain.
     configured_size: Option<PhysicalSize<u32>>,
     format: Option<wgpu::TextureFormat>,
-    /// Kept alive for the atlas and viewport (N02 pattern).
-    #[allow(dead_code)]
+    /// Kept alive for the atlas and viewport (N02 pattern), and reused when
+    /// the atlas is rebuilt for a new font system.
     cache: Cache,
     atlas: TextAtlas,
     swash: SwashCache,
@@ -482,10 +496,9 @@ impl Graphics {
 
         // The N02 offscreen pattern (tests/text_render.rs), live.
         let cache = Cache::new(&device);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        let (atlas, renderer) = text_pipeline(&device, &queue, &cache, format);
         let swash = SwashCache::new();
         let viewport = Viewport::new(&device, &cache);
-        let renderer = TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let deco_pipeline = decoration_pipeline(&device, format);
         let image_renderer = super::images::ImageRenderer::new(&device, format);
 
@@ -995,10 +1008,21 @@ impl Graphics {
         self.selection_bg = color;
     }
 
-    /// Drop every shaped cell: required when the font system is replaced
-    /// (font ids change).
+    /// Drop every shaped cell and every rasterized glyph: required when the
+    /// font system is replaced. Each new fontdb database hands out the same
+    /// font ids again (the monospace face is always the first), so the
+    /// glyphon atlas and the swash image cache, both keyed by
+    /// `CacheKey { font_id, glyph_id, .. }`, would otherwise keep drawing
+    /// the old font's bitmaps. The atlas is recreated with the same format
+    /// (and so the same color mode), and the renderer bound to it.
     pub fn clear_glyph_cache(&mut self) {
         self.glyph_cache = GlyphCache::new();
+        if let Some(format) = self.format {
+            let (atlas, renderer) = text_pipeline(&self.device, &self.queue, &self.cache, format);
+            self.atlas = atlas;
+            self.renderer = renderer;
+        }
+        self.swash = SwashCache::new();
     }
 
     /// Finish, submit and present an acquired [`Frame`] (pinned wgpu 30
