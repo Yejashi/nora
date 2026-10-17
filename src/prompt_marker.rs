@@ -20,7 +20,7 @@
 //! store of detected markers with 1-based IDs and byte-cost accounting
 //! (mirroring [`crate::graphics_image::ImageStore`]).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 /// An OSC 133 prompt-marker kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +135,10 @@ pub struct MarkerAtLine {
 }
 
 impl MarkerAtLine {
-    /// The byte cost of this entry (for queue/store bounding).
+    /// The byte cost of this entry (for queue/store bounding): its size,
+    /// as it owns no heap data.
     pub fn byte_cost(&self) -> usize {
-        self.event.byte_cost()
+        std::mem::size_of::<Self>()
     }
 
     /// The marker's current grid line, given the grid's `total_scrolled`
@@ -322,9 +323,10 @@ pub struct HyperlinkAtLine {
 }
 
 impl HyperlinkAtLine {
-    /// The byte cost of this entry (for queue/store bounding).
+    /// The byte cost of this entry (for queue/store bounding): the entry
+    /// itself plus the URI's heap allocation.
     pub fn byte_cost(&self) -> usize {
-        self.uri.len()
+        std::mem::size_of::<Self>() + self.uri.capacity()
     }
 
     /// The hyperlink's current grid line, given the grid's `total_scrolled`
@@ -419,7 +421,7 @@ impl HyperlinkQueue {
 /// A bounded store of detected hyperlinks (mirrors [`MarkerStore`]).
 #[derive(Debug)]
 pub struct HyperlinkStore {
-    links: HashMap<usize, HyperlinkAtLine>,
+    links: BTreeMap<usize, HyperlinkAtLine>,
     total_bytes: usize,
     next_id: usize,
 }
@@ -434,17 +436,23 @@ impl HyperlinkStore {
     /// Create an empty store (1-based auto-assigned IDs).
     pub fn new() -> Self {
         Self {
-            links: HashMap::new(),
+            links: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
         }
     }
 
-    /// Store a hyperlink, auto-assigning the next 1-based ID. Returns the
-    /// ID on success, or `None` when the [`MAX_MARKERS`] cap is exceeded.
+    /// Store a hyperlink, auto-assigning the next 1-based ID. At the
+    /// [`MAX_MARKERS`] cap the oldest hyperlink is evicted first (the
+    /// newest output is where links are clicked).
+    ///
+    /// Returns the new hyperlink's ID (always `Some`; the `Option` is
+    /// kept for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: HyperlinkAtLine) -> Option<usize> {
-        if self.links.len() >= MAX_MARKERS {
-            return None;
+        if self.links.len() >= MAX_MARKERS
+            && let Some((_, oldest)) = self.links.pop_first()
+        {
+            self.total_bytes -= oldest.byte_cost();
         }
         let id = self.next_id;
         self.next_id += 1;

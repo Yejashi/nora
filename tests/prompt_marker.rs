@@ -524,8 +524,8 @@ fn filter_hyperlink_file_uri() {
 #[test]
 fn queue_oversize_evicts_oldest() {
     let mut queue = MarkerQueue::new();
-    // Each event costs 1 byte; push more than the 1 MiB cap.
-    let n = 1024 * 1024 + 10;
+    // Push more than fits in the 1 MiB cap.
+    let n = 1024 * 1024 / entry(MarkerKind::A).byte_cost() + 10;
     let mut last_kind = MarkerKind::A;
     for i in 0..n {
         last_kind = match i % 4 {
@@ -571,7 +571,7 @@ fn queue_push_and_drain_order() {
     queue.push(entry(MarkerKind::B));
     queue.push(entry(MarkerKind::C));
     assert_eq!(queue.len(), 3);
-    assert_eq!(queue.total_bytes(), 3);
+    assert_eq!(queue.total_bytes(), 3 * entry(MarkerKind::A).byte_cost());
     let drained = queue.drain();
     assert_eq!(
         drained,
@@ -634,14 +634,15 @@ fn store_byte_accounted() {
     let mut store = MarkerStore::new();
     store.insert(entry(MarkerKind::A)).expect("insert");
     store.insert(entry(MarkerKind::B)).expect("insert");
+    let cost = entry(MarkerKind::A).byte_cost();
     assert_eq!(store.len(), 2);
-    assert_eq!(store.total_bytes(), 2);
+    assert_eq!(store.total_bytes(), 2 * cost);
     // Delete one; the byte cost is subtracted.
     let deleted = store.delete(1);
     assert!(deleted.is_some());
     assert_eq!(deleted.unwrap().event.kind, MarkerKind::A);
     assert_eq!(store.len(), 1);
-    assert_eq!(store.total_bytes(), 1);
+    assert_eq!(store.total_bytes(), cost);
     // Clear the rest.
     let n = store.clear();
     assert_eq!(n, 1);
@@ -657,7 +658,7 @@ fn store_delete_missing() {
     store.insert(entry(MarkerKind::A)).expect("insert");
     assert!(store.delete(99).is_none());
     assert_eq!(store.len(), 1);
-    assert_eq!(store.total_bytes(), 1);
+    assert_eq!(store.total_bytes(), entry(MarkerKind::A).byte_cost());
 }
 
 /// Query a nonexistent ID; verify it returns None.
@@ -788,4 +789,86 @@ fn engine_osc_ended_by_esc_does_not_hold_output() {
     let mut engine = nora::engine::Engine::new(4, 40);
     engine.feed(b"junk\x1b]0;t\x1b[2J\x1b[Hshown");
     assert_eq!(engine_row(&mut engine, 0), "shown");
+}
+
+// ---------------------------------------------------------------------------
+// Queue and store memory bounds
+// ---------------------------------------------------------------------------
+
+fn link(uri: &str) -> nora::prompt_marker::HyperlinkAtLine {
+    nora::prompt_marker::HyperlinkAtLine {
+        line: 0,
+        col: 0,
+        scrolled: 0,
+        pulled: 0,
+        uri: uri.to_string(),
+    }
+}
+
+/// A marker entry costs at least its own size, so the 1 MiB budget bounds
+/// the queue's real memory (it used to cost 1 byte, allowing ~1M entries).
+#[test]
+fn marker_queue_costs_entry_size() {
+    let cost = entry(MarkerKind::A).byte_cost();
+    assert!(cost >= std::mem::size_of::<MarkerAtLine>());
+    let mut queue = MarkerQueue::new();
+    for _ in 0..200_000 {
+        queue.push(entry(MarkerKind::A));
+    }
+    assert!(queue.total_bytes() <= 1024 * 1024);
+    assert!(queue.len() * std::mem::size_of::<MarkerAtLine>() <= 1024 * 1024);
+}
+
+/// A hyperlink entry costs its size plus the URI allocation, so a flood
+/// of short links stays within 1 MiB of real memory.
+#[test]
+fn hyperlink_queue_costs_entry_size_and_uri() {
+    let one = link("x");
+    assert!(one.byte_cost() > std::mem::size_of::<nora::prompt_marker::HyperlinkAtLine>());
+    let mut queue = nora::prompt_marker::HyperlinkQueue::new();
+    for _ in 0..200_000 {
+        queue.push(link("x"));
+    }
+    assert!(queue.total_bytes() <= 1024 * 1024);
+    assert!(queue.len() * one.byte_cost() <= 1024 * 1024);
+}
+
+/// The hyperlink store evicts the oldest link at the cap instead of
+/// refusing the newest.
+#[test]
+fn hyperlink_store_evicts_oldest_at_cap() {
+    let mut store = nora::prompt_marker::HyperlinkStore::new();
+    let cap = nora::prompt_marker::MAX_MARKERS;
+    for i in 0..cap {
+        store.insert(link(&format!("https://e/{i}")));
+    }
+    let bytes = store.total_bytes();
+    let newest = store.insert(link("https://e/new")).expect("insert at cap");
+    assert_eq!(store.len(), cap);
+    assert!(store.query(1).is_none(), "the oldest was evicted");
+    assert_eq!(
+        store.query(newest).map(|l| l.uri.as_str()),
+        Some("https://e/new")
+    );
+    assert!(store.total_bytes() <= bytes + link("https://e/new").byte_cost());
+}
+
+/// A stream of OSC 8 links through the engine keeps the undrained queue
+/// within its budget.
+#[test]
+fn engine_hyperlink_flood_is_bounded() {
+    let mut engine = nora::engine::Engine::new(4, 40);
+    let mut chunk = Vec::new();
+    for _ in 0..1000 {
+        chunk.extend_from_slice(b"\x1b]8;;https://e/x\x07l\x1b]8;;\x07");
+    }
+    for _ in 0..100 {
+        engine.feed(&chunk);
+    }
+    let handle = engine.hyperlink_handle();
+    let queue = handle.lock().unwrap();
+    assert!(queue.total_bytes() <= 1024 * 1024);
+    assert!(
+        queue.len() * std::mem::size_of::<nora::prompt_marker::HyperlinkAtLine>() <= 1024 * 1024
+    );
 }
