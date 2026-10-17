@@ -62,14 +62,16 @@ A conforming display needs, from the spec
 ## Scope
 
 In: actions `t`, `T`, `p`, `q`, `d`; formats 24/32/100; `o=z`; media `d`,
-`f` and `t` (regular files only, a uniform `EBADF` on any read failure,
-`/proc`, `/sys`, `/dev` refused, `t` deletes only files under a temp
-directory whose path contains `tty-graphics-protocol`); `i`, `I`, `p`;
+`f`, `t` and `s` (regular files only, a uniform `EBADF` on any read
+failure, `/proc`, `/sys` and `/dev` other than `/dev/shm` refused, `t`
+deletes only files under a temp directory whose path contains
+`tty-graphics-protocol`, `s` reads `/dev/shm/<name>` and unlinks it once it
+decoded); `i`, `I`, `p`;
 source rectangle `x,y,w,h`; `X,Y`; `c,r` (aspect kept when one is given);
 `C`; `z`; delete `a/A i/I n/N c/C p/P q/Q x/X y/Y z/Z r/R`; chunking.
 
-Out (documented, answered with an error where a reply is due): shared
-memory (`t=s`), animation (`a=f`, `a=a`, `a=c`), relative placements
+Out (documented, answered with an error where a reply is due):
+animation (`a=f`, `a=a`, `a=c`), relative placements
 (`P,Q,H,V`), Unicode placeholders (`U=1`).
 
 ## Consequences

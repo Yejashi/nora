@@ -78,11 +78,11 @@ fn quiet_modes_and_errors() {
     assert!(reply(&both).unwrap().contains(";EINVAL:"));
     let format = g.handle(&cmd("a=t,f=7,s=1,v=1,i=6", &rgba(1, 1)), &at(0, 0));
     assert!(reply(&format).unwrap().contains(";EINVAL:"));
-    let shm = g.handle(&cmd("a=t,t=s,s=1,v=1,i=8", b"/name"), &at(0, 0));
-    assert!(
-        reply(&shm).unwrap().contains(";EINVAL:"),
-        "shared memory is refused"
+    let shm = g.handle(
+        &cmd("a=t,t=s,s=1,v=1,i=8", b"/nora-no-such-object"),
+        &at(0, 0),
     );
+    assert!(reply(&shm).unwrap().contains(";EBADF:"), "a missing object");
 }
 
 #[test]
@@ -294,6 +294,17 @@ fn file_media() {
     std::fs::write(&file, b"short").unwrap();
     let out = g.handle(&cmd("a=t,t=f,s=2,v=2,i=3", path.as_bytes()), &at(0, 0));
     assert!(reply(&out).unwrap().contains(";EBADF:"));
+    // /dev/shm is a temporary directory clients use (kitten icat does).
+    if std::path::Path::new("/dev/shm").is_dir() {
+        let shm = format!("/dev/shm/nora-tty-graphics-protocol-{}", std::process::id());
+        std::fs::write(&shm, rgba(1, 1)).unwrap();
+        let out = g.handle(&cmd("a=q,t=t,s=1,v=1,i=9", shm.as_bytes()), &at(0, 0));
+        assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=9;OK\x1b\\"));
+        assert!(
+            !std::path::Path::new(&shm).exists(),
+            "removed after reading"
+        );
+    }
     // t=t removes only a protocol temp file.
     let temp = std::env::temp_dir().join(format!("tty-graphics-protocol-{}", std::process::id()));
     std::fs::write(&temp, rgba(1, 1)).unwrap();
@@ -313,4 +324,36 @@ fn file_media() {
     assert!(file.exists(), "not a protocol temp file: kept");
     let _ = std::fs::remove_file(&temp);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `t=s`: a POSIX shared-memory object (`/dev/shm` on Linux) is read and
+/// unlinked once it decoded; one that is not the image is left alone.
+#[test]
+fn shared_memory_media() {
+    if !std::path::Path::new("/dev/shm").is_dir() {
+        return;
+    }
+    let mut g = GraphicsState::new();
+    let name = format!("/nora-graphics-shm-{}", std::process::id());
+    let file = format!("/dev/shm{name}");
+    std::fs::write(&file, rgba(2, 1)).unwrap();
+    let out = g.handle(&cmd("a=t,t=s,s=2,v=1,i=1,S=8", name.as_bytes()), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=1;OK\x1b\\"));
+    assert!(
+        !std::path::Path::new(&file).exists(),
+        "unlinked after reading"
+    );
+    std::fs::write(&file, b"not an image").unwrap();
+    let out = g.handle(&cmd("a=t,t=s,f=100,i=2", name.as_bytes()), &at(0, 0));
+    assert!(reply(&out).unwrap().contains(";EBADF:"));
+    assert!(
+        std::path::Path::new(&file).exists(),
+        "kept when it is not the image"
+    );
+    let out = g.handle(&cmd("a=t,t=s,s=1,v=1,i=3", b"/a/b"), &at(0, 0));
+    assert!(
+        reply(&out).unwrap().contains(";EBADF:"),
+        "a name with a slash"
+    );
+    std::fs::remove_file(&file).unwrap();
 }

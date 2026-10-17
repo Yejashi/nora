@@ -607,14 +607,20 @@ impl GraphicsState {
 /// Read, decompress and decode a transmission to RGBA.
 fn decode(keys: &Keys) -> Result<(u32, u32, Vec<u8>), Failure> {
     let medium = keys.char("t", 'd');
-    let file_medium = matches!(medium, 'f' | 't');
+    let file_medium = matches!(medium, 'f' | 't' | 's');
     let raw = match medium {
         'd' => keys.0.data.clone(),
         'f' | 't' => read_file(keys, medium == 't')?,
-        's' => return Err(Failure("EINVAL", "Shared memory is not supported")),
+        's' => read_shared_memory(keys)?,
         _ => return Err(Failure("EINVAL", "Unknown transmission medium")),
     };
     let decoded = decode_bytes(keys, raw);
+    if medium == 's'
+        && decoded.is_ok()
+        && let Some(path) = shared_memory_path(keys)
+    {
+        let _ = std::fs::remove_file(path);
+    }
     // A file's contents must not be probed through the error: every
     // failure with a file medium is the same EBADF.
     if file_medium {
@@ -725,17 +731,51 @@ fn png_pixels(data: &[u8]) -> Result<(u32, u32, Vec<u8>), Failure> {
 
 /// Read a file named by the payload (`t=f`, or `t=t` which is removed
 /// afterwards when it is a temporary file of this protocol). Regular files
-/// only; `/proc`, `/sys` and `/dev` are refused. Every failure is EBADF.
+/// only; `/proc`, `/sys` and `/dev` (except `/dev/shm`, a temporary
+/// directory clients use for `t=t`) are refused. Every failure is EBADF.
 fn read_file(keys: &Keys, temporary: bool) -> Result<Vec<u8>, Failure> {
     let path = std::str::from_utf8(&keys.0.data).map_err(|_| EBADF)?;
     let path = std::fs::canonicalize(path).map_err(|_| EBADF)?;
-    if ["/proc", "/sys", "/dev"]
+    let sensitive = ["/proc", "/sys", "/dev"]
         .iter()
-        .any(|p| path.starts_with(p))
-    {
+        .any(|p| path.starts_with(p));
+    if sensitive && !path.starts_with("/dev/shm") {
         return Err(EBADF);
     }
-    let file = std::fs::File::open(&path).map_err(|_| EBADF)?;
+    let data = read_path(&path, keys)?;
+    if temporary && is_protocol_temp_file(&path) {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(data)
+}
+
+/// The file of a POSIX shared-memory object (`t=s`): on Linux the object
+/// `/name` is `/dev/shm/name`.
+fn shared_memory_path(keys: &Keys) -> Option<std::path::PathBuf> {
+    let name = std::str::from_utf8(&keys.0.data).ok()?;
+    let base = name.strip_prefix('/')?;
+    if base.is_empty() || base.contains('/') || base.contains('\0') {
+        return None;
+    }
+    Some(std::path::Path::new("/dev/shm").join(base))
+}
+
+/// Read a shared-memory object (`t=s`). Every failure is EBADF; the
+/// caller unlinks it once it decoded as the image, as the protocol asks
+/// (so naming an unrelated object never deletes it).
+fn read_shared_memory(keys: &Keys) -> Result<Vec<u8>, Failure> {
+    let path = shared_memory_path(keys).ok_or(EBADF)?;
+    let resolved = std::fs::canonicalize(&path).map_err(|_| EBADF)?;
+    if !resolved.starts_with("/dev/shm") {
+        return Err(EBADF);
+    }
+    read_path(&resolved, keys)
+}
+
+/// Read `S` bytes at offset `O` (all after it when `S` is 0) of a regular
+/// file.
+fn read_path(path: &std::path::Path, keys: &Keys) -> Result<Vec<u8>, Failure> {
+    let file = std::fs::File::open(path).map_err(|_| EBADF)?;
     let meta = file.metadata().map_err(|_| EBADF)?;
     if !meta.is_file() {
         return Err(EBADF);
@@ -755,9 +795,6 @@ fn read_file(keys: &Keys, temporary: bool) -> Result<Vec<u8>, Failure> {
         .take(size)
         .read_to_end(&mut data)
         .map_err(|_| EBADF)?;
-    if temporary && is_protocol_temp_file(&path) {
-        let _ = std::fs::remove_file(&path);
-    }
     Ok(data)
 }
 
