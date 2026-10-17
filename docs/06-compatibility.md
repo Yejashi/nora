@@ -350,10 +350,10 @@ Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless
 
 | Setting | Type | Default | Constraint |
 | --- | --- | --- | --- |
-| `terminal.history` | integer | `1000` | `0`..=`1000000` |
-| `terminal.mouse` | boolean | `false` | — |
+| `terminal.history` | integer | `10000` | `0`..=`1000000` |
+| `terminal.mouse` | — | — | rejected: not supported (mouse reporting is always available to applications that request it) |
 | `font.family` | string | `"monospace"` | — |
-| `font.size` | float | `12.0` | `> 0` and `<= 1000` |
+| `font.size` | float | `15.0` | `4.0`..=`200.0` points |
 | `theme.background` | string | `"#000000"` | `#RRGGBB` |
 | `theme.foreground` | string | `"#ffffff"` | `#RRGGBB` |
 | `theme.cursor` | string | `"#ffffff"` | `#RRGGBB` |

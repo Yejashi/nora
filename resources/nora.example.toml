@@ -23,7 +23,7 @@
 # italic faces of the family are used when installed; characters the font
 # lacks fall back to any installed font that has them.
 family = "monospace"
-# Points (0 < size <= 1000). 1 pt = 4/3 px at 96 DPI, scaled by the
+# Points (4 <= size <= 200). 1 pt = 4/3 px at 96 DPI, scaled by the
 # display scale factor. Ctrl+Shift+Plus/Minus/0 zoom from this size.
 size = 15.0
 

@@ -21,8 +21,11 @@ use std::path::PathBuf;
 
 /// Upper bound for `terminal.history` (lines).
 pub const MAX_HISTORY: usize = 1_000_000;
+/// Lower bound for `font.size` (points): smaller gives cells of a pixel or
+/// two and a grid of hundreds of thousands of cells.
+pub const MIN_FONT_SIZE: f32 = 4.0;
 /// Upper bound for `font.size` (points).
-pub const MAX_FONT_SIZE: f32 = 1000.0;
+pub const MAX_FONT_SIZE: f32 = 200.0;
 
 /// The complete nora configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,16 +183,18 @@ pub struct TerminalConfig {
     /// Scrollback lines (0 to [`MAX_HISTORY`]).
     #[serde(default = "default_history")]
     pub history: usize,
-    /// Whether to enable mouse support by default.
+    /// Not supported: parsed only so that [`NoraConfig::validate`] can say
+    /// so. Mouse reporting is always available to an application that
+    /// asks for it (DECSET 1000 and friends); there is no switch.
     #[serde(default)]
-    pub mouse: bool,
+    pub mouse: Option<bool>,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             history: default_history(),
-            mouse: false,
+            mouse: None,
         }
     }
 }
@@ -286,12 +291,12 @@ impl NoraConfig {
         self.scrolling.history.unwrap_or(self.terminal.history)
     }
 
-    /// Effective wheel lines per step.
     /// Whether inline suggestions are on (`[autocomplete] enabled`).
     pub fn autocomplete_enabled(&self) -> bool {
         self.autocomplete.enabled.unwrap_or(true)
     }
 
+    /// Effective wheel lines per step.
     pub fn scroll_multiplier(&self) -> u8 {
         self.scrolling.multiplier.unwrap_or(3)
     }
@@ -395,12 +400,20 @@ impl NoraConfig {
             ));
         }
 
+        if self.terminal.mouse.is_some() {
+            errors.push(
+                "terminal.mouse: not supported; mouse reporting is always available to \
+                 applications that request it (remove this key)"
+                    .to_string(),
+            );
+        }
+
         // Validate font size.
         // `!(a && b)` also rejects NaN, for which every comparison is false.
-        if !(self.font.size > 0.0 && self.font.size <= MAX_FONT_SIZE) {
+        if !(self.font.size >= MIN_FONT_SIZE && self.font.size <= MAX_FONT_SIZE) {
             errors.push(format!(
-                "font.size: {} must be greater than 0 and at most {}",
-                self.font.size, MAX_FONT_SIZE
+                "font.size: {} must be between {MIN_FONT_SIZE} and {MAX_FONT_SIZE} points",
+                self.font.size
             ));
         }
 
@@ -744,9 +757,6 @@ pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str,
     // Terminal settings.
     if old.terminal.history != new.terminal.history {
         changes.push(("terminal.history", ConfigChange::NewSession));
-    }
-    if old.terminal.mouse != new.terminal.mouse {
-        changes.push(("terminal.mouse", ConfigChange::Immediate));
     }
 
     // Scrolling and window size.

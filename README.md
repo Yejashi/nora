@@ -199,7 +199,7 @@ action = "split_right"
 
 | Section | Keys |
 | --- | --- |
-| `[font]` | `family` (any fontconfig family), `size` (points, default 15) |
+| `[font]` | `family` (any fontconfig family), `size` (points, 4 to 200, default 15) |
 | `[colors]` | `foreground`, `background`, `cursor`, `selection_background`; `[colors.normal]` and `[colors.bright]` for the 16 ANSI colors |
 | `[window]` | `columns`, `lines`: the initial size in cells |
 | `[cursor]` | `style`: `block`, `beam` or `underline` |

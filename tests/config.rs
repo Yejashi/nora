@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nora::config::{
-    ConfigChange, ConfigError, ConfigState, FontConfig, KeysConfig, NoraConfig, TerminalConfig,
-    ThemeConfig, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, classify_change, load_config,
-    load_config_with_candidates, parse_config,
+    ConfigChange, ConfigError, ConfigState, FontConfig, KeysConfig, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    NoraConfig, TerminalConfig, ThemeConfig, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, classify_change,
+    load_config, load_config_with_candidates, parse_config,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -56,7 +56,7 @@ fn write_config(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
 fn default_config() {
     let c = NoraConfig::default();
     assert_eq!(c.terminal.history, 10_000);
-    assert!(!c.terminal.mouse);
+    assert_eq!(c.terminal.mouse, None);
     assert_eq!(c.font.family, "monospace");
     assert_eq!(c.font.size, 15.0);
     assert_eq!(c.theme.background, "#000000");
@@ -73,7 +73,7 @@ fn validate_valid_config() {
     let c = NoraConfig {
         terminal: TerminalConfig {
             history: 5000,
-            mouse: true,
+            mouse: None,
         },
         font: FontConfig {
             family: "DejaVu Sans Mono".to_string(),
@@ -129,6 +129,44 @@ fn validate_invalid_font_size() {
         huge.validate().iter().any(|e| e.starts_with("font.size")),
         "expected a font.size error for 1000.1"
     );
+
+    // A tiny size gives cells of a pixel or two and a huge grid; a huge
+    // one, glyphs larger than the window.
+    for bad in [0.05, 3.9, 200.1, f32::NAN, f32::INFINITY] {
+        let mut c = NoraConfig::default();
+        c.font.size = bad;
+        let errors = c.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("font.size") && e.contains("between 4 and 200")),
+            "expected a font.size range error for {bad}, got: {errors:?}"
+        );
+    }
+    for good in [MIN_FONT_SIZE, 4.5, 15.0, MAX_FONT_SIZE] {
+        let mut c = NoraConfig::default();
+        c.font.size = good;
+        assert!(c.validate().is_empty(), "{good} is valid");
+    }
+}
+
+/// `terminal.mouse` was parsed but never did anything: it is rejected with
+/// a message saying so, rather than silently ignored.
+#[test]
+fn terminal_mouse_is_rejected_as_unsupported() {
+    for value in ["true", "false"] {
+        let err = parse_config(&format!("[terminal]\nmouse = {value}\n"))
+            .expect_err("terminal.mouse is not supported");
+        match err {
+            ConfigError::Validation { errors, .. } => assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("terminal.mouse") && e.contains("not supported")),
+                "{errors:?}"
+            ),
+            other => panic!("expected a Validation error, got: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -156,7 +194,6 @@ fn parse_valid_toml() {
     let toml_text = r##"
 [terminal]
 history = 2000
-mouse = true
 
 [font]
 family = "DejaVu Sans Mono"
@@ -173,7 +210,6 @@ bindings = { "Ctrl+Shift+C" = "copy" }
 "##;
     let c = parse_config(toml_text).expect("valid TOML should parse");
     assert_eq!(c.terminal.history, 2000);
-    assert!(c.terminal.mouse);
     assert_eq!(c.font.family, "DejaVu Sans Mono");
     assert_eq!(c.font.size, 14.0);
     assert_eq!(c.theme.background, "#101418");
@@ -227,22 +263,17 @@ fn load_config_defaults() {
     let loaded = load_config_with_candidates(None, &[]).expect("defaults should load");
     assert!(loaded.path.is_none());
     assert_eq!(loaded.config.history(), 10_000);
-    assert!(!loaded.config.terminal.mouse);
+    assert_eq!(loaded.config.terminal.mouse, None);
     assert_eq!(loaded.config.font.family, "monospace");
 }
 
 #[test]
 fn load_config_explicit_path() {
     let tmp = TempDir::new();
-    let path = write_config(
-        &tmp.0,
-        "config.toml",
-        "[terminal]\nhistory = 4321\nmouse = true\n",
-    );
+    let path = write_config(&tmp.0, "config.toml", "[terminal]\nhistory = 4321\n");
     let loaded = load_config(Some(path.to_str().unwrap())).expect("explicit path should load");
     assert_eq!(loaded.path.as_deref(), Some(path.as_path()));
     assert_eq!(loaded.config.terminal.history, 4321);
-    assert!(loaded.config.terminal.mouse);
 }
 
 #[test]
