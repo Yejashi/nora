@@ -1026,6 +1026,39 @@ scenario_imagetools() {
     pass imagetools
 }
 
+# Video through kitty graphics: mpv's kitty output plays a synthetic test
+# clip, with frames sent inline (base64) and through shared memory (every
+# frame `t=s,...,m=1`, a name without a slash). The picture must appear,
+# and nora must unlink each shared-memory frame it read.
+scenario_video() {
+    local dir="$OUT/video"; mkdir -p "$dir"
+    for tool in mpv ffmpeg; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "SKIP video: $tool not installed"; return; }
+    done
+    ffmpeg -loglevel error -y -f lavfi -i testsrc=size=320x180:rate=30 -t 5 \
+        -pix_fmt yuv420p "$dir/clip.mp4" || { fail video "ffmpeg could not make the clip"; return; }
+    local shm colors
+    for shm in no yes; do
+        launch "video" sh -c "mpv --vo=kitty --vo-kitty-use-shm=$shm --no-audio --really-quiet \
+            --loop-file=inf '$dir/clip.mp4' 2>'$dir/mpv-$shm.err'" \
+            || { fail video "no window (shm=$shm)"; return; }
+        colors=0
+        for _ in $(seq 1 20); do
+            shot "$dir/shm-$shm.png"
+            colors=$("${IM_CONVERT[@]}" "$dir/shm-$shm.png" -format '%k' info:)
+            [ "$colors" -gt 1000 ] && break
+        done
+        # Read segments are unlinked: at most the frame in flight remains.
+        local left
+        left=$(find /dev/shm -maxdepth 1 -name 'mpv-kitty-*' -newer "$dir/clip.mp4" 2>/dev/null | wc -l)
+        finish
+        [ "$shm" = no ] || [ "$left" -le 1 ] || { fail video "$left shared-memory frames left in /dev/shm"; return; }
+        echo "  shm=$shm: colors $colors"
+        [ "$colors" -gt 1000 ] || { fail video "no video frame drawn (shm=$shm)"; return; }
+    done
+    pass video
+}
+
 # Glyph atlas soak (audit R8): about 32 000 distinct CJK and Hangul
 # glyphs, one new screenful at a time, drawn in two passes at two zoom
 # levels. The atlas must trim glyphs a frame no longer uses: no frame may
@@ -1466,7 +1499,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell echo suggest prompts ime vim nvim less ssh a11y tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools video atlas zshell echo suggest prompts ime vim nvim less ssh a11y tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
