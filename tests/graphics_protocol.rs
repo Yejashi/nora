@@ -227,3 +227,20 @@ fn placeholder_placement_ids_and_missing_placements() {
     e.feed(&apc("Ga=d,d=i,i=7"));
     assert!(e.snapshot().images.is_empty());
 }
+
+/// A display with an enormous `r` moves the cursor at most one screen
+/// down (no unbounded line-feed buffer is built on the PTY thread).
+#[test]
+fn a_huge_row_count_moves_at_most_a_screen() {
+    let mut e = engine();
+    // 268 million rows would be a 268 MB line-feed buffer.
+    e.feed(&apc("Ga=T,f=24,s=1,v=1,i=7,r=268000000;AAAA"));
+    assert_eq!(e.replies(), vec!["\x1b_Gi=7;OK\x1b\\".to_string()]);
+    assert_eq!(
+        e.snapshot().cursor,
+        Some((23, 0)),
+        "at the bottom, past the edge"
+    );
+    e.feed(b"x");
+    assert_eq!(e.snapshot().cursor, Some((23, 1)), "the terminal goes on");
+}

@@ -205,8 +205,11 @@ impl StreamFilter {
 /// The bytes that move the cursor past a displayed image, as kitty does:
 /// down `rows - 1` lines (scrolling at the bottom), then right by
 /// `columns`, to the next line's start when that reaches the right edge.
+/// The line feeds stop at the screen height: past it, more only add blank
+/// history, and an image's rows come from the client.
 fn cursor_movement(columns: u32, rows: u32, at: &MarkerContext) -> Vec<u8> {
-    let mut out = b"\n".repeat(rows.saturating_sub(1) as usize);
+    let feeds = (rows.saturating_sub(1) as usize).min(at.screen_lines);
+    let mut out = b"\n".repeat(feeds);
     if at.cursor_col + columns as usize >= at.columns {
         out.extend_from_slice(b"\r\n");
     } else if columns > 0 {

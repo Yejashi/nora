@@ -30,6 +30,9 @@ pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DIMENSION: u32 = 8192;
 /// Most placements kept; the oldest goes first.
 pub const MAX_PLACEMENTS: usize = 1024;
+/// Largest placement in columns or rows (`c`, `r` and the derived size are
+/// clamped to it).
+pub const MAX_PLACEMENT_CELLS: u32 = 10_000;
 /// Images with no id from the application get ids from here up.
 const INTERNAL_ID_BASE: u32 = 1 << 31;
 
@@ -382,24 +385,38 @@ impl GraphicsState {
             0 => image.height - sy,
             h => h.min(image.height - sy),
         };
-        let (c, r) = (keys.u32("c"), keys.u32("r"));
-        let ratio = |a: u32, b: u32, n: u64| -> u32 {
+        // Sizes from the client are bounded (MAX_PLACEMENT_CELLS) and
+        // computed in u64, so no request overflows.
+        let (cw64, ch64) = (u64::from(cw), u64::from(ch));
+        let c = u64::from(keys.u32("c").min(MAX_PLACEMENT_CELLS));
+        let r = u64::from(keys.u32("r").min(MAX_PLACEMENT_CELLS));
+        let ratio = |a: u32, b: u32, n: u64| -> u64 {
             if b == 0 {
                 0
             } else {
-                (n * u64::from(a) / u64::from(b)) as u32
+                n * u64::from(a) / u64::from(b)
             }
         };
-        let size = match (c, r) {
-            (0, 0) => (sw, sh),
-            (c, 0) => (c * cw, ratio(sh, sw, u64::from(c * cw))),
-            (0, r) => (ratio(sw, sh, u64::from(r * ch)), r * ch),
-            (c, r) => (c * cw, r * ch),
+        let (width, height) = match (c, r) {
+            (0, 0) => (u64::from(sw), u64::from(sh)),
+            (c, 0) => (c * cw64, ratio(sh, sw, c * cw64)),
+            (0, r) => (ratio(sw, sh, r * ch64), r * ch64),
+            (c, r) => (c * cw64, r * ch64),
         };
+        let max_cells = u64::from(MAX_PLACEMENT_CELLS);
+        let to_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        let size = (
+            to_u32(width.min(max_cells * cw64)),
+            to_u32(height.min(max_cells * ch64)),
+        );
         let offset = (keys.u32("X").min(cw - 1), keys.u32("Y").min(ch - 1));
         let is_virtual = keys.u32("U") == 1;
-        let columns = (offset.0 + size.0).div_ceil(cw).max(1);
-        let rows = (offset.1 + size.1).div_ceil(ch).max(1);
+        let cells = |offset: u32, size: u32, cell: u64| {
+            to_u32((u64::from(offset) + u64::from(size)).div_ceil(cell))
+                .clamp(1, MAX_PLACEMENT_CELLS)
+        };
+        let columns = cells(offset.0, size.0, cw64);
+        let rows = cells(offset.1, size.1, ch64);
         if placement_id != 0 {
             self.placements
                 .retain(|p| !(p.image_id == id && p.placement_id == placement_id));

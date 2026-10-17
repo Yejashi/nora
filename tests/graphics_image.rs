@@ -357,3 +357,27 @@ fn shared_memory_media() {
     );
     std::fs::remove_file(&file).unwrap();
 }
+
+/// Client sizes (`c`, `r`) are clamped, so no size arithmetic overflows
+/// (a debug build used to panic on the PTY thread).
+#[test]
+fn huge_cell_counts_are_clamped() {
+    use nora::graphics_image::MAX_PLACEMENT_CELLS as MAX;
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=t,f=32,s=1,v=1,i=1", &rgba(1, 1)), &at(0, 0));
+    let out = g.handle(&cmd("a=p,i=1,c=4294967295,r=4294967295", &[]), &at(0, 0));
+    assert_eq!(out.move_cursor, Some((MAX, MAX)));
+    let p = g.placements().last().unwrap();
+    assert_eq!(
+        (p.columns, p.rows, p.size),
+        (MAX, MAX, (MAX * 10, MAX * 20))
+    );
+    // Only `r`: the width follows the aspect ratio, also clamped.
+    let out = g.handle(&cmd("a=p,i=1,r=4294967295,X=9,Y=19", &[]), &at(0, 0));
+    assert_eq!(out.move_cursor, Some((MAX, MAX)));
+    // A tall image scaled by `c` only.
+    g.handle(&cmd("a=t,f=32,s=1,v=8192,i=2", &rgba(1, 8192)), &at(0, 0));
+    let out = g.handle(&cmd("a=p,i=2,c=4294967295", &[]), &at(0, 0));
+    assert_eq!(out.move_cursor, Some((MAX, MAX)));
+    assert_eq!(g.placements().last().unwrap().size, (MAX * 10, MAX * 20));
+}
