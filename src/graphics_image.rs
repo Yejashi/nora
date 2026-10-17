@@ -17,8 +17,18 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::graphics_filter::GraphicsEvent;
+
+/// Upload generations come from one process-wide counter, so
+/// `(image id, generation)` is unique across every terminal's state (the
+/// renderer shares one texture cache between panes).
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Largest decoded image (RGBA bytes).
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -46,7 +56,8 @@ pub struct Image {
     pub height: u32,
     /// RGBA, `width * height * 4` bytes, shared with snapshots.
     pub pixels: Arc<[u8]>,
-    /// Distinguishes uploads under the same id (for texture caches).
+    /// Distinguishes uploads (for texture caches): unique in the process,
+    /// so it also tells apart images of different terminals with one id.
     pub generation: u64,
     /// Stored without an id or a number: its id was never told to the
     /// client, so no client command (put, delete by id or range, transmit
@@ -152,7 +163,6 @@ pub struct GraphicsState {
     chunk: Option<GraphicsEvent>,
     chunk_overflow: bool,
     next_internal: u32,
-    generation: u64,
     serial: u64,
     /// The cell size in pixels, for sizing placements.
     cell: (u32, u32),
@@ -340,7 +350,6 @@ impl GraphicsState {
             }
             self.placements.retain(|p| p.image_id != victim);
         }
-        self.generation += 1;
         self.total_bytes += bytes;
         self.images.insert(
             id,
@@ -350,7 +359,7 @@ impl GraphicsState {
                 width,
                 height,
                 pixels: pixels.into(),
-                generation: self.generation,
+                generation: next_generation(),
                 internal,
             },
         );

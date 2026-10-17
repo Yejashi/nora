@@ -435,6 +435,31 @@ fn huge_cell_counts_are_clamped() {
     assert_eq!(g.placements().last().unwrap().size, (MAX * 10, MAX * 20));
 }
 
+/// Each pane has its own state, but the renderer keys textures by (id,
+/// generation): two states storing the same id (or their first internal
+/// id) never share a generation.
+#[test]
+fn generations_are_unique_across_states() {
+    let (mut a, mut b) = (GraphicsState::new(), GraphicsState::new());
+    let mut seen = std::collections::HashSet::new();
+    for g in [&mut a, &mut b] {
+        g.handle(&cmd("a=t,f=32,s=1,v=1,i=1", &rgba(1, 1)), &at(0, 0));
+        g.handle(&cmd("a=T,f=32,s=1,v=1", &rgba(1, 1)), &at(0, 0));
+        let internal = g.placements().last().unwrap().image_id;
+        for id in [1, internal] {
+            assert!(seen.insert(g.image(id).unwrap().generation), "id {id}");
+        }
+    }
+    let keys: std::collections::HashSet<_> = [&a, &b]
+        .iter()
+        .flat_map(|g| {
+            g.placements()
+                .map(|p| (p.image_id, g.image(p.image_id).unwrap().generation))
+        })
+        .collect();
+    assert_eq!(keys.len(), 2, "the internal images' texture keys differ");
+}
+
 /// An image stored without an id or number gets an internal id the client
 /// never learns; a client using that id (they are 2^31 and up) reaches its
 /// own image, never the internal one.
