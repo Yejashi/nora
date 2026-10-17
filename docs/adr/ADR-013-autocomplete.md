@@ -138,7 +138,9 @@ Option 4, with these parts:
    ratio). Not recorded: lines starting with a space, multi-line or with
    control characters, over 4 KiB. Caps: 5 000 entries, 2 MiB; the lowest
    ranked is evicted. File `$XDG_STATE_HOME/nora/history` (mode 0600,
-   atomic rename, damaged lines skipped). Tests: `tests/suggest.rs`.
+   atomic rename, damaged lines skipped; each save loads, merges and
+   renames under an exclusive `flock` on `history.lock`, waiting at most
+   1 s, so concurrent saves from several processes keep every command). Tests: `tests/suggest.rs`.
    **Sources b and c, done 2026-10-16:** when history has no match, the
    last word completes as a path (cwd from OSC 7, `~/` from HOME) or, as
    the first word, as an executable on PATH; only an unambiguous extension

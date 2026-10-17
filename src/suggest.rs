@@ -297,11 +297,17 @@ impl History {
     /// mark the history clean. What the file holds now (another nora
     /// process may have saved since) is merged in first, so no process
     /// drops another's commands; a file [`History::load`] rejects is left
-    /// alone and is an error.
+    /// alone and is an error. The load, merge and rename hold an exclusive
+    /// lock on `<file>.lock` beside it, so saves from several processes at
+    /// once (a logout signals them all) do not race; without the lock
+    /// (it cannot be created, or is not free within [`SAVE_LOCK_WAIT`])
+    /// the save goes ahead unlocked.
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Released when dropped, after the rename.
+        let _lock = lock_beside(path);
         self.merge(Self::load(path)?);
         let mut text = String::with_capacity(self.bytes + self.entries.len() * 32);
         text.push_str(FILE_HEADER);
@@ -328,6 +334,32 @@ impl History {
         written?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+/// Longest a save waits for another process's save to release the lock.
+pub const SAVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// An exclusive advisory lock (`flock`) on `<path>.lock`, held until the
+/// returned file is dropped; `None` when the lock file cannot be opened,
+/// locking fails, or another holder keeps it past [`SAVE_LOCK_WAIT`].
+fn lock_beside(path: &Path) -> Option<std::fs::File> {
+    let name = path.file_name()?.to_string_lossy();
+    let lock_path = path.with_file_name(format!("{name}.lock"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(lock_path).ok()?;
+    let deadline = std::time::Instant::now() + SAVE_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
     }
 }
 

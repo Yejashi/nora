@@ -178,7 +178,7 @@ fn unreadable_history_is_never_overwritten() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name())
-        .filter(|name| name != "history")
+        .filter(|name| name != "history" && name != "history.lock")
         .collect();
     assert!(leftovers.is_empty(), "no temporary files: {leftovers:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -213,12 +213,58 @@ fn saves_from_two_processes_merge() {
     let mut dirs = make.dirs.clone();
     dirs.sort();
     assert_eq!(dirs, vec![("/a".to_string(), 1), ("/b".to_string(), 3)]);
-    let names: Vec<_> = std::fs::read_dir(&dir)
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()
         .map(|e| e.file_name())
         .collect();
-    assert_eq!(names, ["history"], "no temporary files left");
+    names.sort();
+    assert_eq!(
+        names,
+        ["history", "history.lock"],
+        "no temporary files left"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Saves running at the same moment (a logout signals every nora
+/// process) each load, merge and rename under the lock, so none drops
+/// the commands another just wrote.
+#[test]
+fn concurrent_saves_keep_every_command() {
+    let dir = std::env::temp_dir().join(format!("nora-suggest-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("history");
+    const SAVERS: usize = 8;
+    const ROUNDS: usize = 4;
+    for round in 0..ROUNDS {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(SAVERS));
+        let savers: Vec<_> = (0..SAVERS)
+            .map(|i| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut h = History::new();
+                    assert!(h.record(&format!("cmd-{round}-{i}"), None, Some(0), NOW));
+                    barrier.wait();
+                    h.save(&path).expect("saves");
+                })
+            })
+            .collect();
+        for saver in savers {
+            saver.join().unwrap();
+        }
+    }
+    let disk = History::load(&path).unwrap();
+    for round in 0..ROUNDS {
+        for i in 0..SAVERS {
+            assert!(
+                disk.get(&format!("cmd-{round}-{i}")).is_some(),
+                "cmd-{round}-{i} kept"
+            );
+        }
+    }
+    assert_eq!(disk.len(), SAVERS * ROUNDS);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
