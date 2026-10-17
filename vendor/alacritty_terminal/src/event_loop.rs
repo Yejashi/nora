@@ -102,6 +102,38 @@ impl MarkerContext {
     }
 }
 
+/// nora: the `CSI ? 2026 h` that begins a synchronized update.
+const BSU: &[u8] = b"\x1b[?2026h";
+
+/// nora: run `at_marker` on the terminal as of a filter position.
+///
+/// Inside a synchronized update the parser only buffers bytes, so the
+/// terminal (and [`MarkerContext::of`]) would still show the state from
+/// before the update. When bytes are buffered they are parsed first
+/// (ending the update, which also emits their replies before any reply
+/// `at_marker` sends), and the update is resumed afterwards so the rest of
+/// it stays synchronized. `at_marker` gets the parser to parse injected
+/// bytes with.
+pub fn at_marker_position<T, U, R>(
+    parser: &mut ansi::Processor<T>,
+    terminal: &mut Term<U>,
+    at_marker: impl FnOnce(&mut ansi::Processor<T>, &mut Term<U>) -> R,
+) -> R
+where
+    T: ansi::Timeout,
+    U: EventListener,
+{
+    let flushed = parser.sync_bytes_count() > 0;
+    if flushed {
+        parser.stop_sync(terminal);
+    }
+    let result = at_marker(parser, terminal);
+    if flushed {
+        parser.advance(terminal, BSU);
+    }
+    result
+}
+
 /// The main event loop.
 ///
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
@@ -270,12 +302,15 @@ where
                 let mut pos = 0;
                 for &mpos in &marker_positions {
                     state.parser.advance(&mut **terminal, &to_parse[pos..mpos]);
-                    let context = MarkerContext::of(&**terminal);
-                    if let Some(filter) = self.filter.as_mut()
-                        && let Some(inject) = filter.on_marker(mpos, &context)
-                    {
-                        state.parser.advance(&mut **terminal, &inject);
-                    }
+                    let filter = &mut self.filter;
+                    at_marker_position(&mut state.parser, &mut **terminal, |parser, term| {
+                        let context = MarkerContext::of(term);
+                        if let Some(filter) = filter.as_mut()
+                            && let Some(inject) = filter.on_marker(mpos, &context)
+                        {
+                            parser.advance(term, &inject);
+                        }
+                    });
                     pos = mpos;
                 }
                 state.parser.advance(&mut **terminal, &to_parse[pos..]);

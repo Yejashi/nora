@@ -639,10 +639,17 @@ impl Engine {
         let mut pos = 0;
         for at in positions {
             self.processor.advance(&mut *term, &forward[pos..at]);
-            let context = alacritty_terminal::event_loop::MarkerContext::of(&*term);
-            if let Some(inject) = self.stream.on_marker(&context) {
-                self.processor.advance(&mut *term, &inject);
-            }
+            let stream = &mut self.stream;
+            alacritty_terminal::event_loop::at_marker_position(
+                &mut self.processor,
+                &mut *term,
+                |parser, term| {
+                    let context = alacritty_terminal::event_loop::MarkerContext::of(term);
+                    if let Some(inject) = stream.on_marker(&context) {
+                        parser.advance(term, &inject);
+                    }
+                },
+            );
             pos = at;
         }
         self.processor.advance(&mut *term, &forward[pos..]);
