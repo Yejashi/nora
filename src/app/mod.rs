@@ -1725,6 +1725,7 @@ impl WinApp {
             return;
         };
         let t_start = std::time::Instant::now();
+        let allocs_start = nora::trace::thread_allocations();
         let slot = self
             .pane_slots
             .get(&active)
@@ -1787,12 +1788,14 @@ impl WinApp {
             return;
         }
         let t_gathered = std::time::Instant::now();
+        let allocs_gathered = nora::trace::thread_allocations();
         let graphics = self
             .graphics
             .as_mut()
             .expect("graphics are created at startup");
         let mut frame = graphics.acquire();
         let t_acquired = std::time::Instant::now();
+        let allocs_acquired = nora::trace::thread_allocations();
         let (state, action) = on_event(
             self.state.clone(),
             RenderEvent::SurfaceStatus(frame.status.clone()),
@@ -1962,6 +1965,7 @@ impl WinApp {
                     scene.add_separators(&tiles, u32::from(bar), layout.cell_w, layout.cell_h);
                 }
                 let t_built = std::time::Instant::now();
+                let allocs_built = nora::trace::thread_allocations();
                 if let Err(message) = graphics.draw_frame(
                     &mut frame,
                     fonts,
@@ -1976,6 +1980,7 @@ impl WinApp {
                 }
                 let suboptimal = frame.status == SurfaceStatus::Suboptimal;
                 let t_drawn = std::time::Instant::now();
+                let allocs_drawn = nora::trace::thread_allocations();
                 graphics.present(frame);
                 if self.frames == 0 {
                     nora::trace::stage("first frame presented");
@@ -1985,8 +1990,29 @@ impl WinApp {
                         (b - a).as_secs_f64() * 1000.0
                     };
                     let done = std::time::Instant::now();
+                    // Only in `alloc-count` builds; before `cells` so the grid
+                    // stays the last field (scripts/perf.sh).
+                    let allocs = match (
+                        allocs_start,
+                        allocs_gathered,
+                        allocs_acquired,
+                        allocs_built,
+                        allocs_drawn,
+                        nora::trace::thread_allocations(),
+                    ) {
+                        (Some(a), Some(g), Some(q), Some(b), Some(d), Some(e)) => format!(
+                            " allocs {} gather_allocs {} acquire_allocs {} scene_allocs {} encode_allocs {} present_allocs {}",
+                            e - a,
+                            g - a,
+                            q - g,
+                            b - q,
+                            d - b,
+                            e - d
+                        ),
+                        _ => String::new(),
+                    };
                     eprintln!(
-                        "frame: total {:.3} gather {:.3} acquire {:.3} scene {:.3} encode {:.3} present {:.3} ms cells {} grid {}x{}",
+                        "frame: total {:.3} gather {:.3} acquire {:.3} scene {:.3} encode {:.3} present {:.3} ms{allocs} cells {} grid {}x{}",
                         ms(t_start, done),
                         ms(t_start, t_gathered),
                         ms(t_gathered, t_acquired),

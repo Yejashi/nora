@@ -25,6 +25,11 @@ use std::process::ExitCode;
 use nora::session::pty::DEFAULT_CAP;
 use nora::session::{LaunchSpec, PtyError, PtySession};
 
+// Measurement builds only (`--features alloc-count`, audit R12).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOC: nora::trace::alloc_count::CountingAlloc = nora::trace::alloc_count::CountingAlloc;
+
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

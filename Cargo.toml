@@ -18,6 +18,9 @@ x11 = ["winit/x11"]
 # Mirrors winit's default Wayland stack (client + dlopen backend +
 # client-side decorations).
 wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+# Measurement builds only: count heap allocations per thread and report
+# them per frame in `NORA_TRACE_FRAMES` output (audit R12).
+alloc-count = []
 
 [dependencies]
 alacritty_terminal = "0.26.0"

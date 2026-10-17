@@ -97,6 +97,8 @@ jobs:
           grep -E "^test .* FAILED$|panicked at|^test result: FAILED" test.log \
             | sort -u | head -40 | sed 's/^/::error::/' || true
           exit "$STATUS"
+      - name: Allocation counter (alloc-count measurement feature)
+        run: cargo test --locked --features alloc-count --test alloc_count
       - name: Headless launch smoke (no display server)
         run: |
           # With no display server the launch path falls back to the
