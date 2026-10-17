@@ -188,6 +188,49 @@ fn install_script_runs() {
     );
 }
 
+/// install.sh installs the binary cargo built under `CARGO_TARGET_DIR`,
+/// not `target/release/nora`. A stub `cargo` first on PATH "builds" a
+/// marker script there, so the test needs no release build and fails if
+/// the script installs from anywhere else.
+#[test]
+fn install_script_honors_cargo_target_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir();
+    let (home, stub_bin, target) = (root.join("home"), root.join("bin"), root.join("tgt"));
+    for dir in [&home, &stub_bin, &target] {
+        std::fs::create_dir_all(dir).expect("create test dir");
+    }
+    let cargo = stub_bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\n\
+         mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
+         printf '#!/bin/sh\\necho nora from-cargo-target-dir\\n' > \"$CARGO_TARGET_DIR/release/nora\"\n\
+         chmod 0755 \"$CARGO_TARGET_DIR/release/nora\"\n",
+    )
+    .expect("write stub cargo");
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod stub cargo");
+
+    let mut env = home_env(&home);
+    let path = std::env::var("PATH").unwrap_or_default();
+    env.push(("PATH".into(), format!("{}:{path}", stub_bin.display())));
+    env.push(("CARGO_TARGET_DIR".into(), target.display().to_string()));
+    let out = run_script("install.sh", &env);
+    assert_script_ok(&out, "install.sh");
+
+    let version = Command::new(home.join(".local/bin/nora"))
+        .arg("--version")
+        .output()
+        .expect("run the installed binary");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        "nora from-cargo-target-dir",
+        "install.sh must install $CARGO_TARGET_DIR/release/nora"
+    );
+}
+
 /// Acceptance: the desktop entry carries the required keys and passes
 /// `desktop-file-validate` when that tool is available.
 #[test]
