@@ -29,6 +29,8 @@ pub struct Scene {
     pub cells: Vec<DrawCell>,
     pub fills: Vec<CellFill>,
     pub rects: Vec<PixelRect>,
+    /// Kitty graphics placements (ADR-014), lowest z first per pane.
+    pub images: Vec<super::images::ImageDraw>,
 }
 
 /// Separator and inactive-tab colors.
@@ -65,6 +67,25 @@ impl Scene {
                     color: [bg.r, bg.g, bg.b, 255],
                 });
             }
+        }
+        // Images scale with the cell (zoom): sizes and offsets were taken at
+        // the cell size of the placement.
+        let (cw, ch) = (layout.cell_w, layout.cell_h);
+        let (x0, y0) = (col0 as f32 * cw, row0 as f32 * ch);
+        let clip = [x0, y0, snap.cols as f32 * cw, snap.rows as f32 * ch];
+        for image in &snap.images {
+            let sx = cw / image.cell.0.max(1) as f32;
+            let sy = ch / image.cell.1.max(1) as f32;
+            self.images.push(super::images::ImageDraw {
+                rect: [
+                    x0 + image.col as f32 * cw + image.offset.0 as f32 * sx,
+                    y0 + image.row as f32 * ch + image.offset.1 as f32 * sy,
+                    image.size.0 as f32 * sx,
+                    image.size.1 as f32 * sy,
+                ],
+                clip,
+                image: image.clone(),
+            });
         }
         let first_cell = self.cells.len();
         for row in 0..snap.rows {

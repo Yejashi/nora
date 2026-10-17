@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use super::glyphs;
+use super::images::Band;
 use glyphon::{
     Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
     Viewport,
@@ -420,6 +421,8 @@ pub struct Graphics {
     glyph_cache: GlyphCache,
     /// N13c decoration (underline/strikethrough) fill pipeline.
     deco_pipeline: wgpu::RenderPipeline,
+    /// Kitty graphics (ADR-014).
+    image_renderer: super::images::ImageRenderer,
     /// Selection highlight color (`[colors] selection_background`).
     selection_bg: [u8; 4],
 }
@@ -484,6 +487,7 @@ impl Graphics {
         let viewport = Viewport::new(&device, &cache);
         let renderer = TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let deco_pipeline = decoration_pipeline(&device, format);
+        let image_renderer = super::images::ImageRenderer::new(&device, format);
 
         Ok(Self {
             instance,
@@ -501,6 +505,7 @@ impl Graphics {
             renderer,
             glyph_cache: GlyphCache::new(),
             deco_pipeline,
+            image_renderer,
             selection_bg: SELECTION_BG,
         })
     }
@@ -648,6 +653,7 @@ impl Graphics {
         rects: &[super::scene::PixelRect],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
+        images: &[super::images::ImageDraw],
     ) -> Result<(), String> {
         let Some(view) = frame.view.as_ref() else {
             return Ok(());
@@ -713,6 +719,16 @@ impl Graphics {
             });
         }
 
+        // Kitty graphics (ADR-014): textures uploaded and quads laid out
+        // before the pass; drawn in three bands around the text below.
+        let frame_size = frame
+            .texture
+            .as_ref()
+            .map(|t| (t.texture.size().width, t.texture.size().height))
+            .unwrap_or((1, 1));
+        let images = self
+            .image_renderer
+            .prepare(&self.device, &self.queue, images, frame_size);
         let mut pass = frame.encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("nora pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -732,6 +748,8 @@ impl Graphics {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        self.image_renderer
+            .draw(&mut pass, &images, Band::UnderBackgrounds, frame_size);
         // N14b: selection highlight — fill rectangles under the selected
         // cells, drawn before the glyphs so text composites on top.
         // Cell backgrounds and the block cursor: solid rectangles drawn
@@ -855,6 +873,8 @@ impl Graphics {
             pass.set_vertex_buffer(0, buffer.slice(0..));
             pass.draw(0..search.len() as u32, 0..1);
         }
+        self.image_renderer
+            .draw(&mut pass, &images, Band::UnderText, frame_size);
         self.renderer
             .prepare(
                 &self.device,
@@ -961,6 +981,9 @@ impl Graphics {
             pass.set_vertex_buffer(0, buffer.slice(0..));
             pass.draw(0..deco.len() as u32, 0..1);
         }
+
+        self.image_renderer
+            .draw(&mut pass, &images, Band::OverText, frame_size);
 
         // Dropping `pass` ends it (pinned wgpu 30 `RenderPass` has no
         // explicit finish; the N02 offscreen test follows the same pattern).

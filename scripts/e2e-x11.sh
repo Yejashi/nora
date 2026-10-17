@@ -878,6 +878,74 @@ CHILD
     pass scale
 }
 
+# Kitty graphics (ADR-014): a chunked RGBA image and a PNG read from a
+# file are drawn at the cursor, at their pixel size, with the text after
+# them; `a=d` removes them.
+scenario_graphics() {
+    have base64 graphics || return
+    local dir="$OUT/graphics"; rm -rf "$dir"; mkdir -p "$dir"
+    # 40x20 opaque red, raw RGBA; 30x30 green PNG.
+    local red green_path blue magenta
+    red=$(for _ in $(seq 1 800); do printf '\377\000\000\377'; done | base64 -w0)
+    # 24x24 (two cells): blue under text (z=-1), magenta over it (z=0).
+    blue=$(for _ in $(seq 1 576); do printf '\000\000\377\377'; done | base64 -w0)
+    magenta=$(for _ in $(seq 1 576); do printf '\377\000\377\377'; done | base64 -w0)
+    "${IM_CONVERT[@]}" -size 30x30 xc:'#00FF00' "$dir/green.png"
+    green_path=$(printf '%s' "$dir/green.png" | base64 -w0)
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+printf 'BEFORE\r\n'
+printf '\033_Ga=T,f=32,s=40,v=20,m=1;%s\033\\\\' '${red:0:2048}'
+printf '\033_Gm=0;%s\033\\\\' '${red:2048}'
+printf 'AFTER\r\n'
+printf '\033_Ga=T,f=100,t=f;%s\033\\\\' '$green_path'
+printf '\r\nEND\r\n'
+printf '\033_Ga=T,f=32,s=24,v=24,z=-1,C=1;%s\033\\\\' '$blue'
+printf 'UU\r\n'
+printf '\033_Ga=T,f=32,s=24,v=24,C=1;%s\033\\\\' '$magenta'
+printf 'MM\r\n'
+echo 1 >"$dir/shown"
+while [ ! -e "$dir/delete" ]; do sleep 0.1; done
+printf '\033_Ga=d\033\\\\'
+echo 1 >"$dir/deleted"
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch graphics "$dir/child.sh" || { fail graphics "no window"; return; }
+    wait_file "$dir/shown" || { finish; fail graphics "child did not run"; return; }
+    shot "$dir/shown.png"
+    echo 1 >"$dir/delete"
+    wait_file "$dir/deleted"
+    shot "$dir/deleted.png"
+    finish
+    local red_px green_px red_after green_after red_spot
+    red_px=$(count_color "$dir/shown.png" '#FF0000')
+    green_px=$(count_color "$dir/shown.png" '#00FF00')
+    red_after=$(count_color "$dir/deleted.png" '#FF0000')
+    green_after=$(count_color "$dir/deleted.png" '#00FF00')
+    # The red image starts at the second row's first cell (12x24 cells).
+    "${IM_CONVERT[@]}" "$dir/shown.png" -crop 40x20+0+24 +repage "$dir/red-spot.png"
+    red_spot=$(count_color "$dir/red-spot.png" '#FF0000')
+    echo "  red px $red_px (at the cursor: $red_spot), green px $green_px; after a=d: $red_after, $green_after"
+    [ "$red_spot" -eq 800 ] || { fail graphics "the RGBA image is not at the cursor at 40x20"; return; }
+    [ "$red_px" -eq 800 ] || { fail graphics "red pixels elsewhere: $red_px"; return; }
+    [ "$green_px" -eq 900 ] || { fail graphics "the PNG is not drawn at 30x30: $green_px"; return; }
+    [ "$red_after" -eq 0 ] && [ "$green_after" -eq 0 ] || { fail graphics "a=d left images"; return; }
+    # Row 5: blue at z=-1 under "UU" (the text shows); row 6: magenta at
+    # z=0 over "MM" (the text is hidden).
+    local under over
+    "${IM_CONVERT[@]}" "$dir/shown.png" -crop 24x24+0+120 +repage "$dir/under.png"
+    "${IM_CONVERT[@]}" "$dir/shown.png" -crop 24x24+0+144 +repage "$dir/over.png"
+    under="$(count_color "$dir/under.png" '#0000FF') $(count_color "$dir/under.png" '#FFFFFF')"
+    over="$(count_color "$dir/over.png" '#FF00FF') $(count_color "$dir/over.png" '#FFFFFF')"
+    echo "  z=-1 blue/white px: $under; z=0 magenta/white px: $over"
+    set -- $under
+    [ "$1" -gt 300 ] && [ "$2" -gt 20 ] || { fail graphics "z=-1: the image should be under the text"; return; }
+    set -- $over
+    [ "$1" -eq 576 ] && [ "$2" -eq 0 ] || { fail graphics "z=0: the image should cover the text"; return; }
+    pass graphics
+}
+
 # Glyph atlas soak (audit R8): about 32 000 distinct CJK and Hangul
 # glyphs, one new screenful at a time, drawn in two passes at two zoom
 # levels. The atlas must trim glyphs a frame no longer uses: no frame may
@@ -1235,7 +1303,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

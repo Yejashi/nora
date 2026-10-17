@@ -6,6 +6,7 @@
 
 pub mod glyphs;
 mod graphics;
+mod images;
 mod scene;
 
 use std::{
@@ -382,6 +383,7 @@ impl ApplicationHandler for App {
                     &mut fonts,
                     &[],
                     [0, 0, 0, 255],
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -1991,6 +1993,7 @@ impl WinApp {
                     &scene.rects,
                     &selection_cells,
                     &search_cells,
+                    &scene.images,
                 ) {
                     eprintln!("nora: frame draw failed: {message}");
                 }
