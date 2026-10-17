@@ -66,6 +66,15 @@ impl ImeState {
         self.committed.clear();
     }
 
+    /// Drop the composition shown so far but stay enabled (the platform
+    /// IME is still on for the window): used when focus moves to another
+    /// pane, so no preedit is stranded on the pane left behind and the
+    /// next platform events start fresh where focus is now.
+    pub fn drop_composition(&mut self) {
+        self.preedit.clear();
+        self.committed.clear();
+    }
+
     /// Check if the IME is active.
     pub fn is_active(&self) -> bool {
         self.active

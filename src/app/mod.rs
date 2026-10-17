@@ -675,9 +675,6 @@ struct WinApp {
     /// N24b: per-pane render state machine; `DirtyPulse`/`ChildExit` fold
     /// into the pane's own state.
     pane_render: std::collections::HashMap<PaneKey, RenderState>,
-    /// N24b: per-pane IME state machine; each pane's preedit/commit is
-    /// independent.
-    pane_ime: std::collections::HashMap<PaneKey, nora::ime::ImeState>,
     /// N24b: per-pane search UI; each pane's search is independent.
     pane_search: std::collections::HashMap<PaneKey, nora::search::SearchUi>,
     /// N24b: per-pane live terminal `TermMode` (N10b); the mode source
@@ -737,8 +734,6 @@ pub fn run_windowed(
     pane_exit.insert(first_pane, None);
     let mut pane_render = std::collections::HashMap::new();
     pane_render.insert(first_pane, RenderState::default());
-    let mut pane_ime = std::collections::HashMap::new();
-    pane_ime.insert(first_pane, nora::ime::ImeState::new());
     let mut pane_search = std::collections::HashMap::new();
     pane_search.insert(first_pane, nora::search::SearchUi::new());
     let mut pane_modes = std::collections::HashMap::new();
@@ -804,7 +799,6 @@ pub fn run_windowed(
         pane_grid,
         pane_exit,
         pane_render,
-        pane_ime,
         pane_search,
         pane_modes,
         pane_selection,
@@ -858,7 +852,6 @@ impl WinApp {
         self.pane_grid.insert(pane, (0, 0));
         self.pane_exit.insert(pane, None);
         self.pane_render.insert(pane, RenderState::default());
-        self.pane_ime.insert(pane, nora::ime::ImeState::new());
         self.pane_search.insert(pane, nora::search::SearchUi::new());
         self.pane_modes.insert(pane, TermMode::SHOW_CURSOR);
         self.pane_selection.insert(pane, None);
@@ -877,7 +870,6 @@ impl WinApp {
         self.pane_grid.remove(&pane);
         self.pane_exit.remove(&pane);
         self.pane_render.remove(&pane);
-        self.pane_ime.remove(&pane);
         self.pane_search.remove(&pane);
         self.pane_modes.remove(&pane);
         self.pane_selection.remove(&pane);
@@ -889,10 +881,10 @@ impl WinApp {
         self.pane_slots.insert(pane, self.slot.clone());
         self.pane_exit.insert(pane, self.child_exit);
         self.pane_render.insert(pane, self.state.clone());
-        self.pane_ime.insert(
-            pane,
-            std::mem::replace(&mut self.ime, nora::ime::ImeState::new()),
-        );
+        // The platform composition belongs to the window, not the pane: a
+        // preedit moved with the pane would be stranded there (and block
+        // accepting its suggestion), so focus leaving drops it instead.
+        self.ime.drop_composition();
         self.pane_search.insert(
             pane,
             std::mem::replace(&mut self.search, nora::search::SearchUi::new()),
@@ -927,7 +919,9 @@ impl WinApp {
             .clone();
         self.child_exit = self.pane_exit.remove(&pane).unwrap_or(None);
         self.state = self.pane_render.remove(&pane).unwrap_or_default();
-        self.ime = self.pane_ime.remove(&pane).unwrap_or_default();
+        // Every way in (focus, split, tab switch, closing the active pane)
+        // starts without the previous pane's preedit.
+        self.ime.drop_composition();
         self.search = self.pane_search.remove(&pane).unwrap_or_default();
         self.modes = self
             .pane_modes
@@ -1162,7 +1156,7 @@ impl WinApp {
             self.slot = Arc::new(Mutex::new(None));
             self.child_exit = None;
             self.state = RenderState::default();
-            self.ime = nora::ime::ImeState::new();
+            self.ime.drop_composition();
             self.search = nora::search::SearchUi::new();
             self.modes = TermMode::SHOW_CURSOR;
         }

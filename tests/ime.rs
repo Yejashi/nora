@@ -235,3 +235,17 @@ fn ime_ui_disabled() {
     ime.cancel(); // `Ime::Disabled`
     assert_eq!(ime.commit(), None);
 }
+
+#[test]
+fn ime_drop_composition_clears_preedit_but_stays_enabled() {
+    // A pane switch mid-composition: nothing is left to show or commit,
+    // and the next platform events compose afresh.
+    let mut ime = ImeState::new();
+    ime.start_composition();
+    ime.update_preedit("にほ");
+    ime.drop_composition();
+    assert_eq!(ime.preedit(), "");
+    assert!(ime.is_active());
+    ime.update_preedit("ご");
+    assert_eq!(ime.commit(), Some("ご".to_string()));
+}
