@@ -48,7 +48,7 @@ use nora::render::palette::Palette;
 use nora::render::policy::snapshot_is_stale;
 use nora::render::state::{Action, RenderEvent, RenderState, SurfaceStatus, on_event};
 use nora::render::term::{TermLayout, default_bg};
-use nora::session::pump::{AppEvent, PaneKey, PumpMsg};
+use nora::session::pump::{AppEvent, PaneKey, PasteGate, PasteGateAction, PumpMsg};
 use nora::workspace::{TabId, Workspace};
 
 /// Fixed smoke-test resize target, in logical pixels.
@@ -638,9 +638,9 @@ struct WinApp {
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
-    /// A clipboard read for a paste is running on its thread (at most one;
-    /// cleared when its `AppEvent::ClipboardText` arrives).
-    paste_in_flight: bool,
+    /// Paste order: the clipboard read in flight (at most one), pastes
+    /// queued behind it and the input held until its text was sent.
+    paste_gate: PasteGate,
     /// Current zoom level (N19b): 1.0 = 100%; scales the shaping font
     /// size passed to `draw_frame`.
     zoom: f32,
@@ -771,7 +771,7 @@ pub fn run_windowed(
         mouse_grab: None,
         frame_skipped: false,
         clipboard: create_clipboard(),
-        paste_in_flight: false,
+        paste_gate: PasteGate::new(),
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_config(config),
         bindings: Bindings::with_config(&config.binding_entries()),
@@ -1438,7 +1438,33 @@ impl WinApp {
 
     /// Send input bytes to `pane`, numbered (ADR-013): a suggestion is
     /// kept only when tagged with the number of the pane's latest input.
+    /// Input behind a paste into the same pane waits for the clipboard
+    /// text ([`PasteGate`]).
     fn send_input(&mut self, pane: PaneKey, bytes: Vec<u8>) {
+        let actions = self
+            .paste_gate
+            .input(pane, bytes, std::time::Instant::now());
+        self.run_paste_actions(actions);
+    }
+
+    /// Run [`PasteGate`] actions in order.
+    fn run_paste_actions(&mut self, actions: Vec<PasteGateAction>) {
+        let mut actions = std::collections::VecDeque::from(actions);
+        while let Some(action) = actions.pop_front() {
+            match action {
+                PasteGateAction::Input { pane, bytes } => self.send_input_now(pane, bytes),
+                PasteGateAction::Paste { pane, text } => self.paste_text(pane, text),
+                PasteGateAction::Read { pane, read } => {
+                    if !self.read_clipboard(pane, read) {
+                        let now = std::time::Instant::now();
+                        actions.extend(self.paste_gate.read_done(read, None, now));
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_input_now(&mut self, pane: PaneKey, bytes: Vec<u8>) {
         self.input_seq += 1;
         let seq = self.input_seq;
         self.pane_input_seq.insert(pane, seq);
@@ -1451,26 +1477,34 @@ impl WinApp {
     /// The clipboard is read on a short-lived thread: a slow or stuck
     /// selection owner must not freeze the window, and text over the paste
     /// cap is dropped there instead of being carried to the pump. One read
-    /// is in flight at a time; the text arrives as
-    /// [`AppEvent::ClipboardText`] for the pane active at the request.
+    /// is in flight at a time (later requests queue behind it); the text
+    /// arrives as [`AppEvent::ClipboardText`] for the pane active at the
+    /// request, and input to that pane typed meanwhile follows it.
     fn paste_clipboard(&mut self) {
-        let (Some(clipboard), Some(pane)) = (self.clipboard.clone(), self.active_pane_key()) else {
+        let (Some(_), Some(pane)) = (self.clipboard.as_ref(), self.active_pane_key()) else {
             if debug_enabled() {
                 eprintln!("debug: paste: clipboard unavailable");
             }
             return;
         };
-        if self.paste_in_flight {
-            return;
-        }
+        let actions = self.paste_gate.request(pane, std::time::Instant::now());
+        self.run_paste_actions(actions);
+    }
+
+    /// Start clipboard read `read` for a paste into `pane` on its thread;
+    /// `false` when it could not start.
+    fn read_clipboard(&mut self, pane: PaneKey, read: u64) -> bool {
+        let Some(clipboard) = self.clipboard.clone() else {
+            return false;
+        };
         let proxy = self.proxy.clone();
-        let spawned = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("nora-paste".to_string())
             .spawn(move || {
                 let text = clipboard.get_text().ok().filter(|text| pasteable(text));
-                let _ = proxy.send_event(AppEvent::ClipboardText { pane, text });
-            });
-        self.paste_in_flight = spawned.is_ok();
+                let _ = proxy.send_event(AppEvent::ClipboardText { pane, read, text });
+            })
+            .is_ok()
     }
 
     /// Deliver clipboard text read for a paste into `pane` (bracketed when
@@ -1753,15 +1787,14 @@ impl WinApp {
             }
             // Handled in `user_event` before routing.
             AppEvent::FontsReady | AppEvent::ConfigChanged | AppEvent::Terminate => {}
-            AppEvent::ClipboardText { pane, text } => {
-                self.paste_in_flight = false;
-                match text {
-                    Some(text) => self.paste_text(pane, text),
-                    None if debug_enabled() => {
-                        eprintln!("debug: paste: clipboard unavailable, empty or too large");
-                    }
-                    None => {}
+            AppEvent::ClipboardText { read, text, .. } => {
+                if text.is_none() && debug_enabled() {
+                    eprintln!("debug: paste: clipboard unavailable, empty or too large");
                 }
+                let actions = self
+                    .paste_gate
+                    .read_done(read, text, std::time::Instant::now());
+                self.run_paste_actions(actions);
             }
             AppEvent::Suggestion { pane, suffix, seq } => {
                 // Computed before the pane's latest input reached the

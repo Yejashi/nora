@@ -162,7 +162,12 @@ pub enum AppEvent {
     /// The clipboard text read for a paste into `pane` (sent by the
     /// window's short-lived clipboard reader thread, not the pump): `None`
     /// when the clipboard was unavailable, empty or over the paste cap.
-    ClipboardText { pane: PaneKey, text: Option<String> },
+    ClipboardText {
+        pane: PaneKey,
+        /// The read's number (`PasteGateAction::Read`).
+        read: u64,
+        text: Option<String>,
+    },
     /// A termination signal arrived (SIGTERM, SIGHUP, SIGINT): close the
     /// window as if asked to (sent by the signal thread, not the pump).
     Terminate,
@@ -1523,6 +1528,165 @@ pub fn pump_thread(
         } else {
             Duration::from_millis(500)
         };
+    }
+}
+
+/// How long the window waits for a clipboard read before input typed
+/// behind it goes out without it (the read's text is then dropped).
+pub const PASTE_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Most paste requests queued behind a clipboard read in flight.
+pub const MAX_QUEUED_PASTES: usize = 4;
+
+/// What the window does next for [`PasteGate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteGateAction {
+    /// Send these input bytes to the pane now ([`PumpMsg::Input`]).
+    Input { pane: PaneKey, bytes: Vec<u8> },
+    /// Paste this clipboard text into the pane now ([`PumpMsg::Paste`]).
+    Paste { pane: PaneKey, text: String },
+    /// Start clipboard read `read` for a paste into the pane; report its
+    /// result with [`PasteGate::read_done`].
+    Read { pane: PaneKey, read: u64 },
+}
+
+/// One entry held behind a clipboard read.
+#[derive(Debug)]
+enum Held {
+    Input(PaneKey, Vec<u8>),
+    Paste(PaneKey),
+}
+
+/// The read in flight.
+#[derive(Debug)]
+struct PasteRead {
+    pane: PaneKey,
+    id: u64,
+    started: Instant,
+}
+
+/// The window's paste order: the clipboard is read on a thread, so input
+/// to a pane typed after a paste request is held until the clipboard text
+/// was sent, then released in order (Ctrl+Shift+V then Enter pastes, then
+/// runs). A paste requested while a read is in flight queues behind it.
+/// Held input is bounded by [`INPUT_HEADROOM`] (more is refused, as the
+/// pump refuses keys over its queue), queued pastes by
+/// [`MAX_QUEUED_PASTES`]; a read that takes longer than
+/// [`PASTE_READ_TIMEOUT`] is abandoned at the next input. Pure: the
+/// caller runs the returned actions in order.
+#[derive(Debug, Default)]
+pub struct PasteGate {
+    reading: Option<PasteRead>,
+    held: std::collections::VecDeque<Held>,
+    held_bytes: usize,
+    next_id: u64,
+}
+
+impl PasteGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a clipboard read is in flight.
+    pub fn reading(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// The user asked to paste into `pane`.
+    pub fn request(&mut self, pane: PaneKey, now: Instant) -> Vec<PasteGateAction> {
+        if self.reading.is_none() {
+            return vec![self.start(pane, now)];
+        }
+        let queued = self
+            .held
+            .iter()
+            .filter(|h| matches!(h, Held::Paste(_)))
+            .count();
+        if queued < MAX_QUEUED_PASTES {
+            self.held.push_back(Held::Paste(pane));
+        }
+        Vec::new()
+    }
+
+    /// Input for `pane`: sent now, or held when a paste into `pane` is
+    /// waiting for its clipboard read.
+    pub fn input(&mut self, pane: PaneKey, bytes: Vec<u8>, now: Instant) -> Vec<PasteGateAction> {
+        let mut actions = Vec::new();
+        if let Some(read) = &self.reading
+            && now.duration_since(read.started) >= PASTE_READ_TIMEOUT
+        {
+            self.reading = None;
+            actions = self.release(now);
+        }
+        if !self.waits(pane) {
+            actions.push(PasteGateAction::Input { pane, bytes });
+        } else if self.held_bytes + bytes.len() <= INPUT_HEADROOM {
+            self.held_bytes += bytes.len();
+            self.held.push_back(Held::Input(pane, bytes));
+        }
+        actions
+    }
+
+    /// Clipboard read `read` finished with `text` (`None`: unavailable,
+    /// empty or too large): paste it, then release what was held behind
+    /// it. The result of an abandoned read is dropped.
+    pub fn read_done(
+        &mut self,
+        read: u64,
+        text: Option<String>,
+        now: Instant,
+    ) -> Vec<PasteGateAction> {
+        let Some(current) = self.reading.take_if(|r| r.id == read) else {
+            return Vec::new();
+        };
+        let mut actions: Vec<_> = text
+            .map(|text| PasteGateAction::Paste {
+                pane: current.pane,
+                text,
+            })
+            .into_iter()
+            .collect();
+        actions.extend(self.release(now));
+        actions
+    }
+
+    /// Whether input for `pane` must wait: a paste into it is pending, or
+    /// earlier input for it is still held.
+    fn waits(&self, pane: PaneKey) -> bool {
+        self.reading.as_ref().is_some_and(|r| r.pane == pane)
+            || self.held.iter().any(|h| match h {
+                Held::Input(p, _) | Held::Paste(p) => *p == pane,
+            })
+    }
+
+    fn start(&mut self, pane: PaneKey, now: Instant) -> PasteGateAction {
+        self.next_id += 1;
+        let read = self.next_id;
+        self.reading = Some(PasteRead {
+            pane,
+            id: read,
+            started: now,
+        });
+        PasteGateAction::Read { pane, read }
+    }
+
+    /// Release held entries in order up to the next queued paste, whose
+    /// read then starts.
+    fn release(&mut self, now: Instant) -> Vec<PasteGateAction> {
+        let mut actions = Vec::new();
+        while let Some(held) = self.held.pop_front() {
+            match held {
+                Held::Input(pane, bytes) => {
+                    self.held_bytes -= bytes.len();
+                    actions.push(PasteGateAction::Input { pane, bytes });
+                }
+                Held::Paste(pane) => {
+                    actions.push(self.start(pane, now));
+                    break;
+                }
+            }
+        }
+        actions
     }
 }
 
