@@ -695,6 +695,8 @@ pub struct ConfigState {
     pub path: Option<PathBuf>,
     /// The epoch of the current config (increments on each reload).
     pub epoch: u64,
+    /// What loading this config repaired ([`LoadedConfig::warnings`]).
+    pub warnings: Vec<String>,
 }
 
 impl ConfigState {
@@ -704,6 +706,7 @@ impl ConfigState {
             current: loaded.config,
             path: loaded.path,
             epoch: 0,
+            warnings: loaded.warnings,
         }
     }
 
@@ -727,6 +730,7 @@ impl ConfigState {
             current: loaded.config,
             path: loaded.path,
             epoch: self.epoch + 1,
+            warnings: loaded.warnings,
         })
     }
 }

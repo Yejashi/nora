@@ -175,6 +175,7 @@ fn terminal_mouse_is_ignored_with_a_warning() {
         // The reload path goes through the same repair.
         let state = ConfigState::new(loaded).reload().expect("reloads");
         assert_eq!(state.current.terminal.mouse, None);
+        assert_eq!(state.warnings.len(), 1, "the reload reports the repair");
     }
 }
 

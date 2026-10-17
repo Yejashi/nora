@@ -1253,6 +1253,9 @@ impl WinApp {
                 return;
             }
         };
+        for warning in &new_state.warnings {
+            eprintln!("nora: warning: {warning}");
+        }
         let old = std::mem::replace(&mut self.config_state, new_state);
         let config = self.config_state.current.clone();
         self.palette = Palette::from_config(&config);
@@ -1290,7 +1293,10 @@ impl WinApp {
             .as_ref()
             .map_or("built-in defaults".to_string(), |p| p.display().to_string());
         eprintln!("nora: config reloaded from {path}");
-        self.notice = Some(format!("config reloaded from {path}"));
+        self.notice = Some(match self.config_state.warnings.first() {
+            Some(first) => format!("config reloaded with a repair: {first}"),
+            None => format!("config reloaded from {path}"),
+        });
     }
 
     /// Perform a bound UI action. `false` when the action had nothing to
