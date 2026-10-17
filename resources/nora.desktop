@@ -1,4 +1,5 @@
 [Desktop Entry]
+Type=Application
 Name=Nora
 GenericName=Terminal
 Comment=GPU-accelerated terminal with inline command suggestions
