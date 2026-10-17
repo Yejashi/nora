@@ -13,7 +13,7 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | Screens/scrolling | Primary/alternate screens, margins, wrap, viewport/history | Engine integration and TUI runs |
 | Queries | Supported cursor/device/color/size replies routed to child | PTY tests with exact bytes/timeouts |
 | Legacy keyboard | Text, controls, navigation, keypad/application modes | Mode-dependent input tables |
-| Kitty keyboard | **Not supported.** nora does not advertise or implement the protocol; applications fall back to legacy encoding (audit F5 removed an invalid encoder) | — |
+| Kitty keyboard | All five flags, stack and query (alacritty_terminal state, `input::kitty` encoder); see below | `tests/kitty_keyboard.rs`, e2e `kitty`, `nvim` |
 | Paste | Bracketed and ordinary paste | Exact payload tests, slow child |
 | Mouse/focus | Selected modes, coordinates and focus reports | Input fixtures and real TUI |
 | Synchronized output | Verified engine behavior, finite recovery timeout | Start/end/missing-end tests |
@@ -64,32 +64,30 @@ Mode-drive citations: DECCKM (`APP_CURSOR`) is `CSI ? 1 h/l` (pinned alacritty_t
 
 Modern kitty keyboard behavior is negotiated by the application, with a legacy default. Implement only the flags actually supported end to end; verify stack/query/pop handling, modifiers, repeat/release and associated text. The engine exposes flags, but frontend encoding remains separate [S11, S23]. The Alacritty frontend keyboard implementation is a useful Apache-licensed reference [S30, S35]; record the exact revision/notice if adapting code.
 
-### Kitty keyboard protocol (N21a, engine stack only)
+### Kitty keyboard protocol (M1.3, N21)
 
-Status 2026-10-15: the frontend encoder was removed and the protocol is not advertised. The engine stack below is not fed by the parser; real support would use alacritty_terminal's own kitty mode tracking and is a later feature.
+Status 2026-10-17: supported, all five flags. alacritty_terminal (with
+`Config::kitty_keyboard`) owns the per-screen mode stack (`CSI > u` push,
+`CSI < u` pop, `CSI = u` set, `CSI ? u` query reply, a separate stack for
+the alternate screen) and exposes the active flags as `TermMode` bits,
+which reach the window with the pane's modes. `nora::input::kitty`
+encodes each key event under them
+(<https://sw.kovidgoyal.net/kitty/keyboard-protocol/>); where the
+protocol keeps legacy bytes, the legacy encoder runs (DECCKM, keypad
+modes).
 
-The kitty keyboard protocol is negotiated by the application as a **push/pop mode stack** owned by the engine (`nora::engine::KittyKeyboardModes`, `KittyKeyboardFlags`). The default is **legacy mode** (protocol disabled, empty stack) — no kitty protocol until the application pushes a mode.
-
-| Area | v0.1 behavior | Status / proof |
+| Flag | Behavior | Proof |
 | --- | --- | --- |
-| Mode stack | `Engine::push_kitty_mode` / `pop_kitty_mode` push/pop flag sets; the stack is bounded to 10 levels (a push past the bound drops the oldest entry) | pass — `tests/kitty_keyboard.rs` |
-| Query | `Engine::kitty_mode` returns the top of the stack, or `KittyKeyboardFlags::NONE` when disabled | pass — `tests/kitty_keyboard.rs` |
-| Enable semantics | The first push enables the protocol; popping the last entry returns to legacy mode | pass — `tests/kitty_keyboard.rs` |
-| Flags | `DISAMBIGUATE`, `REPORT_EVENTS`, `SYSTEM`, `ALTERNATE`, `CURSOR_POS`, `UNICODE_NAME`, `UNICODE_VALUE`, `TEXT`, `LIST` (bits 0–8; `ALL` = bits 0–8 set) | pass — `tests/kitty_keyboard.rs` |
+| 1 disambiguate | Esc as `CSI 27u`; keys with Ctrl/Alt/Super as `CSI code;mods u` (unshifted codepoint); keypad keys as their own numbers (57399…); Enter/Tab/Backspace and functional keys keep legacy bytes when unmodified, `CSI 1;mods X` / `CSI n;mods ~` / `CSI code;mods u` when modified; F3 is `CSI 13~` | `tests/kitty_keyboard.rs`; e2e `kitty` (phase 1) |
+| 2 event types | `:2` repeat and `:3` release for keys sent as escape codes; a release is sent only for a key whose press reached the application with this flag on | `tests/kitty_keyboard.rs`; e2e `kitty` (phase 2) |
+| 4 alternate keys | `code:shifted:base` (base = the key on a US layout) | `tests/kitty_keyboard.rs` |
+| 8 all keys as escape codes | every key, text and Enter/Tab/Backspace included, as `CSI … u`; modifier keys reported (57441…) | `tests/kitty_keyboard.rs`; e2e `kitty` (phase 2) |
+| 16 associated text | with 8: the text's codepoints as a third field, not on release | `tests/kitty_keyboard.rs` |
+| Stack and query | push, pop, query reply, alternate-screen stack, legacy again after the last pop | `tests/kitty_keyboard.rs`; e2e `kitty` (phase 3) |
+| A real application | Neovim queries, enables the protocol, and tells Ctrl+I from Tab | e2e `nvim` |
 
-### Kitty keyboard protocol — frontend encoding (N21b)
-
-The window encodes each key press with the negotiated flags: the pump publishes the engine's live flags through `AppEvent::KittyModes` (the first tick always publishes, correcting the window's initial legacy `KittyKeyboardFlags::NONE`), and the window tries `nora::input::encode_kitty` before the legacy `encode` — when the protocol is disabled (`KittyKeyboardFlags::NONE`), `encode_kitty` returns `None` and the legacy encoding is the fallback. Local UI bindings (clipboard, zoom, search) are checked before both encoders.
-
-| Area | v0.1 behavior | Status / proof |
-| --- | --- | --- |
-| Byte format | key code (2 bytes, big-endian) + event type (1 byte, only when `REPORT_EVENTS`) + system modifiers (1 byte, only when `SYSTEM`) | pass — `tests/kitty_keyboard.rs` |
-| Key code | the winit `KeyCode` discriminant for `Code` physicals; 0 for `Unidentified` physicals (pinned winit 0.30.13 has no `Named` variant) | pass — `tests/kitty_keyboard.rs` |
-| Event type | 1 = down, 2 = repeat, 3 = up (the window filters to press events, so 3 is reserved for a future release event) | pass — `tests/kitty_keyboard.rs` |
-| System modifiers | shift = 1, ctrl = 2, alt = 4, super/logo = 8 (OR-combined) | pass — `tests/kitty_keyboard.rs` |
-| Fallback | `KittyKeyboardFlags::NONE` (legacy mode) → `encode_kitty` returns `None`, legacy `encode` applies | pass — `tests/kitty_keyboard.rs` |
-
-Deferred (negotiated and exposed, byte extensions are later slices): `ALTERNATE`, `CURSOR_POS`, `UNICODE_NAME` / `UNICODE_VALUE`, `TEXT` and `LIST` reporting [S11, S23].
+Not reported: lock modifiers (Caps/Num Lock state is not exposed by
+winit), Hyper and Meta.
 
 ## Paste
 

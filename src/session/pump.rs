@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use super::pty::{DRAIN_TIMEOUT, LaunchSpec, PtySession, SessionEvent};
-use crate::engine::{KittyKeyboardFlags, Snapshot};
+use crate::engine::Snapshot;
 use crate::input::paste::{PasteValidation, validate_paste};
 use crate::render::term::is_noop_damage;
 use crate::workspace::TabId;
@@ -153,12 +153,6 @@ pub enum AppEvent {
     /// The engine's live `TermMode` for the pane changed (N10b); the window
     /// updates that pane's `encode` mode source.
     Modes { pane: PaneKey, modes: TermMode },
-    /// The engine's live kitty keyboard flags for the pane changed (N21b);
-    /// the window updates that pane's `encode_kitty` flag source.
-    KittyModes {
-        pane: PaneKey,
-        flags: KittyKeyboardFlags,
-    },
     /// The selected text for the pane was copied (N14b); the window thread
     /// copies it to the clipboard (or debug-prints it for now).
     Copied { pane: PaneKey, text: String },
@@ -428,9 +422,6 @@ struct PanePump {
     /// The last published engine `TermMode` (N10b); `None` until the first
     /// tick, so the first tick always publishes.
     last_modes: Option<TermMode>,
-    /// The last published engine kitty keyboard flags (N21b); `None` until
-    /// the first tick, so the first tick always publishes.
-    last_kitty: Option<KittyKeyboardFlags>,
     /// Whether this pane's session has terminated and is draining (N12a).
     draining: bool,
     /// The drain deadline (N12a); `None` when not draining.
@@ -455,7 +446,6 @@ impl PanePump {
             pending_input: Vec::new(),
             paste_block: None,
             last_modes: None,
-            last_kitty: None,
             draining: false,
             drain_deadline: None,
             exit_status: None,
@@ -466,7 +456,7 @@ impl PanePump {
 }
 
 /// Tick one pane's session (N24b): run its N12a drain state machine, store +
-/// pulse a snapshot on non-noop damage, and publish its modes/kitty flags on
+/// pulse a snapshot on non-noop damage, and publish its modes on
 /// change. Returns `false` when the pane's session has been fully drained
 /// and closed (the caller removes it).
 /// Seconds since the Unix epoch (0 if the clock is before it).
@@ -720,18 +710,6 @@ fn tick_pane(
         let _ = events.send_event(AppEvent::Modes { pane, modes });
     }
 
-    // N21b: publish the engine's live kitty keyboard flags on change.
-    // `KittyKeyboardFlags` is `Copy`, so the engine guard is dropped
-    // before the channel send — never held across it.
-    let kitty_flags = pane_pump.session.engine().kitty_mode();
-    if pane_pump.last_kitty != Some(kitty_flags) {
-        pane_pump.last_kitty = Some(kitty_flags);
-        let _ = events.send_event(AppEvent::KittyModes {
-            pane,
-            flags: kitty_flags,
-        });
-    }
-
     true
 }
 
@@ -739,7 +717,7 @@ fn tick_pane(
 /// stopped.
 ///
 /// Each tick: (1) [`tick_pane`] for every pane — drain its events, store +
-/// pulse a snapshot on non-noop damage, publish its modes/kitty flags, and
+/// pulse a snapshot on non-noop damage, publish its modes, and
 /// run its N12a drain state machine; (2) remove fully-drained panes and
 /// send [`AppEvent::PaneGone`]; (3) drain [`PumpMsg`] commands, routing each
 /// to its pane's session (spawn a new session on [`PumpMsg::NewPane`], reap

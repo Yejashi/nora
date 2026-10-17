@@ -8,6 +8,7 @@
 
 pub mod bindings;
 pub mod focus;
+pub mod kitty;
 pub mod mouse;
 pub mod paste;
 

@@ -55,10 +55,11 @@ kill/yank, which a terminal that guesses from the screen gets wrong.
 - **Shell integration.** Jump to the previous prompt, select the last
   command's output, track the working directory, and Ctrl+click
   hyperlinks (OSC 8).
-- **Compatible.** xterm key and mouse encodings, bracketed paste, focus
-  events, true color, wide characters with per-glyph font fallback, and a
-  `nora` terminfo entry that is a subset of `xterm-256color`. vim, tmux
-  and htop are exercised in CI.
+- **Compatible.** xterm key and mouse encodings, the kitty keyboard
+  protocol (all five flags), bracketed paste, focus events, true color,
+  wide characters with per-glyph font fallback, and a `nora` terminfo
+  entry that is a subset of `xterm-256color`. vim, Neovim, tmux and htop
+  are exercised in CI.
 - **Live configuration.** One TOML file, validated, applied on save.
   Covers fonts, colors, cursor, scrollback and key bindings.
 - **Bounded and safe by default.** Size caps on control sequences and
@@ -277,7 +278,6 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   installers; work on them is deferred. See
   [docs/15-platforms.md](docs/15-platforms.md).
 - **Not supported yet:**
-  - the kitty keyboard protocol (programs get legacy xterm key encodings);
   - drawing images from the kitty graphics protocol (it is parsed, not
     displayed);
   - font ligatures.

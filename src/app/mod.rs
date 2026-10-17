@@ -31,9 +31,10 @@ use self::scene::Scene;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, create_clipboard};
-use nora::engine::{KittyKeyboardFlags, Snapshot};
+use nora::engine::Snapshot;
 use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
+use nora::input::kitty::{self, Kitty};
 use nora::input::mouse::{
     MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event,
     logical_to_cell, mouse_modifiers, should_report, track_button, wheel_directions,
@@ -536,6 +537,10 @@ struct WinApp {
     /// (key-to-suggestion, ADR-013), and whether one is waiting to show.
     trace_suggest_key_at: Option<std::time::Instant>,
     trace_suggest_pending: bool,
+    /// Keys whose press went to the application, each with whether kitty
+    /// event types were on then: only such a key's release is reported,
+    /// so the application never sees a release without its press.
+    sent_keys: std::collections::HashMap<winit::keyboard::PhysicalKey, bool>,
     trace_latency: bool,
     /// `NORA_TRACE_FRAMES`: log a per-phase timing line for every frame.
     trace_frames: bool,
@@ -551,11 +556,6 @@ struct WinApp {
     /// Initialized to `SHOW_CURSOR` to match N09b's hard-coded behavior; the
     /// first pump tick corrects it to the engine's live mode within ~10 ms.
     modes: TermMode,
-    /// Live kitty keyboard protocol flags (N21b): the flag source passed
-    /// to `encode_kitty`. Initialized to `NONE` (legacy) to match the
-    /// default; the first pump tick publishes the engine's live flags
-    /// within ~10 ms.
-    kitty_flags: KittyKeyboardFlags,
     fonts: Option<glyphs::Fonts>,
     graphics: Option<Graphics>,
     window: Option<Arc<Window>>,
@@ -634,9 +634,6 @@ struct WinApp {
     /// N24b: per-pane live terminal `TermMode` (N10b); the mode source
     /// passed to `encode` for that pane.
     pane_modes: std::collections::HashMap<PaneKey, TermMode>,
-    /// N24b: per-pane live kitty keyboard flags (N21b); the flag source
-    /// passed to `encode_kitty` for that pane.
-    pane_kitty: std::collections::HashMap<PaneKey, KittyKeyboardFlags>,
     /// N24b: per-pane selection drag start (N14b); each pane's selection is
     /// independent.
     pane_selection: std::collections::HashMap<PaneKey, Option<(usize, usize)>>,
@@ -697,8 +694,6 @@ pub fn run_windowed(
     pane_search.insert(first_pane, nora::search::SearchUi::new());
     let mut pane_modes = std::collections::HashMap::new();
     pane_modes.insert(first_pane, TermMode::SHOW_CURSOR);
-    let mut pane_kitty = std::collections::HashMap::new();
-    pane_kitty.insert(first_pane, KittyKeyboardFlags::NONE);
     let mut pane_selection = std::collections::HashMap::new();
     pane_selection.insert(first_pane, None);
     let mut pane_last_visible = std::collections::HashMap::new();
@@ -711,7 +706,6 @@ pub fn run_windowed(
         state: RenderState::default(),
         mods: ModifiersState::default(),
         modes: TermMode::SHOW_CURSOR,
-        kitty_flags: KittyKeyboardFlags::NONE,
         fonts: Some(fonts),
         graphics: None,
         window: Some(window),
@@ -742,6 +736,7 @@ pub fn run_windowed(
         trace_fresh_key_at: None,
         trace_suggest_key_at: None,
         trace_suggest_pending: false,
+        sent_keys: std::collections::HashMap::new(),
         trace_latency: std::env::var_os("NORA_TRACE_LATENCY").is_some(),
         trace_frames: std::env::var_os("NORA_TRACE_FRAMES").is_some(),
         search: nora::search::SearchUi::new(),
@@ -758,7 +753,6 @@ pub fn run_windowed(
         pane_ime,
         pane_search,
         pane_modes,
-        pane_kitty,
         pane_selection,
         pane_last_visible,
     };
@@ -813,7 +807,6 @@ impl WinApp {
         self.pane_ime.insert(pane, nora::ime::ImeState::new());
         self.pane_search.insert(pane, nora::search::SearchUi::new());
         self.pane_modes.insert(pane, TermMode::SHOW_CURSOR);
-        self.pane_kitty.insert(pane, KittyKeyboardFlags::NONE);
         self.pane_selection.insert(pane, None);
         self.pane_last_visible.insert(pane, Vec::new());
     }
@@ -832,7 +825,6 @@ impl WinApp {
         self.pane_ime.remove(&pane);
         self.pane_search.remove(&pane);
         self.pane_modes.remove(&pane);
-        self.pane_kitty.remove(&pane);
         self.pane_selection.remove(&pane);
         self.pane_last_visible.remove(&pane);
     }
@@ -852,7 +844,6 @@ impl WinApp {
             std::mem::replace(&mut self.search, nora::search::SearchUi::new()),
         );
         self.pane_modes.insert(pane, self.modes);
-        self.pane_kitty.insert(pane, self.kitty_flags);
         self.pane_selection.insert(pane, self.selection);
         self.pane_last_visible
             .insert(pane, std::mem::take(&mut self.last_visible));
@@ -889,10 +880,6 @@ impl WinApp {
             .pane_modes
             .remove(&pane)
             .unwrap_or(TermMode::SHOW_CURSOR);
-        self.kitty_flags = self
-            .pane_kitty
-            .remove(&pane)
-            .unwrap_or(KittyKeyboardFlags::NONE);
         self.selection = self.pane_selection.remove(&pane).unwrap_or(None);
         self.last_visible = self.pane_last_visible.remove(&pane).unwrap_or_default();
         self.show_title();
@@ -1126,7 +1113,6 @@ impl WinApp {
             self.ime = nora::ime::ImeState::new();
             self.search = nora::search::SearchUi::new();
             self.modes = TermMode::SHOW_CURSOR;
-            self.kitty_flags = KittyKeyboardFlags::NONE;
         }
     }
 
@@ -1320,6 +1306,29 @@ impl WinApp {
     /// its next word, as ordinary input: the shell's editor inserts it.
     /// `false` (the key goes to the application) when there is none to
     /// accept.
+    /// Encode a key event under the active kitty keyboard flags.
+    fn encode_kitty(&self, event: &winit::event::KeyEvent) -> Kitty {
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        let unshifted = event.key_without_modifiers();
+        let kind = match (event.state, event.repeat) {
+            (ElementState::Released, _) => kitty::KeyEventKind::Release,
+            (ElementState::Pressed, true) => kitty::KeyEventKind::Repeat,
+            (ElementState::Pressed, false) => kitty::KeyEventKind::Press,
+        };
+        kitty::encode(
+            &kitty::KeyEvent {
+                logical: &event.logical_key,
+                unshifted: &unshifted,
+                physical: event.physical_key,
+                location: event.location,
+                mods: self.mods,
+                kind,
+                text: event.text.as_deref(),
+            },
+            self.modes,
+        )
+    }
+
     fn accept_suggestion(&mut self, word: bool) -> bool {
         if self.search.visible || !self.ime.preedit().is_empty() {
             return false;
@@ -1551,15 +1560,6 @@ impl WinApp {
                         self.modes = modes;
                     } else {
                         self.pane_modes.insert(pane, modes);
-                    }
-                }
-            }
-            AppEvent::KittyModes { pane, flags } => {
-                if self.pane_is_live(&pane) {
-                    if self.active_pane_key() == Some(pane) {
-                        self.kitty_flags = flags;
-                    } else {
-                        self.pane_kitty.insert(pane, flags);
                     }
                 }
             }
@@ -2417,9 +2417,23 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 is_synthetic,
                 ..
             } => {
-                // N09b: act only on real presses; held-key focus-gain
-                // presses are synthetic duplicates.
-                if event.state != ElementState::Pressed || is_synthetic {
+                // N09b: held-key focus-gain presses are synthetic
+                // duplicates.
+                if is_synthetic {
+                    return;
+                }
+                // A release is reported only under the kitty protocol's
+                // event types, and only for a key whose press reached the
+                // application with them on (not one a local binding
+                // consumed, nor one pressed before the flags changed).
+                if event.state == ElementState::Released {
+                    if self.sent_keys.remove(&event.physical_key) == Some(true)
+                        && kitty::active(self.modes)
+                        && let Kitty::Send(bytes) = self.encode_kitty(&event)
+                        && let Some(pane) = self.active_pane_key()
+                    {
+                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                    }
                     return;
                 }
                 // A notice (config reload result) is dismissed by any key.
@@ -2494,17 +2508,35 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     window.request_redraw();
                     return;
                 }
-                if let Some(action) = encode(
-                    &event.logical_key,
-                    &event.physical_key,
-                    &self.mods,
-                    event.repeat,
-                    &BindingTable::default(),
-                    self.modes,
-                ) {
+                // Under the kitty keyboard protocol the key is encoded per
+                // its flags; where it keeps the legacy bytes, the legacy
+                // encoder below runs.
+                let kitty_bytes = if kitty::active(self.modes) {
+                    match self.encode_kitty(&event) {
+                        Kitty::Send(bytes) => Some(bytes),
+                        Kitty::Legacy => None,
+                        Kitty::Nothing => return,
+                    }
+                } else {
+                    None
+                };
+                let action = match kitty_bytes {
+                    Some(bytes) => Some(InputAction::Send(bytes)),
+                    None => encode(
+                        &event.logical_key,
+                        &event.physical_key,
+                        &self.mods,
+                        event.repeat,
+                        &BindingTable::default(),
+                        self.modes,
+                    ),
+                };
+                if let Some(action) = action {
                     match action {
                         InputAction::Send(bytes) => {
                             if let Some(pane) = self.active_pane_key() {
+                                let types = self.modes.contains(TermMode::REPORT_EVENT_TYPES);
+                                self.sent_keys.insert(event.physical_key, types);
                                 // The buffer is about to change: a stale
                                 // suggestion must not be accepted before
                                 // the shell reports the new one.

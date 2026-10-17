@@ -1,6 +1,6 @@
 # N21: Negotiated modern keyboard encoding
 
-Implementation status: not_started. This card is a plan, not evidence of completion.
+Implementation status: done 2026-10-17 (all five flags; alacritty_terminal keeps the stack, `src/input/kitty.rs` encodes; evidence: `tests/kitty_keyboard.rs`, e2e `kitty` and `nvim`). The earlier N21a/N21b stack and encoder were removed (audit F5).
 
 - Dependencies: N20.
 - Read: [06-compatibility.md](../06-compatibility.md), [12-sources.md](../12-sources.md); [agent workflow](../08-agent-workflow.md).

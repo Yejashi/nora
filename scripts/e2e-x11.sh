@@ -187,6 +187,52 @@ scenario_keys() {
     pass keys
 }
 
+# Kitty keyboard protocol (M1.3): a raw-mode child pushes flags, and real
+# key events arrive in the protocol's encoding; popping restores legacy.
+scenario_kitty() {
+    local dir="$OUT/kitty"; mkdir -p "$dir"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+stty raw -echo
+printf '\033[>1u'; echo 1 >"$dir/ready1"
+head -c 19 | od -An -tx1 >"$dir/bytes1.txt"
+printf '\033[>11u'; echo 2 >"$dir/ready2"
+head -c 14 | od -An -tx1 >"$dir/bytes2.txt"
+printf '\033[<u\033[<u'; echo 3 >"$dir/ready3"
+head -c 1 | od -An -tx1 >"$dir/bytes3.txt"
+stty sane
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch kitty "$dir/child.sh" || { fail kitty "no window"; return; }
+    # Each phase starts once the child set its flags and the window has
+    # them (the mode change reaches the window with the next frame).
+    phase() { wait_file "$dir/ready$1" || return 1; sleep 0.5; }
+    phase 1 || { finish; fail kitty "child did not start"; return; }
+    xdotool key ctrl+a Escape b ctrl+Up
+    phase 2 || { finish; fail kitty "phase 1 got too few bytes: $(cat "$dir/bytes1.txt" 2>/dev/null)"; return; }
+    xdotool key c
+    phase 3 || { finish; fail kitty "phase 2 got too few bytes"; return; }
+    xdotool key ctrl+a
+    wait_file "$dir/bytes3.txt"
+    finish
+    local got1 got2 got3
+    got1=$(tr -s ' \n' ' ' <"$dir/bytes1.txt" | sed 's/^ //; s/ $//')
+    got2=$(tr -s ' \n' ' ' <"$dir/bytes2.txt" | sed 's/^ //; s/ $//')
+    got3=$(tr -s ' \n' ' ' <"$dir/bytes3.txt" 2>/dev/null | sed 's/^ //; s/ $//')
+    echo "  disambiguate: $got1"
+    echo "  all keys + event types: $got2"
+    echo "  after pop: $got3"
+    # CSI 97;5u, CSI 27u, b, CSI 1;5A
+    [ "$got1" = "1b 5b 39 37 3b 35 75 1b 5b 32 37 75 62 1b 5b 31 3b 35 41" ] \
+        || { fail kitty "disambiguate bytes differ"; return; }
+    # CSI 99u (press), CSI 99;1:3u (release)
+    [ "$got2" = "1b 5b 39 39 75 1b 5b 39 39 3b 31 3a 33 75" ] \
+        || { fail kitty "all-keys bytes differ"; return; }
+    [ "$got3" = "01" ] || { fail kitty "legacy Ctrl+A after pop: $got3"; return; }
+    pass kitty
+}
+
 # Mouse: with SGR click reporting enabled (1000 + 1006), a click on a
 # known cell arrives as exact press/release reports.
 scenario_mouse() {
@@ -965,6 +1011,42 @@ RC
     pass ime
 }
 
+# Neovim with the kitty keyboard protocol: it queries `CSI ? u` and turns
+# the protocol on when answered. Ctrl+I and Tab are then distinct keys
+# (both are 0x09 in legacy mode), and Escape arrives as `CSI 27u`.
+scenario_nvim() {
+    have nvim nvim || return
+    # The protocol query arrived in Neovim 0.10.
+    local version
+    version=$(nvim --version | head -1 | sed -n 's/^NVIM v\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+    set -- $version
+    if [ "${1:-0}" -eq 0 ] && [ "${2:-0}" -lt 10 ]; then
+        echo "SKIP nvim: $(nvim --version | head -1) predates the kitty keyboard query"
+        return
+    fi
+    local dir="$OUT/nvim"; mkdir -p "$dir"
+    rm -f "$dir/out.txt"
+    launch nvim nvim --clean -c 'inoremap <C-i> [ci]' "$dir/out.txt" \
+        || { fail nvim "no window"; return; }
+    sleep 1
+    xdotool type --delay 50 "ia"
+    xdotool key ctrl+i
+    xdotool type --delay 50 "b"
+    xdotool key Tab
+    xdotool type --delay 50 "c"
+    xdotool key Escape
+    xdotool type --delay 50 ":wq"
+    xdotool key Return
+    wait_file "$dir/out.txt"
+    finish
+    local got
+    got=$(od -An -c "$dir/out.txt" 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //; s/ $//')
+    echo "  file: $got"
+    [ "$(cat "$dir/out.txt" 2>/dev/null)" = "$(printf 'a[ci]b\tc')" ] \
+        || { fail nvim "expected a[ci]b<Tab>c (Ctrl+I distinct from Tab)"; return; }
+    pass nvim
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -1004,7 +1086,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim tmux htop)
+ALL=(render tty resize keys kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim nvim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
