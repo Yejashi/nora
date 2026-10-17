@@ -608,9 +608,14 @@ impl GraphicsState {
         });
     }
 
-    /// `CSI 3 J`: delete the placements in the scrollback.
+    /// `CSI 3 J`: delete the placements in the scrollback. The alternate
+    /// screen has none, and its grid's scroll counters say nothing about
+    /// the main screen's placements, so there it deletes nothing.
     pub fn clear_scrollback(&mut self, at: &Cursor) {
         self.version += 1;
+        if at.alt {
+            return;
+        }
         self.placements.retain(|p| {
             p.is_virtual || p.alt || p.line_now(at.scrolled, at.pulled) + i64::from(p.rows) > 0
         });
@@ -636,7 +641,9 @@ impl GraphicsState {
 
     /// The placements visible in a viewport `display_offset` lines into
     /// the history, lowest z first; drops those scrolled out of a history
-    /// of `history` lines.
+    /// of `history` lines. The counters and the history are the screen's
+    /// that `alt` names: only that screen's placements are aged with them
+    /// (the other screen's grid scrolls on its own).
     pub fn visible(
         &mut self,
         scrolled: u64,
@@ -647,8 +654,11 @@ impl GraphicsState {
         alt: bool,
     ) -> Vec<VisibleImage> {
         let oldest = -(history as i64);
-        self.placements
-            .retain(|p| p.is_virtual || p.line_now(scrolled, pulled) + i64::from(p.rows) > oldest);
+        self.placements.retain(|p| {
+            p.is_virtual
+                || p.alt != alt
+                || p.line_now(scrolled, pulled) + i64::from(p.rows) > oldest
+        });
         let mut shown: Vec<(&Placement, i64)> = self
             .placements
             .iter()

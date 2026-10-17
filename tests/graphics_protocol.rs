@@ -99,6 +99,29 @@ fn clears_remove_placements_but_keep_images() {
     );
 }
 
+/// The alternate screen's grid scrolls on its own (as `less` does): its
+/// counters must not age, and so delete, the main screen's placements,
+/// nor may its `CSI 3 J` (it has no scrollback).
+#[test]
+fn alternate_screen_scrolling_keeps_the_main_screens_images() {
+    let mut e = engine();
+    e.feed(&apc(&format!("Ga=T,i=1,C=1,s=8,v=16;{}", zeros(8, 16))));
+    // Scrolled into the main screen's history, still within it.
+    e.feed(&b"\n".repeat(30));
+    e.feed(b"\x1b[?1049h");
+    e.feed(&b"\n".repeat(200));
+    assert!(e.snapshot().images.is_empty());
+    e.feed(b"\x1b[3J");
+    assert!(e.snapshot().images.is_empty());
+    e.feed(b"\x1b[?1049l");
+    e.scroll(alacritty_terminal::grid::Scroll::Delta(30));
+    assert_eq!(
+        e.snapshot().images.len(),
+        1,
+        "the main screen's image is still in its history"
+    );
+}
+
 #[test]
 fn the_alternate_screen_has_its_own_images() {
     let mut e = engine();
