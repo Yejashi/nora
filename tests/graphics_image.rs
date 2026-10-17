@@ -320,6 +320,54 @@ fn clears() {
     assert_eq!((g.image_count(), g.total_bytes()), (0, 0));
 }
 
+/// ADR-014 "Media reads": which commands read a file follows the
+/// chunking rules, a file loaded ahead gives the same result as one read
+/// in place, and a path sent in chunks is never read.
+#[test]
+fn file_media_are_loaded_ahead_and_never_chunked() {
+    use nora::graphics_image::{load_media, track_file_read};
+    let mut in_chunk = false;
+    assert!(track_file_read(
+        &cmd("a=t,t=f,s=1,v=1", b"/x"),
+        &mut in_chunk
+    ));
+    assert!(track_file_read(&cmd("a=q,t=s,i=3", b"/x"), &mut in_chunk));
+    assert!(!track_file_read(&cmd("a=p,t=f,i=1", b"/x"), &mut in_chunk));
+    assert!(!track_file_read(&cmd("t=f,i=1,I=2", b"/x"), &mut in_chunk));
+    assert!(!track_file_read(&cmd("a=t,i=1", b""), &mut in_chunk), "t=d");
+    assert!(!track_file_read(&cmd("t=f,m=1", b"/x"), &mut in_chunk));
+    assert!(in_chunk, "a first chunk starts a transfer");
+    assert!(!track_file_read(&cmd("t=f,m=1", b"/x"), &mut in_chunk));
+    assert!(!track_file_read(&cmd("t=f", b"/x"), &mut in_chunk));
+    assert!(!in_chunk, "the last chunk ends it");
+    assert!(!track_file_read(&cmd("m=1", b""), &mut in_chunk));
+    assert!(!track_file_read(&cmd("a=d", b""), &mut in_chunk));
+    assert!(!in_chunk, "a delete aborts it");
+
+    let dir = std::env::temp_dir().join(format!("nora-graphics-ahead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("image.rgba");
+    std::fs::write(&file, rgba(2, 2)).unwrap();
+    let path = file.to_string_lossy().into_owned();
+    let mut g = GraphicsState::new();
+    let command = cmd("a=t,t=f,s=2,v=2,i=1", path.as_bytes());
+    let media = load_media(&command);
+    std::fs::remove_file(&file).unwrap();
+    let out = g.handle_loaded(&command, &at(0, 0), Some(media));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=1;OK\x1b\\"));
+    assert_eq!(g.image(1).map(|i| (i.width, i.height)), Some((2, 2)));
+
+    std::fs::write(&file, rgba(2, 2)).unwrap();
+    let (head, tail) = path.split_at(path.len() / 2);
+    g.handle(&cmd("a=t,t=f,s=2,v=2,i=2,m=1", head.as_bytes()), &at(0, 0));
+    let out = g.handle(&cmd("m=0", tail.as_bytes()), &at(0, 0));
+    assert_eq!(
+        reply(&out).as_deref(),
+        Some("\x1b_Gi=2;EBADF:Failed to read image data\x1b\\")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn file_media() {
     let dir = std::env::temp_dir().join(format!("nora-graphics-{}", std::process::id()));

@@ -235,8 +235,21 @@ impl GraphicsState {
         self.version
     }
 
-    /// Handle one APC graphics command arriving with the cursor at `at`.
+    /// Handle one APC graphics command arriving with the cursor at `at`,
+    /// reading the file it names, if any, here.
     pub fn handle(&mut self, event: &GraphicsEvent, at: &Cursor) -> Outcome {
+        self.handle_loaded(event, at, None)
+    }
+
+    /// [`GraphicsState::handle`] with the file of a command for which
+    /// [`track_file_read`] said yes already read by [`load_media`] (off
+    /// the terminal lock, ADR-014 "Media reads"), so this reads no file.
+    pub fn handle_loaded(
+        &mut self,
+        event: &GraphicsEvent,
+        at: &Cursor,
+        media: Option<LoadedMedia>,
+    ) -> Outcome {
         if event.command != b'G' {
             return Outcome::default();
         }
@@ -258,17 +271,31 @@ impl GraphicsState {
             }
             let complete = self.chunk.take().expect("chunk in progress");
             let overflow = std::mem::take(&mut self.chunk_overflow);
-            return self.complete(&complete, at, overflow);
+            // File media are not chunked: a path sent in chunks is never
+            // read (it would be read here, under the terminal lock).
+            let media = is_file_medium(&complete).then_some(LoadedMedia(Err(EBADF)));
+            return self.complete(&complete, at, overflow, media);
         }
         if more {
             self.chunk = Some(event.clone());
             self.chunk_overflow = event.data.len() > MAX_TRANSFER_BYTES;
             return Outcome::default();
         }
-        self.complete(event, at, false)
+        self.complete(event, at, false, media)
     }
 
-    fn complete(&mut self, event: &GraphicsEvent, at: &Cursor, overflow: bool) -> Outcome {
+    /// A chunked transfer is in progress (the next command continues it).
+    pub fn in_chunk(&self) -> bool {
+        self.chunk.is_some()
+    }
+
+    fn complete(
+        &mut self,
+        event: &GraphicsEvent,
+        at: &Cursor,
+        overflow: bool,
+        media: Option<LoadedMedia>,
+    ) -> Outcome {
         self.version += 1;
         let keys = Keys(event);
         let action = keys.char("a", 't');
@@ -282,10 +309,10 @@ impl GraphicsState {
         } else {
             match action {
                 't' | 'T' | 'q' => {
-                    let decoded = if overflow {
-                        Err(Failure("EFBIG", "Image data too large"))
-                    } else {
-                        decode(&keys)
+                    let decoded = match media {
+                        _ if overflow => Err(Failure("EFBIG", "Image data too large")),
+                        Some(LoadedMedia(loaded)) => loaded,
+                        None => decode(&keys),
                     };
                     match (action, decoded) {
                         (_, Err(failure)) => Err(failure),
@@ -828,6 +855,57 @@ impl GraphicsState {
     }
 }
 
+/// A file-medium transmission (`t=f`, `t=t`, `t=s`) read and decoded by
+/// [`load_media`] before the terminal lock is taken (ADR-014, "Media
+/// reads"), for [`GraphicsState::handle_loaded`].
+#[derive(Debug)]
+pub struct LoadedMedia(Result<(u32, u32, Vec<u8>), Failure>);
+
+impl LoadedMedia {
+    /// The decoded bytes it holds.
+    pub fn bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |(_, _, pixels)| pixels.len())
+    }
+}
+
+fn is_file_medium(event: &GraphicsEvent) -> bool {
+    matches!(Keys(event).char("t", 'd'), 'f' | 't' | 's')
+}
+
+/// Follow a command through [`GraphicsState::handle`]'s chunking rules:
+/// `in_chunk` says whether a chunked transfer is in progress before the
+/// command and is updated past it. Returns whether handling the command
+/// reads a file (a transmit or query with a file medium, not part of a
+/// chunked transfer, that does not name both `i` and `I`).
+pub fn track_file_read(event: &GraphicsEvent, in_chunk: &mut bool) -> bool {
+    if event.command != b'G' {
+        return false;
+    }
+    let keys = Keys(event);
+    let more = event.get("m") == Some("1");
+    if keys.char("a", 't') == 'd' && *in_chunk && event.get("m").is_none() {
+        *in_chunk = false;
+    }
+    if *in_chunk {
+        *in_chunk = more;
+        return false;
+    }
+    if more {
+        *in_chunk = true;
+        return false;
+    }
+    matches!(keys.char("a", 't'), 't' | 'T' | 'q')
+        && is_file_medium(event)
+        && !(keys.u32("i") != 0 && keys.u32("I") != 0)
+}
+
+/// Read and decode the file a command names, with the replies, limits
+/// and deletions (`t=t`, `t=s`) of handling it in place. Runs without
+/// any lock: a slow filesystem (NFS, FUSE) then stalls only the reader.
+pub fn load_media(event: &GraphicsEvent) -> LoadedMedia {
+    LoadedMedia(decode(&Keys(event)))
+}
+
 /// Read, decompress and decode a transmission to RGBA.
 fn decode(keys: &Keys) -> Result<(u32, u32, Vec<u8>), Failure> {
     let medium = keys.char("t", 'd');
@@ -999,7 +1077,8 @@ fn read_shared_memory(keys: &Keys) -> Result<Vec<u8>, Failure> {
 /// Read `S` bytes at offset `O` (all after it when `S` is 0) of a regular
 /// file. The type is checked before opening, and the open does not block,
 /// so a FIFO (whose open waits for a writer) never stalls the reader
-/// thread, which holds the terminal lock here.
+/// thread (which reads files without the terminal lock, but in stream
+/// order: output after the command waits for the read).
 fn read_path(path: &std::path::Path, keys: &Keys) -> Result<Vec<u8>, Failure> {
     use std::os::unix::fs::OpenOptionsExt;
     if !std::fs::metadata(path).map_err(|_| EBADF)?.is_file() {

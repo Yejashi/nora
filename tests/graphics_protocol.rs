@@ -34,6 +34,30 @@ fn detection_reply_comes_before_the_device_attributes() {
     assert_eq!(replies[1], "\x1b[?62;22c");
 }
 
+/// `Engine::feed` loads files before it locks the terminal (ADR-014,
+/// "Media reads"); replies keep their order with the parser's.
+#[test]
+fn files_through_feed_keep_the_reply_order() {
+    use base64::Engine as _;
+    let dir = std::env::temp_dir().join(format!("nora-feed-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("pixels.rgba");
+    std::fs::write(&file, vec![0u8; 4]).unwrap();
+    let path = base64::engine::general_purpose::STANDARD.encode(file.to_string_lossy().as_bytes());
+    let mut e = engine();
+    let mut bytes = apc(&format!("Ga=q,t=f,s=1,v=1,i=4;{path}"));
+    bytes.extend_from_slice(b"\x1b[c");
+    bytes.extend_from_slice(&apc(&format!("Ga=t,t=f,s=1,v=1,i=5;{path}")));
+    e.feed(&bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let replies = e.replies();
+    assert_eq!(replies.len(), 3, "{replies:?}");
+    assert_eq!(replies[0], "\x1b_Gi=4;OK\x1b\\");
+    assert_eq!(replies[1], "\x1b[?62;22c");
+    assert_eq!(replies[2], "\x1b_Gi=5;OK\x1b\\");
+    assert!(e.graphics().image(5).is_some());
+}
+
 #[test]
 fn display_moves_the_cursor_past_the_image() {
     let mut e = engine();

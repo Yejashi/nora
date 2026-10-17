@@ -10,7 +10,10 @@
 //! shell events are recorded at the cursor's line, graphics commands are
 //! handled at the cursor, their replies are recorded in order with the
 //! parser's own, and the bytes it returns (a cursor movement after an
-//! image) are parsed right there.
+//! image) are parsed right there. A command that names a file is read
+//! without the terminal lock first (ADR-014, "Media reads"): by
+//! [`StreamFilter::process`] for `Engine::feed`, and through the event
+//! loop's `run_unlocked` hook on the PTY path.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -18,8 +21,10 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::event_loop::MarkerContext;
 
 use crate::engine::Recorder;
-use crate::graphics_filter::{GraphicsFilter, GraphicsSignal};
-use crate::graphics_image::{Cursor, GraphicsState};
+use crate::graphics_filter::{GraphicsEvent, GraphicsFilter, GraphicsSignal};
+use crate::graphics_image::{
+    Cursor, GraphicsState, LoadedMedia, MAX_IMAGE_BYTES, load_media, track_file_read,
+};
 use crate::prompt_marker::{
     HyperlinkAtLine, HyperlinkQueue, MarkerAtLine, MarkerQueue, PromptMarkerFilter, ShellEvent,
 };
@@ -40,7 +45,15 @@ pub struct StreamTargets {
 enum Pending {
     Shell(ShellEvent),
     Graphics(GraphicsSignal),
+    /// A graphics command that reads a file, with the file once loaded
+    /// off the terminal lock (ADR-014, "Media reads").
+    Media(GraphicsEvent, Option<LoadedMedia>),
 }
+
+/// Files [`StreamFilter::process`] loads ahead for `Engine::feed` (which
+/// calls it before locking the terminal); past this many decoded bytes
+/// in one chunk, the rest are loaded as they are handled.
+const PRELOAD_BYTES: usize = MAX_IMAGE_BYTES;
 
 /// The prompt-marker and graphics filters with the state they feed.
 pub struct StreamFilter {
@@ -65,8 +78,46 @@ impl StreamFilter {
     }
 
     /// Filter a chunk: the bytes to parse and the positions at which
-    /// [`StreamFilter::on_marker`] must be called.
+    /// [`StreamFilter::on_marker`] must be called. Files named by graphics
+    /// commands are read here, up to [`PRELOAD_BYTES`]: the caller
+    /// (`Engine::feed`) has not locked the terminal yet.
     pub fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        let filtered = self.filter(bytes);
+        let mut loaded = 0;
+        for index in 0..self.pending.len() {
+            if loaded >= PRELOAD_BYTES {
+                break;
+            }
+            loaded += self.load_media(index);
+        }
+        filtered
+    }
+
+    /// Whether the next reported position is a command whose file is not
+    /// loaded yet.
+    fn next_needs_file(&self) -> bool {
+        matches!(
+            self.pending.get(self.pending_index),
+            Some(Pending::Media(_, None))
+        )
+    }
+
+    /// Load the file of the pending command at `index`, if it is one that
+    /// is not loaded yet; returns the decoded bytes now held for it.
+    fn load_media(&mut self, index: usize) -> usize {
+        match self.pending.get_mut(index) {
+            Some(Pending::Media(event, media @ None)) => {
+                let loaded = load_media(event);
+                let bytes = loaded.bytes();
+                *media = Some(loaded);
+                bytes
+            }
+            _ => 0,
+        }
+    }
+
+    /// The filters over a chunk, without reading files.
+    fn filter(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
         let (forward, shell) = self.markers.process(bytes);
         let (_, graphics) = self.graphics.process(&forward);
         self.pending.clear();
@@ -76,17 +127,36 @@ impl StreamFilter {
             self.pending = shell.into_iter().map(|(_, e)| Pending::Shell(e)).collect();
             return (forward, positions);
         }
+        // Which commands read a file follows from the chunking state the
+        // graphics state will have at each (every earlier command has been
+        // handled; this batch's are followed in order).
+        let mut in_chunk = self
+            .targets
+            .graphics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_chunk();
+        let graphics = graphics.into_iter().map(|(pos, signal)| {
+            let pending = match signal {
+                GraphicsSignal::Command(event) if track_file_read(&event, &mut in_chunk) => {
+                    Pending::Media(event, None)
+                }
+                GraphicsSignal::Command(event) => Pending::Graphics(GraphicsSignal::Command(event)),
+                GraphicsSignal::Reset => {
+                    in_chunk = false;
+                    Pending::Graphics(GraphicsSignal::Reset)
+                }
+                other => Pending::Graphics(other),
+            };
+            (pos, pending)
+        });
         // Merge by position. A shell event at offset p is a removed frame
         // that sat just before byte p, and a graphics command at p ended at
         // p, so at the same offset the graphics command came first.
         let mut merged: Vec<(usize, Pending)> = shell
             .into_iter()
             .map(|(pos, e)| (pos, Pending::Shell(e)))
-            .chain(
-                graphics
-                    .into_iter()
-                    .map(|(pos, s)| (pos, Pending::Graphics(s))),
-            )
+            .chain(graphics)
             .collect();
         merged.sort_by_key(|(pos, event)| (*pos, matches!(event, Pending::Shell(_))));
         let positions = merged.iter().map(|(pos, _)| *pos).collect();
@@ -107,7 +177,19 @@ impl StreamFilter {
             }
             Pending::Graphics(signal) => {
                 let signal = std::mem::replace(signal, GraphicsSignal::Reset);
-                self.graphics_signal(signal, context)
+                self.graphics_signal(signal, None, context)
+            }
+            Pending::Media(event, media) => {
+                // Loaded off the lock by both callers (`process` up to its
+                // budget, the event loop through `run_unlocked`); past the
+                // preload budget of `Engine::feed` it is loaded here.
+                let event = GraphicsEvent {
+                    command: event.command,
+                    keys: std::mem::take(&mut event.keys),
+                    data: std::mem::take(&mut event.data),
+                };
+                let media = media.take().unwrap_or_else(|| load_media(&event));
+                self.graphics_signal(GraphicsSignal::Command(event), Some(media), context)
             }
         }
     }
@@ -156,7 +238,12 @@ impl StreamFilter {
         }
     }
 
-    fn graphics_signal(&mut self, signal: GraphicsSignal, at: &MarkerContext) -> Option<Vec<u8>> {
+    fn graphics_signal(
+        &mut self,
+        signal: GraphicsSignal,
+        media: Option<LoadedMedia>,
+        at: &MarkerContext,
+    ) -> Option<Vec<u8>> {
         let mut state = self
             .targets
             .graphics
@@ -176,7 +263,7 @@ impl StreamFilter {
         };
         match signal {
             GraphicsSignal::Command(event) => {
-                let outcome = state.handle(&event, &cursor);
+                let outcome = state.handle_loaded(&event, &cursor, media);
                 drop(state);
                 if let Some(reply) = outcome.reply {
                     let reply = String::from_utf8_lossy(&reply).into_owned();
@@ -220,12 +307,23 @@ fn cursor_movement(columns: u32, rows: u32, at: &MarkerContext) -> Vec<u8> {
     out
 }
 
+/// The PTY reader's hooks. `process` runs with the terminal locked, so it
+/// reads no file; the event loop calls `run_unlocked` with the lock (and
+/// its lease) released before a position whose command names one.
 impl alacritty_terminal::event_loop::Filter for StreamFilter {
     fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
-        StreamFilter::process(self, bytes)
+        self.filter(bytes)
     }
 
     fn on_marker(&mut self, _position: usize, context: &MarkerContext) -> Option<Vec<u8>> {
         StreamFilter::on_marker(self, context)
+    }
+
+    fn needs_unlocked(&self) -> bool {
+        self.next_needs_file()
+    }
+
+    fn run_unlocked(&mut self) {
+        self.load_media(self.pending_index);
     }
 }

@@ -76,6 +76,17 @@ pub trait Filter {
     fn on_marker(&mut self, _position: usize, _context: &MarkerContext) -> Option<Vec<u8>> {
         None
     }
+
+    /// nora: whether the event at the next reported position needs work
+    /// that must not run with the terminal locked (a kitty graphics file
+    /// read, ADR-014 "Media reads"). Asked before each `on_marker`.
+    fn needs_unlocked(&self) -> bool {
+        false
+    }
+
+    /// nora: do that work. The event loop calls it with the terminal lock
+    /// and its lease released, then locks again for `on_marker`.
+    fn run_unlocked(&mut self) {}
 }
 
 /// The terminal at a position a [`Filter`] reported.
@@ -258,7 +269,7 @@ where
         let mut deferred_err: Option<io::Error> = None;
 
         // Reserve the next terminal lock for PTY reading.
-        let _terminal_lease = Some(self.terminal.lease());
+        let mut _terminal_lease = Some(self.terminal.lease());
         let mut terminal = None;
 
         loop {
@@ -286,17 +297,16 @@ where
             }
 
             // Attempt to lock the terminal.
-            let terminal = match &mut terminal {
-                Some(terminal) => terminal,
-                None => terminal.insert(match self.terminal.try_lock_unfair() {
+            if terminal.is_none() {
+                terminal = Some(match self.terminal.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
                     None if unprocessed >= READ_BUFFER_SIZE || deferred_err.is_some() => {
                         self.terminal.lock_unfair()
                     },
                     None => continue,
                     Some(terminal) => terminal,
-                }),
-            };
+                });
+            }
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
@@ -320,13 +330,30 @@ where
             // no-ops, so the cursor line after each marker's segment is
             // the marker's own line. Report it to the filter.
             if marker_positions.is_empty() {
-                state.parser.advance(&mut **terminal, &to_parse);
+                let locked = terminal.as_mut().expect("terminal locked above");
+                state.parser.advance(&mut **locked, &to_parse);
             } else {
                 let mut pos = 0;
                 for &mpos in &marker_positions {
-                    state.parser.advance(&mut **terminal, &to_parse[pos..mpos]);
+                    let locked = terminal.as_mut().expect("terminal locked");
+                    state.parser.advance(&mut **locked, &to_parse[pos..mpos]);
+                    // nora: work the filter must not do under the lock (a
+                    // kitty graphics file read, ADR-014 "Media reads") runs
+                    // with the lock and the lease released, so a slow
+                    // filesystem stalls only this thread. The parser keeps
+                    // its state; the rest of the bytes are parsed after.
+                    if self.filter.as_ref().is_some_and(|filter| filter.needs_unlocked()) {
+                        drop(terminal.take());
+                        drop(_terminal_lease.take());
+                        if let Some(filter) = self.filter.as_mut() {
+                            filter.run_unlocked();
+                        }
+                        _terminal_lease = Some(self.terminal.lease());
+                        terminal = Some(self.terminal.lock_unfair());
+                    }
+                    let locked = terminal.as_mut().expect("terminal locked");
                     let filter = &mut self.filter;
-                    at_marker_position(&mut state.parser, &mut **terminal, |parser, term| {
+                    at_marker_position(&mut state.parser, &mut **locked, |parser, term| {
                         let context = MarkerContext::of(term);
                         if let Some(filter) = filter.as_mut()
                             && let Some(inject) = filter.on_marker(mpos, &context)
@@ -336,7 +363,8 @@ where
                     });
                     pos = mpos;
                 }
-                state.parser.advance(&mut **terminal, &to_parse[pos..]);
+                let locked = terminal.as_mut().expect("terminal locked");
+                state.parser.advance(&mut **locked, &to_parse[pos..]);
             }
 
             processed += unprocessed;

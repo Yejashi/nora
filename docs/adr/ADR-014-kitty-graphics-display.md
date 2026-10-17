@@ -55,6 +55,22 @@ A conforming display needs, from the spec
   (keyed by id and upload generation), drops unused ones, and draws
   textured quads in three bands: z below −1 073 741 824 under cell
   backgrounds, other negative z under the text, z ≥ 0 over it.
+- **Media reads.** A command with a file medium (`t=f`, `t=t`, `t=s`) is
+  read and decoded without the terminal lock: a file on a hung NFS or
+  sshfs mount would otherwise freeze the window. The PTY filter runs
+  under the lock, so it only marks such a command (following the
+  chunking state, so a chunk continuation is never read); the vendored
+  loop asks `Filter::needs_unlocked` before each reported position and,
+  when it says yes, releases the lock and its lease, calls
+  `Filter::run_unlocked` (the read, decode and the `t=t`/`t=s`
+  deletions), and locks again for `on_marker`, which handles the
+  command with the loaded result. The parser keeps its state across the
+  gap, so the bytes are still parsed in order and replies keep their
+  place. `Engine::feed` runs the filter before it locks, so it loads
+  files there (up to 64 MiB decoded per chunk; past that, in place). A
+  path sent in chunks (`m=1`) is answered `EBADF` and never read.
+  Rejected: refusing network and FUSE filesystems by `fstatfs` magic
+  (a local disk can also stall, and it blocks legitimate use).
 - **Dependencies.** `png` (0.18.1) and `flate2` (1.1.10) become direct
   dependencies; both are already in the lock through `arboard`, so no new
   crate is compiled.
@@ -89,6 +105,8 @@ animation (`a=f`, `a=a`, `a=c`), relative placements (`P,Q,H,V`).
 
 - The reader thread decodes PNG and inflates zlib for images it receives;
   this is bounded by the per-image and total byte budgets and is in stream
-  order anyway (the parser waits for it, as for any output).
+  order anyway (the parser waits for it, as for any output). Files are
+  read and decoded off the terminal lock (Media reads); direct data is
+  still decoded under it.
 - The renderer gains a texture pipeline and a per-image texture budget.
 - The old `GraphicsHandler` tests are replaced by protocol tests.
