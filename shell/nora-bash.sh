@@ -9,47 +9,85 @@
 #   D — output end (after the output, before the next prompt)
 #
 # Safe to source in a normal bash session: it only appends to
-# PROMPT_COMMAND and installs a DEBUG trap, and it does not source
-# anything else. Sourcing it twice in the same shell is a no-op.
+# PROMPT_COMMAND and, at the first prompt, adds to the DEBUG trap (a DEBUG
+# trap set before that keeps running first), and it does not source
+# anything else. Sourcing it twice in the same shell is a no-op; it does
+# nothing in a non-interactive shell.
+#
+# Keep `__nora_prompt_start` the last PROMPT_COMMAND entry (hooks such as
+# direnv, zoxide and starship prepend themselves, which is fine): the first
+# command after it is taken as the user's command.
+
+[[ $- == *i* ]] || return 0
+[[ -n ${__nora_bash_loaded-} ]] && return 0
+__nora_bash_loaded=1
 
 # Emit an OSC 133 marker: `ESC ] 133 ; <kind> ST`.
 __nora_osc133() {
     printf '\033]133;%s\033\\' "$1"
 }
 
+# Set once a prompt is drawn, cleared by the first command after it.
+__nora_at_prompt=
+
 # Runs before each prompt is drawn (via PROMPT_COMMAND).
 # Closes the previous command's output (D) and opens the new prompt (A).
+# Until the DEBUG trap is installed, `$1` is the `trap -p DEBUG` output
+# taken by the PROMPT_COMMAND entry itself (a function cannot see it).
 __nora_prompt_start() {
+    [[ -n ${__nora_debug_installed-} ]] || __nora_install_debug_trap "$1"
     __nora_osc133 D
     __nora_osc133 A
+    __nora_at_prompt=1
 }
 
-# Runs before each command executes (via the DEBUG trap).
-# Marks the command start (B) and the output start (C).
+# Runs before each simple command (via the DEBUG trap); `$1` is the
+# status to return (the chained DEBUG trap's, so `extdebug` users keep
+# its verdict).
 #
-# bash fires the DEBUG trap for every simple command, including the
-# commands that make up PROMPT_COMMAND itself. Those are not user
-# commands, so skip any command whose text appears in PROMPT_COMMAND;
-# otherwise a spurious B/C pair lands on the prompt line between D and A,
-# and the engine's C-to-D previous-command selection (N35c) would select
-# the prompt line instead of the command.
+# Marks the command start (B) and the output start (C) once per command
+# line: only the first command after a prompt counts, so loops and
+# pipelines do not repeat the pair mid-output, and the PROMPT_COMMAND
+# entries that run before `__nora_prompt_start` (also traced) emit
+# nothing. Completion functions and `bind -x` widgets run while editing
+# and are skipped.
 __nora_command_start() {
-    case "$PROMPT_COMMAND" in
-        *"$BASH_COMMAND"*) return ;;
+    if [[ -n $__nora_at_prompt && -z ${COMP_LINE-} && -z ${READLINE_POINT+set} ]]; then
+        __nora_at_prompt=
+        __nora_osc133 B
+        __nora_osc133 C
+    fi
+    return "${1:-0}"
+}
+
+# Set __nora_prev_debug to the command text in `trap -p DEBUG` output
+# `$1` (`trap -- '<text>' DEBUG`, quoted for reuse), or nothing.
+__nora_trap_text() {
+    __nora_prev_debug=
+    [[ -n $1 ]] || return 0
+    eval "set -- $1"
+    __nora_prev_debug=${3-}
+}
+
+# Chain onto the DEBUG trap `$1` (`trap -p DEBUG` output) instead of
+# replacing it: it runs first (it sees the command's `$_` and `$?`), then
+# ours. Done at the first prompt with the trap read at the top level:
+# without `set -T`, both a sourced file and a function see no DEBUG trap.
+__nora_install_debug_trap() {
+    __nora_debug_installed=1
+    __nora_trap_text "$1"
+    case "$__nora_prev_debug" in
+        *__nora_command_start*) ;;
+        '') trap '__nora_command_start' DEBUG ;;
+        *) trap "$__nora_prev_debug"$'\n''__nora_command_start "$?"' DEBUG ;;
     esac
-    __nora_osc133 B
-    __nora_osc133 C
+    unset __nora_prev_debug
 }
 
 # Append our hook to the existing PROMPT_COMMAND (preserving any the user
-# already set). Guard against double-install.
+# already set). The trap is read only while not yet installed (one
+# command substitution, at the first prompt).
 case "${PROMPT_COMMAND:-}" in
     *__nora_prompt_start*) ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__nora_prompt_start" ;;
-esac
-
-# Install the DEBUG trap (guard against double-install).
-case "$(trap -p DEBUG)" in
-    *__nora_command_start*) ;;
-    *) trap '__nora_command_start' DEBUG ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }"'__nora_prompt_start "${__nora_debug_installed:-$(trap -p DEBUG)}"' ;;
 esac

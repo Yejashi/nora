@@ -1462,6 +1462,100 @@ fn pty_bash_shell_integration_marker_order() {
     let _ = std::fs::remove_file(&rc);
 }
 
+/// `shell/nora-bash.sh` emits one `B C` pair per command line: a loop
+/// piped into another command (many simple commands) gets one pair; a
+/// user command whose text also appears in PROMPT_COMMAND (`history -a`)
+/// still gets its pair; and a DEBUG trap installed before the script
+/// keeps running (chained, not replaced).
+#[test]
+fn pty_bash_one_marker_pair_per_command_line() {
+    let script = std::env::current_dir()
+        .expect("test CWD is the package root")
+        .join("shell/nora-bash.sh");
+    let rc = std::env::temp_dir().join(format!("nora-bash-rc-pairs-{}", std::process::id()));
+    std::fs::write(
+        &rc,
+        format!(
+            "PROMPT_COMMAND='history -a'\n\
+             trap 'prev_count=$((prev_count + 1))' DEBUG\n\
+             source {}\n",
+            script.display()
+        ),
+    )
+    .expect("write the rcfile");
+    let bash = [
+        "/run/current-system/sw/bin/bash",
+        "/usr/bin/bash",
+        "/bin/bash",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).exists())
+    .unwrap_or("bash")
+    .to_string();
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: bash,
+            args: vec![
+                "--rcfile".to_string(),
+                rc.to_string_lossy().into_owned(),
+                "-i".to_string(),
+            ],
+            cwd: None,
+            // No user history file is touched by `history -a`.
+            env: vec![("HISTFILE".to_string(), "/dev/null".to_string())],
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("bash spawns over a real PTY");
+    pump(&mut session, |text, _events| !text.trim().is_empty()).expect("first prompt");
+
+    // Each command with the text its output adds and how often that text
+    // is on screen once it ran (the echoed command line may contain it).
+    for (line, done, count) in [
+        (
+            &b"for i in 1 2 3; do echo loop-$i; done | cat\n"[..],
+            "loop-3",
+            1,
+        ),
+        (&b"history -a\n"[..], "", 0),
+        (
+            &b"prev_count=0; [ \"${prev_count:-0}\" -gt 0 ] && echo PREV-TRAP-OK\n"[..],
+            "PREV-TRAP-OK",
+            2,
+        ),
+    ] {
+        session.feed(line).expect("feed a command");
+        session.flush(256).expect("flush the command to bash");
+        if count > 0 {
+            pump(&mut session, |text, _events| {
+                text.matches(done).count() >= count
+            })
+            .unwrap_or_else(|error| panic!("{done}: {error}"));
+        }
+    }
+    session.feed(b"exit\n").expect("feed exit");
+    session.flush(256).expect("flush exit to bash");
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("bash exits cleanly within the deadline");
+
+    let kinds: Vec<MarkerKind> = session
+        .engine()
+        .drain_markers()
+        .iter()
+        .map(|marker| marker.event.kind)
+        .collect();
+    use MarkerKind::{A, B, C, D};
+    assert_eq!(
+        kinds,
+        vec![D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C],
+        "one D A per prompt and one B C per command line; got {kinds:?}"
+    );
+    session.close();
+    let _ = std::fs::remove_file(&rc);
+}
+
 /// Audit P4: input to a child that never reads stdin stays bounded end to
 /// end: the session writer holds at most its budget and at most
 /// `MAX_IN_FLIGHT` bytes sit between nora and the PTY, however much is
