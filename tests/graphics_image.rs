@@ -511,3 +511,22 @@ fn clients_never_address_internal_images() {
         Some(format!("\x1b_Gi={id};OK\x1b\\"))
     );
 }
+
+/// File media with an offset (`O`) and size (`S`): the image is read from
+/// the middle of the file (the reader seeks there).
+#[test]
+fn file_offset_and_size() {
+    let dir = std::env::temp_dir().join(format!("nora-graphics-offset-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("packed");
+    let mut bytes = b"junk-junk".to_vec();
+    bytes.extend_from_slice(&rgba(2, 1));
+    bytes.extend_from_slice(b"trailing");
+    std::fs::write(&file, &bytes).unwrap();
+    let mut g = GraphicsState::new();
+    let keys = format!("a=t,t=f,s=2,v=1,i=1,O=9,S={}", rgba(2, 1).len());
+    let out = g.handle(&cmd(&keys, file.to_string_lossy().as_bytes()), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=1;OK\x1b\\"));
+    assert_eq!(&*g.image(1).unwrap().pixels, rgba(2, 1).as_slice());
+    let _ = std::fs::remove_dir_all(&dir);
+}

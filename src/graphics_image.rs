@@ -950,9 +950,11 @@ fn read_path(path: &std::path::Path, keys: &Keys) -> Result<Vec<u8>, Failure> {
         return Err(EBADF);
     }
     let mut data = Vec::with_capacity(size as usize);
-    let mut reader = std::io::BufReader::new(file);
-    std::io::copy(&mut (&mut reader).take(offset), &mut std::io::sink()).map_err(|_| EBADF)?;
-    reader
+    // Seek to the offset: reading up to it would read (and drop) up to
+    // 4 GiB here, on the reader thread.
+    let mut file = file;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).map_err(|_| EBADF)?;
+    std::io::BufReader::new(file)
         .take(size)
         .read_to_end(&mut data)
         .map_err(|_| EBADF)?;
