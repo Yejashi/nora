@@ -115,8 +115,11 @@ impl GraphicsQueue {
 enum FilterState {
     /// Ground state: no APC in progress.
     Pass,
-    /// Saw an ESC; the next byte may be `_` (start of APC).
+    /// Saw an ESC; the next byte may be `_` (start of APC), `[` (CSI) or
+    /// `c` (RIS).
     SawEsc,
+    /// Inside a CSI sequence, watching for `CSI 2 J` / `CSI 3 J`.
+    Csi,
     /// Inside an APC payload; accumulating bytes.
     Apc,
     /// Saw an ESC inside an APC; the next byte may be `\` (ST terminator).
@@ -128,8 +131,21 @@ enum FilterState {
 /// the buffer never grows past the cap (audit P3).
 pub const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
 
-/// A byte-level state machine that extracts graphics APCs in parallel with
-/// the vte parser.
+/// What the filter found in the stream, for the graphics state (ADR-014).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphicsSignal {
+    /// A kitty graphics command.
+    Command(GraphicsEvent),
+    /// `CSI 2 J`: the screen was erased.
+    ClearScreen,
+    /// `CSI 3 J`: the scrollback was erased.
+    ClearScrollback,
+    /// `ESC c`: the terminal was reset.
+    Reset,
+}
+
+/// A byte-level state machine that extracts graphics APCs (and the
+/// screen clears that remove images) in parallel with the vte parser.
 #[derive(Debug, Clone)]
 pub struct GraphicsFilter {
     state: FilterState,
@@ -137,6 +153,8 @@ pub struct GraphicsFilter {
     /// The current APC outgrew [`MAX_APC_BYTES`]; it is ignored at its
     /// terminator.
     overflow: bool,
+    /// The CSI parameter bytes so far (a few are enough for `2J`/`3J`).
+    csi: Vec<u8>,
 }
 
 impl GraphicsFilter {
@@ -146,6 +164,7 @@ impl GraphicsFilter {
             state: FilterState::Pass,
             buffer: Vec::new(),
             overflow: false,
+            csi: Vec::new(),
         }
     }
 
@@ -163,13 +182,28 @@ impl GraphicsFilter {
         }
     }
 
+    /// The APC just terminated: its graphics command, if it is one.
+    fn finish_apc(&mut self) -> Option<GraphicsSignal> {
+        let overflow = std::mem::take(&mut self.overflow);
+        let event = (!overflow)
+            .then(|| parse_payload(&self.buffer))
+            .flatten()
+            // Only 'G' is the graphics protocol; other APC commands (e.g.
+            // titles) are not graphics events.
+            .filter(|event| event.command == b'G');
+        self.buffer.clear();
+        self.state = FilterState::Pass;
+        event.map(GraphicsSignal::Command)
+    }
+
     /// Process a chunk of bytes.
     ///
-    /// Returns `(bytes_to_forward, events)`. `bytes_to_forward` is the input
-    /// slice (all bytes, no transformation). `events` is the list of
-    /// [`GraphicsEvent`]s extracted from this chunk.
-    pub fn process<'a>(&mut self, bytes: &'a [u8]) -> (&'a [u8], Vec<GraphicsEvent>) {
-        let mut events = Vec::new();
+    /// Returns `(bytes_to_forward, signals)`. `bytes_to_forward` is the
+    /// input slice (all bytes, no transformation). Each signal comes with
+    /// the offset just past the sequence that produced it, so the caller
+    /// can act on it at that point of the stream.
+    pub fn process<'a>(&mut self, bytes: &'a [u8]) -> (&'a [u8], Vec<(usize, GraphicsSignal)>) {
+        let mut signals = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
             // Fast path: skip plain text to the next ESC.
@@ -187,29 +221,51 @@ impl GraphicsFilter {
                         self.state = FilterState::SawEsc;
                     }
                 }
-                FilterState::SawEsc => {
-                    if byte == 0x5F {
+                FilterState::SawEsc => match byte {
+                    0x5F => {
                         self.state = FilterState::Apc;
                         self.buffer.clear();
-                    } else {
+                    }
+                    b'[' => {
+                        self.state = FilterState::Csi;
+                        self.csi.clear();
+                    }
+                    b'c' => {
+                        signals.push((i, GraphicsSignal::Reset));
                         self.state = FilterState::Pass;
                     }
-                }
+                    0x1B => {}
+                    _ => self.state = FilterState::Pass,
+                },
+                FilterState::Csi => match byte {
+                    0x30..=0x3F => {
+                        if self.csi.len() < 8 {
+                            self.csi.push(byte);
+                        }
+                    }
+                    0x20..=0x2F => self.csi.push(b' '),
+                    0x40..=0x7E => {
+                        if byte == b'J' {
+                            match self.csi.as_slice() {
+                                b"2" => signals.push((i, GraphicsSignal::ClearScreen)),
+                                b"3" => signals.push((i, GraphicsSignal::ClearScrollback)),
+                                _ => {}
+                            }
+                        }
+                        self.state = FilterState::Pass;
+                    }
+                    0x1B => self.state = FilterState::SawEsc,
+                    // C0 controls execute inside a CSI without ending it.
+                    0x00..=0x1F => {}
+                    _ => self.state = FilterState::Pass,
+                },
                 FilterState::Apc => {
                     if byte == 0x1B {
                         self.state = FilterState::ApcEsc;
                     } else if byte == 0x9C {
-                        if !std::mem::take(&mut self.overflow)
-                            && let Some(event) = parse_payload(&self.buffer)
-                        {
-                            // Only 'G' is the graphics protocol; other APC
-                            // commands (e.g. titles) are not graphics events.
-                            if event.command == b'G' {
-                                events.push(event);
-                            }
+                        if let Some(signal) = self.finish_apc() {
+                            signals.push((i, signal));
                         }
-                        self.buffer.clear();
-                        self.state = FilterState::Pass;
                     } else if byte == 0x18 || byte == 0x1A {
                         self.buffer.clear();
                         self.overflow = false;
@@ -220,17 +276,9 @@ impl GraphicsFilter {
                 }
                 FilterState::ApcEsc => {
                     if byte == 0x5C {
-                        if !std::mem::take(&mut self.overflow)
-                            && let Some(event) = parse_payload(&self.buffer)
-                        {
-                            // Only 'G' is the graphics protocol; other APC
-                            // commands (e.g. titles) are not graphics events.
-                            if event.command == b'G' {
-                                events.push(event);
-                            }
+                        if let Some(signal) = self.finish_apc() {
+                            signals.push((i, signal));
                         }
-                        self.buffer.clear();
-                        self.state = FilterState::Pass;
                     } else {
                         self.hold(&[0x1B, byte]);
                         self.state = FilterState::Apc;
@@ -238,7 +286,7 @@ impl GraphicsFilter {
                 }
             }
         }
-        (bytes, events)
+        (bytes, signals)
     }
 }
 

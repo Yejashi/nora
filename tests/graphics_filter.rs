@@ -6,7 +6,15 @@
 //! ADR-011) in parallel with the vte parser without breaking ordinary
 //! terminal text.
 
-use nora::graphics_filter::{GraphicsEvent, GraphicsFilter, GraphicsQueue};
+use nora::graphics_filter::{GraphicsEvent, GraphicsFilter, GraphicsQueue, GraphicsSignal};
+
+/// The command of a filter signal.
+fn command(signal: &(usize, GraphicsSignal)) -> &GraphicsEvent {
+    match &signal.1 {
+        GraphicsSignal::Command(event) => event,
+        other => panic!("not a command: {other:?}"),
+    }
+}
 
 /// Build a well-formed kitty-graphics APC: `ESC _ G<control data>;<base64> ST`.
 ///
@@ -41,7 +49,7 @@ fn synthetic_apc() {
     let (forward, events) = filter.process(&payload);
     assert_eq!(forward, payload.as_slice(), "all bytes must be forwarded");
     assert_eq!(events.len(), 1, "exactly one GraphicsEvent");
-    let event = &events[0];
+    let event = command(&events[0]);
     assert_eq!(event.command, b'G');
     assert_eq!(event.get("s"), Some("2"));
     assert_eq!(event.get("v"), Some("2"));
@@ -63,8 +71,8 @@ fn chunking_reassembles() {
         all_events.extend(events);
     }
     assert_eq!(all_events.len(), 1, "byte-by-byte reassembly");
-    assert_eq!(all_events[0].command, b'G');
-    assert_eq!(all_events[0].data, b"abc");
+    assert_eq!(command(&all_events[0]).command, b'G');
+    assert_eq!(command(&all_events[0]).data, b"abc");
 
     // Irregular chunks (split in the middle of the base64).
     let mut filter = GraphicsFilter::new();
@@ -74,8 +82,8 @@ fn chunking_reassembles() {
     all_events.extend(filter.process(first).1);
     all_events.extend(filter.process(second).1);
     assert_eq!(all_events.len(), 1, "irregular-chunk reassembly");
-    assert_eq!(all_events[0].command, b'G');
-    assert_eq!(all_events[0].data, b"abc");
+    assert_eq!(command(&all_events[0]).command, b'G');
+    assert_eq!(command(&all_events[0]).data, b"abc");
 }
 
 /// Oversize: feed a payload larger than the queue cap; verify the queue
@@ -145,28 +153,44 @@ fn mid_sequence_frame() {
         1,
         "the APC after the partial CSI must be extracted"
     );
-    assert_eq!(events[0].command, b'G');
-    assert_eq!(events[0].data, b"abc");
+    assert_eq!(command(&events[0]).command, b'G');
+    assert_eq!(command(&events[0]).data, b"abc");
 }
 
-/// The filter preserves terminal byte semantics: feeding an APC through the
-/// filter and then to the parser (via Engine::feed) must produce the same
-/// terminal state as feeding the APC directly. This test uses Engine to
-/// verify the integration (the filter runs before the parser).
+/// Through `Engine::feed` (the same stream filter as the PTY path) a
+/// graphics command is handled and answered, and the text around it is
+/// parsed as usual.
 #[test]
-fn engine_feed_preserves_semantics() {
+fn engine_feed_handles_a_command() {
     let mut engine = nora::engine::Engine::new(25, 80);
-    // Feed ordinary text.
     engine.feed(b"Hello");
-    // Feed a well-formed APC.
-    let payload = apc("Gs=2,v=2;YWJj");
-    engine.feed(&payload);
-    // The graphics queue should have one event.
-    let events = engine.drain_graphics();
-    assert_eq!(events.len(), 1, "Engine must have extracted the APC");
-    assert_eq!(events[0].command, b'G');
-    assert_eq!(events[0].data, b"abc");
-    // The terminal state should be correct (the filter did not break normal
-    // text). (We don't assert the full grid here; the point is that the
-    // filter did not panic or corrupt the parser state.)
+    // `/wAA/w==` is one red RGBA pixel.
+    engine.feed(&apc("Ga=t,i=7,s=1,v=1;/wAA/w=="));
+    engine.feed(b" world");
+    assert!(engine.graphics().image(7).is_some(), "the image was stored");
+    assert_eq!(engine.replies(), vec!["\x1b_Gi=7;OK\x1b\\".to_string()]);
+    let snap = engine.snapshot();
+    let text: String = snap.cells[..11].iter().map(|c| c.ch).collect();
+    assert_eq!(text, "Hello world", "the APC left the text alone");
+}
+
+/// The screen clears that remove images are reported at their place in the
+/// stream; a private-mode or other erase is not.
+#[test]
+fn clear_signals_and_positions() {
+    let mut filter = GraphicsFilter::new();
+    let bytes = b"ab\x1b[2Jcd\x1b[3J\x1b[?2J\x1b[Jef\x1bc";
+    let (forward, signals) = filter.process(bytes);
+    assert_eq!(forward, bytes.as_slice());
+    assert_eq!(
+        signals,
+        vec![
+            (6, GraphicsSignal::ClearScreen),
+            (12, GraphicsSignal::ClearScrollback),
+            (bytes.len(), GraphicsSignal::Reset),
+        ]
+    );
+    let (_, signals) = filter.process(&apc("Ga=d"));
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0].0, apc("Ga=d").len(), "a command ends at its ST");
 }

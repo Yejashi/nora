@@ -166,6 +166,7 @@ fn snap(
         damage,
         epoch: 1,
         display_offset: 0,
+        images: Vec::new(),
     }
 }
 

@@ -101,10 +101,9 @@ pub fn main() {
             // read before the APC goes out (N32b).
             std::thread::sleep(std::time::Duration::from_millis(100));
             let b64 = args.get(1).map(String::as_str).unwrap_or("");
-            // kitty-graphics APC (real protocol, per ADR-011):
-            // ESC _ G<control data>;<base64> ESC \. A 2x2 RGBA transmit; the
-            // test only checks that the APC reaches the shared queue.
-            let payload = format!("Gs=2,v=2;{b64}");
+            // kitty-graphics APC (ADR-014): ESC _ G<control data>;<base64>
+            // ESC \. Transmit and display a 1x1 RGBA image with id 7.
+            let payload = format!("Ga=T,i=7,s=1,v=1;{b64}");
             let _ = out.write_all(format!("\x1b_{payload}\x1b\\").as_bytes());
             let _ = out.flush();
             // Let the APC reach the master before the marker.

@@ -65,7 +65,8 @@ pub fn pump_tick_with(session: &mut PtySession, want_snapshot: bool) -> PumpOutc
     let mut snapshot = None;
     if !terminated && want_snapshot {
         let (damage, cursor) = session.engine().probe();
-        if !is_noop_damage(&damage, cursor) {
+        // An image change is a frame even without grid damage.
+        if !is_noop_damage(&damage, cursor) || session.engine().graphics_changed() {
             snapshot = Some(session.engine().snapshot());
         }
     }

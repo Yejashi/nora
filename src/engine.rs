@@ -55,16 +55,13 @@ pub struct Engine {
     /// both touch it through `&self` accessors, so it lives behind a
     /// mutex. `None` when nothing is selected.
     selection: Arc<Mutex<Option<Selection>>>,
-    /// Bounded graphics filter (N32a): extracts kitty-graphics APCs in
-    /// parallel with the vte parser.
-    graphics_filter: crate::graphics_filter::GraphicsFilter,
-    /// Byte-bounded queue of graphics events, shared between the headless
-    /// `Engine::feed` path and the PTY `EventLoop` filter (N32b), drained
-    /// by the render tick (N33).
-    graphics_queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
-    /// Bounded OSC 133 prompt-marker filter (N35a): detects prompt markers
-    /// in parallel with the vte parser, suppressing well-formed frames.
-    marker_filter: crate::prompt_marker::PromptMarkerFilter,
+    /// The prompt-marker and graphics filters for [`Engine::feed`] (the PTY
+    /// path runs its own [`crate::stream::StreamFilter`] on the same state).
+    stream: crate::stream::StreamFilter,
+    /// Kitty graphics (ADR-014), shared with the PTY path's filter.
+    graphics: Arc<Mutex<crate::graphics_image::GraphicsState>>,
+    /// The graphics version the last snapshot showed.
+    graphics_seen: u64,
     /// Byte-bounded queue of prompt-marker events, shared between the
     /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35a).
     marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
@@ -386,6 +383,9 @@ pub struct Snapshot {
     pub damage: Damage,
     /// Viewport offset into the scrollback history (0 = bottom).
     pub display_offset: usize,
+    /// Kitty graphics placements in the viewport (ADR-014), lowest z
+    /// first.
+    pub images: Vec<crate::graphics_image::VisibleImage>,
 }
 
 /// Content identity only: [`Snapshot::epoch`] is deliberately not compared,
@@ -399,6 +399,11 @@ impl PartialEq for Snapshot {
             && self.cursor_shape == other.cursor_shape
             && self.modes == other.modes
             && self.damage == other.damage
+            && self.images.len() == other.images.len()
+            && self.images.iter().zip(&other.images).all(|(a, b)| {
+                (a.image_id, a.generation, a.row, a.col, a.z)
+                    == (b.image_id, b.generation, b.row, b.col, b.z)
+            })
     }
 }
 
@@ -416,6 +421,7 @@ impl std::fmt::Debug for Snapshot {
             .field("modes", &self.modes)
             .field("damage", &self.damage)
             .field("display_offset", &self.display_offset)
+            .field("images", &self.images.len())
             .finish()
     }
 }
@@ -527,6 +533,15 @@ impl Engine {
         let size = Size { rows, cols };
         let recorder = Recorder::default();
         let term = Arc::new(FairMutex::new(Term::new(config, &size, recorder.clone())));
+        let targets = crate::stream::StreamTargets {
+            markers: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
+            cwd: Arc::new(Mutex::new(None)),
+            shell_input: Arc::new(Mutex::new(crate::shell_input::ShellInput::new())),
+            hyperlinks: Arc::new(Mutex::new(crate::prompt_marker::HyperlinkQueue::new())),
+            graphics: Arc::new(Mutex::new(crate::graphics_image::GraphicsState::new())),
+            recorder: recorder.clone(),
+        };
+        let stream = crate::stream::StreamFilter::new(targets.clone());
         Self {
             term,
             processor: vte::ansi::Processor::<vte::ansi::StdSyncHandler>::new(),
@@ -536,14 +551,14 @@ impl Engine {
             history: scrollback,
             recorder,
             selection: Arc::new(Mutex::new(None)),
-            graphics_filter: crate::graphics_filter::GraphicsFilter::new(),
-            graphics_queue: Arc::new(Mutex::new(crate::graphics_filter::GraphicsQueue::new())),
-            marker_filter: crate::prompt_marker::PromptMarkerFilter::new(),
-            marker_queue: Arc::new(Mutex::new(crate::prompt_marker::MarkerQueue::new())),
+            stream,
+            graphics: targets.graphics,
+            graphics_seen: 0,
+            marker_queue: targets.markers,
             marker_store: crate::prompt_marker::MarkerStore::new(),
-            cwd: Arc::new(Mutex::new(None)),
-            shell_input: Arc::new(Mutex::new(crate::shell_input::ShellInput::new())),
-            hyperlink_queue: Arc::new(Mutex::new(crate::prompt_marker::HyperlinkQueue::new())),
+            cwd: targets.cwd,
+            shell_input: targets.shell_input,
+            hyperlink_queue: targets.hyperlinks,
             hyperlink_store: crate::prompt_marker::HyperlinkStore::new(),
         }
     }
@@ -613,108 +628,48 @@ impl Engine {
 
     /// Feed raw PTY bytes into the engine, preserving parser state.
     ///
-    /// The graphics filter (N32a) and the prompt-marker filter (N35a) run
-    /// before the vte parser: the graphics filter extracts kitty-graphics
-    /// APCs into the byte-bounded [`GraphicsQueue`] and forwards all bytes
-    /// (no transformation), and the marker filter extracts OSC 133 prompt
-    /// markers into the byte-bounded [`MarkerQueue`], suppressing well-formed
-    /// marker frames so terminal byte semantics are preserved.
+    /// The same [`crate::stream::StreamFilter`] the PTY path uses runs
+    /// first: prompt markers (N35a) and kitty graphics (ADR-014) are
+    /// extracted, and the parser processes the bytes in segments around
+    /// their positions, so each is handled with the cursor where it was
+    /// (and a displayed image's cursor movement is parsed in place).
     pub fn feed(&mut self, bytes: &[u8]) {
-        let (forward, events) = self.graphics_filter.process(bytes);
-        if !events.is_empty() {
-            let mut queue = self
-                .graphics_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for event in events {
-                queue.push(event);
-            }
-        }
-        let (forward, events) = self.marker_filter.process(forward);
+        let (forward, positions) = self.stream.process(bytes);
         let mut term = self.term.lock();
-        if events.is_empty() {
-            // Fast path: no markers in this chunk, process all bytes at once.
-            self.processor.advance(&mut *term, &forward);
-        } else {
-            // Segment path (N35b): markers are grid no-ops, so the cursor
-            // line after processing each marker's segment is exactly the
-            // line the marker was detected on. Process the forwarded bytes
-            // in segments (splitting at each marker position) and record
-            // the cursor line after each marker.
-            let mut pos = 0;
-            for (marker_pos, event) in events {
-                self.processor
-                    .advance(&mut *term, &forward[pos..marker_pos]);
-                let line = term.grid().cursor.point.line.0;
-                let scrolled = term.grid().total_scrolled();
-                let pulled = term.grid().total_pulled();
-                {
-                    let cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
-                    self.shell_input
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .apply(&event, cwd.as_deref());
-                }
-                match event {
-                    crate::prompt_marker::ShellEvent::Marker(m) => {
-                        let entry = crate::prompt_marker::MarkerAtLine {
-                            line,
-                            scrolled,
-                            pulled,
-                            event: m,
-                        };
-                        let mut queue = self
-                            .marker_queue
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        queue.push(entry);
-                    }
-                    crate::prompt_marker::ShellEvent::Cwd(path) => {
-                        let mut cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
-                        *cwd = Some(path);
-                    }
-                    crate::prompt_marker::ShellEvent::Hyperlink(uri) => {
-                        let col = term.grid().cursor.point.column.0;
-                        let entry = crate::prompt_marker::HyperlinkAtLine {
-                            line,
-                            col,
-                            scrolled,
-                            pulled,
-                            uri,
-                        };
-                        let mut queue = self
-                            .hyperlink_queue
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        queue.push(entry);
-                    }
-                    // Folded into the shell input state above.
-                    crate::prompt_marker::ShellEvent::Buffer(_)
-                    | crate::prompt_marker::ShellEvent::BufferEnd
-                    | crate::prompt_marker::ShellEvent::CommandLine(_)
-                    | crate::prompt_marker::ShellEvent::CommandExit(_) => {}
-                }
-                pos = marker_pos;
+        let mut pos = 0;
+        for at in positions {
+            self.processor.advance(&mut *term, &forward[pos..at]);
+            let context = alacritty_terminal::event_loop::MarkerContext::of(&*term);
+            if let Some(inject) = self.stream.on_marker(&context) {
+                self.processor.advance(&mut *term, &inject);
             }
-            self.processor.advance(&mut *term, &forward[pos..]);
+            pos = at;
+        }
+        self.processor.advance(&mut *term, &forward[pos..]);
+    }
+
+    /// The prompt-marker, shell and graphics state the stream hooks write
+    /// to, for the PTY path's own [`crate::stream::StreamFilter`].
+    pub fn stream_targets(&self) -> crate::stream::StreamTargets {
+        crate::stream::StreamTargets {
+            markers: Arc::clone(&self.marker_queue),
+            cwd: Arc::clone(&self.cwd),
+            shell_input: Arc::clone(&self.shell_input),
+            hyperlinks: Arc::clone(&self.hyperlink_queue),
+            graphics: Arc::clone(&self.graphics),
+            recorder: self.recorder.clone(),
         }
     }
 
-    /// Drain the graphics queue (N32a), returning all pending graphics
-    /// events in order. Called by the render tick (N33).
-    pub fn drain_graphics(&mut self) -> Vec<crate::graphics_filter::GraphicsEvent> {
-        self.graphics_queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain()
+    /// The kitty graphics state (ADR-014).
+    pub fn graphics(&self) -> std::sync::MutexGuard<'_, crate::graphics_image::GraphicsState> {
+        self.graphics.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A clone of the shared graphics-queue handle (N32b): the PTY
-    /// `EventLoop` filter pushes graphics events into the same queue the
-    /// headless [`Engine::feed`] path uses, so both paths feed one
-    /// byte-bounded queue drained by the render tick.
-    pub fn graphics_handle(&self) -> Arc<Mutex<crate::graphics_filter::GraphicsQueue>> {
-        Arc::clone(&self.graphics_queue)
+    /// Whether the images changed since the last snapshot, so a frame is
+    /// due although the grid has no damage.
+    pub fn graphics_changed(&self) -> bool {
+        self.graphics().version() != self.graphics_seen
     }
 
     /// Drain the prompt-marker queue (N35a), returning all pending
@@ -1355,6 +1310,27 @@ impl Engine {
             selected
         };
 
+        // Kitty graphics in the viewport; leaving the alternate screen drops
+        // its placements.
+        let images = {
+            let alt = content.mode.contains(TermMode::ALT_SCREEN);
+            let grid = term.grid();
+            let history = grid.total_lines().saturating_sub(grid.screen_lines());
+            let mut graphics = self.graphics.lock().unwrap_or_else(PoisonError::into_inner);
+            if !alt {
+                graphics.leave_alternate_screen();
+            }
+            self.graphics_seen = graphics.version();
+            graphics.visible(
+                grid.total_scrolled(),
+                grid.total_pulled(),
+                display_offset,
+                self.rows,
+                history,
+                alt,
+            )
+        };
+
         // Increment before assignment: the first snapshot is epoch 1.
         self.snapshot_epoch += 1;
 
@@ -1370,6 +1346,7 @@ impl Engine {
             colors: *content.colors,
             damage,
             display_offset,
+            images,
         };
         term.reset_damage();
         snapshot

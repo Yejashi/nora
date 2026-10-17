@@ -144,6 +144,10 @@ pub struct GraphicsState {
     next_internal: u32,
     generation: u64,
     serial: u64,
+    /// The cell size in pixels, for sizing placements.
+    cell: (u32, u32),
+    /// Bumped by every change that alters what is drawn.
+    version: u64,
 }
 
 /// A command's control keys, with the protocol's defaults.
@@ -168,7 +172,24 @@ impl Keys<'_> {
 
 impl GraphicsState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cell: (8, 16),
+            ..Self::default()
+        }
+    }
+
+    /// The cell size in pixels (the window's, updated on zoom).
+    pub fn cell_size(&self) -> (u32, u32) {
+        self.cell
+    }
+
+    pub fn set_cell_size(&mut self, width: u32, height: u32) {
+        self.cell = (width.max(1), height.max(1));
+    }
+
+    /// A counter that changes whenever the drawn images may have changed.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Handle one APC graphics command arriving with the cursor at `at`.
@@ -205,6 +226,7 @@ impl GraphicsState {
     }
 
     fn complete(&mut self, event: &GraphicsEvent, at: &Cursor, overflow: bool) -> Outcome {
+        self.version += 1;
         let keys = Keys(event);
         let action = keys.char("a", 't');
         let id = keys.u32("i");
@@ -483,6 +505,7 @@ impl GraphicsState {
 
     /// `CSI 2 J`: delete the placements on the current screen.
     pub fn clear_screen(&mut self, at: &Cursor) {
+        self.version += 1;
         let lines = at.lines as i64;
         self.placements.retain(|p| {
             let top = p.line_now(at.scrolled, at.pulled);
@@ -492,12 +515,14 @@ impl GraphicsState {
 
     /// `CSI 3 J`: delete the placements in the scrollback.
     pub fn clear_scrollback(&mut self, at: &Cursor) {
+        self.version += 1;
         self.placements
             .retain(|p| p.alt || p.line_now(at.scrolled, at.pulled) + i64::from(p.rows) > 0);
     }
 
     /// `ESC c`: delete every placement and image.
     pub fn reset(&mut self) {
+        self.version += 1;
         self.placements.clear();
         self.images.clear();
         self.total_bytes = 0;
@@ -506,7 +531,11 @@ impl GraphicsState {
 
     /// Drop the alternate screen's placements (it was left).
     pub fn leave_alternate_screen(&mut self) {
+        let before = self.placements.len();
         self.placements.retain(|p| !p.alt);
+        if self.placements.len() != before {
+            self.version += 1;
+        }
     }
 
     /// The placements visible in a viewport `display_offset` lines into

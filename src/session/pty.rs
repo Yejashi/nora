@@ -41,118 +41,6 @@ use crate::engine::{Engine, EventRecord};
 use super::io::{BoundedWriter, WriterConfig, WriterError};
 use super::{NOMINAL_CELL_HEIGHT, NOMINAL_CELL_WIDTH, ReplyLedger, resolve_record};
 
-/// N32b/N35a: byte-level pre-filter for the PTY `EventLoop`.
-///
-/// Runs the N32a [`GraphicsFilter`] and the N35a [`PromptMarkerFilter`] in
-/// sequence on the pinned PTY reader thread (via the vendored `Filter`
-/// hook), pushing extracted events into the session's shared
-/// [`GraphicsQueue`] and [`MarkerQueue`] handles. The headless
-/// `Engine::feed` path and this PTY path feed the same queues.
-///
-/// The vendored `EventLoop::with_filter` installs a single filter (it
-/// replaces, not chains), so both filters run inside this one hook: the
-/// graphics filter sees the raw bytes, and the marker filter sees the
-/// graphics filter's forwarded bytes.
-struct PtyFilter {
-    graphics: crate::graphics_filter::GraphicsFilter,
-    graphics_queue: Arc<Mutex<crate::graphics_filter::GraphicsQueue>>,
-    markers: crate::prompt_marker::PromptMarkerFilter,
-    marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
-    /// The child's current working directory (N35d): the most recent OSC 7
-    /// `file://` path, shared with the headless `Engine::feed` path.
-    cwd: Arc<Mutex<Option<String>>>,
-    /// The shell's reported command line state (ADR-013), shared with the
-    /// headless `Engine::feed` path.
-    shell_input: Arc<Mutex<crate::shell_input::ShellInput>>,
-    /// Byte-bounded queue of hyperlink events, shared with the headless
-    /// `Engine::feed` path (N35d).
-    hyperlink_queue: Arc<Mutex<crate::prompt_marker::HyperlinkQueue>>,
-    /// Shell events from the last `process` call, in order (N35b/N35d).
-    /// The event loop calls `on_marker` once per reported position, in
-    /// order, so `pending_index` tracks which event the next callback is
-    /// for.
-    pending_events: Vec<crate::prompt_marker::ShellEvent>,
-    pending_index: usize,
-}
-
-impl alacritty_terminal::event_loop::Filter for PtyFilter {
-    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
-        let (forward, events) = self.graphics.process(bytes);
-        if !events.is_empty() {
-            let mut queue = self
-                .graphics_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for event in events {
-                queue.push(event);
-            }
-        }
-        let (forward, events) = self.markers.process(forward);
-        self.pending_events = events.iter().map(|(_, e)| e.clone()).collect();
-        self.pending_index = 0;
-        let positions: Vec<usize> = events.iter().map(|(pos, _)| *pos).collect();
-        (forward, positions)
-    }
-
-    fn on_marker(
-        &mut self,
-        _position: usize,
-        cursor_line: i32,
-        cursor_col: usize,
-        total_scrolled: u64,
-        total_pulled: u64,
-    ) {
-        if let Some(event) = self.pending_events.get(self.pending_index).cloned() {
-            self.pending_index += 1;
-            {
-                let cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
-                self.shell_input
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .apply(&event, cwd.as_deref());
-            }
-            match event {
-                crate::prompt_marker::ShellEvent::Marker(m) => {
-                    let entry = crate::prompt_marker::MarkerAtLine {
-                        line: cursor_line,
-                        scrolled: total_scrolled,
-                        pulled: total_pulled,
-                        event: m,
-                    };
-                    let mut queue = self
-                        .marker_queue
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    queue.push(entry);
-                }
-                crate::prompt_marker::ShellEvent::Cwd(path) => {
-                    let mut cwd = self.cwd.lock().unwrap_or_else(PoisonError::into_inner);
-                    *cwd = Some(path);
-                }
-                crate::prompt_marker::ShellEvent::Hyperlink(uri) => {
-                    let entry = crate::prompt_marker::HyperlinkAtLine {
-                        line: cursor_line,
-                        col: cursor_col,
-                        scrolled: total_scrolled,
-                        pulled: total_pulled,
-                        uri,
-                    };
-                    let mut queue = self
-                        .hyperlink_queue
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    queue.push(entry);
-                }
-                // Folded into the shell input state above.
-                crate::prompt_marker::ShellEvent::Buffer(_)
-                | crate::prompt_marker::ShellEvent::BufferEnd
-                | crate::prompt_marker::ShellEvent::CommandLine(_)
-                | crate::prompt_marker::ShellEvent::CommandExit(_) => {}
-            }
-        }
-    }
-}
-
 /// Default per-session write budgets (policy values, 03:86-89): 1 MiB
 /// total, 64 KiB reserved for parser replies.
 pub const DEFAULT_CAP: WriterConfig = WriterConfig {
@@ -434,22 +322,15 @@ impl PtySession {
         // the exit token before reading master bytes that arrived in the
         // same poll batch; the flag makes the exit path do one final
         // `pty_read` so trailing output (argv/pwd lines) reaches the term.
-        // N32b/N35a: install the pre-filter on the pinned PTY reader so
-        // kitty-graphics APCs (N32a) and OSC 133 prompt markers (N35a) are
-        // extracted on the PTY path (the headless `Engine::feed` path
-        // already runs its own N32a/N35a filters). Both push into the
-        // session's shared queues.
-        let pty_filter = PtyFilter {
-            graphics: crate::graphics_filter::GraphicsFilter::new(),
-            graphics_queue: engine.graphics_handle(),
-            markers: crate::prompt_marker::PromptMarkerFilter::new(),
-            marker_queue: engine.markers_handle(),
-            cwd: engine.cwd_handle(),
-            shell_input: engine.shell_input_handle(),
-            hyperlink_queue: engine.hyperlink_handle(),
-            pending_events: Vec::new(),
-            pending_index: 0,
-        };
+        // The stream hooks (prompt markers, kitty graphics) run on the
+        // pinned PTY reader, writing to the engine's shared state, as
+        // `Engine::feed` does on the headless path. Graphics are sized in
+        // the window's cells.
+        engine.graphics().set_cell_size(
+            u32::from(options.cell_width),
+            u32::from(options.cell_height),
+        );
+        let pty_filter = crate::stream::StreamFilter::new(engine.stream_targets());
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loop_ = EventLoop::new(engine.term_handle(), engine.recorder(), pty, true, false)
             .map(|loop_| {
@@ -770,6 +651,9 @@ impl PtySession {
         }
         self.size.cell_width = width;
         self.size.cell_height = height;
+        self.engine
+            .graphics()
+            .set_cell_size(u32::from(width), u32::from(height));
         let _ = self.sender.send(Msg::Resize(self.size));
     }
 

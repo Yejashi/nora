@@ -1207,17 +1207,16 @@ fn close_before_drop_clean() {
     drop(session);
 }
 
-/// N32b: a PTY session that emits a kitty-graphics APC produces a
-/// [`GraphicsEvent`] in the shared graphics queue. The vendored `EventLoop`
-/// filter runs on the PTY reader thread *before* the parser, so the event
-/// is queued before the `APC-DONE` marker is visible in the grid.
+/// ADR-014: a kitty graphics command from a child over a real PTY is
+/// handled on the reader thread at its place in the stream, before the
+/// `APC-DONE` text after it is parsed: the image is stored and placed.
 #[test]
-fn pty_graphics_apc_reaches_shared_queue() {
-    // `aGVsbG8=` is the base64 of "hello".
+fn pty_graphics_command_reaches_the_state() {
+    // `/wAA/w==` is one red RGBA pixel.
     let mut session = PtySession::spawn(
         LaunchSpec {
             program: helper(),
-            args: vec!["apc".to_string(), "aGVsbG8=".to_string()],
+            args: vec!["apc".to_string(), "/wAA/w==".to_string()],
             cwd: None,
             env: Vec::new(),
         },
@@ -1233,13 +1232,14 @@ fn pty_graphics_apc_reaches_shared_queue() {
     pump(&mut session, |text, _events| text.contains("APC-DONE"))
         .expect("APC-DONE marker observed within the deadline");
 
-    let events = session.engine().drain_graphics();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.command == b'G' && event.data == b"hello"),
-        "expected a graphics event with command 'G' and data 'hello'; got {events:?}"
-    );
+    let engine = session.engine();
+    let graphics = engine.graphics();
+    let image = graphics
+        .image(7)
+        .expect("image 7 stored by the reader thread");
+    assert_eq!(&*image.pixels, &[255, 0, 0, 255]);
+    assert_eq!(graphics.placements().count(), 1, "a=T displayed it");
+    drop(graphics);
 
     session.close();
 }

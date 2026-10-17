@@ -20,6 +20,7 @@ pub mod search;
 pub mod session;
 pub mod shell_input;
 pub mod signals;
+pub mod stream;
 pub mod suggest;
 pub mod trace;
 pub mod workspace;

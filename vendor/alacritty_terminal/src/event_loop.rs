@@ -61,21 +61,44 @@ pub trait Filter {
     fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>);
 
     /// Called by the event loop after processing the segment ending at
-    /// `position`, with the cursor's grid line and column and the grid's
-    /// monotonic `total_scrolled` and `total_pulled` counters at that
-    /// point.
-    /// Implementors use this to record each shell event's grid position
-    /// (N35b/N35d); storing both counters lets them recompute the event's
-    /// current line later, which stays correct across scrolls and across
-    /// vertical resizes that pull lines from history.
-    fn on_marker(
-        &mut self,
-        _position: usize,
-        _cursor_line: i32,
-        _cursor_col: usize,
-        _total_scrolled: u64,
-        _total_pulled: u64,
-    ) {
+    /// `position`, with the terminal at that point (N35b/N35d, ADR-014).
+    /// Implementors use it to record each event's grid position; storing
+    /// both scroll counters lets them recompute the event's current line
+    /// later, which stays correct across scrolls and across vertical
+    /// resizes that pull lines from history. Bytes returned are parsed
+    /// right there, before the next segment (kitty graphics move the
+    /// cursor this way).
+    fn on_marker(&mut self, _position: usize, _context: &MarkerContext) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// The terminal at a position a [`Filter`] reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerContext {
+    pub cursor_line: i32,
+    pub cursor_col: usize,
+    pub total_scrolled: u64,
+    pub total_pulled: u64,
+    pub columns: usize,
+    pub screen_lines: usize,
+    pub alt_screen: bool,
+}
+
+impl MarkerContext {
+    /// The context of `term` now.
+    pub fn of<T>(term: &Term<T>) -> Self {
+        use crate::grid::Dimensions;
+        let grid = term.grid();
+        Self {
+            cursor_line: grid.cursor.point.line.0,
+            cursor_col: grid.cursor.point.column.0,
+            total_scrolled: grid.total_scrolled(),
+            total_pulled: grid.total_pulled(),
+            columns: grid.columns(),
+            screen_lines: grid.screen_lines(),
+            alt_screen: term.mode().contains(crate::term::TermMode::ALT_SCREEN),
+        }
     }
 }
 
@@ -247,12 +270,11 @@ where
                 let mut pos = 0;
                 for &mpos in &marker_positions {
                     state.parser.advance(&mut **terminal, &to_parse[pos..mpos]);
-                    let line = terminal.grid().cursor.point.line.0;
-                    let col = terminal.grid().cursor.point.column.0;
-                    let scrolled = terminal.grid().total_scrolled();
-                    let pulled = terminal.grid().total_pulled();
-                    if let Some(filter) = self.filter.as_mut() {
-                        filter.on_marker(mpos, line, col, scrolled, pulled);
+                    let context = MarkerContext::of(&**terminal);
+                    if let Some(filter) = self.filter.as_mut()
+                        && let Some(inject) = filter.on_marker(mpos, &context)
+                    {
+                        state.parser.advance(&mut **terminal, &inject);
                     }
                     pos = mpos;
                 }
