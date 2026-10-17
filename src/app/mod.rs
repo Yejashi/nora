@@ -596,11 +596,6 @@ struct WinApp {
     /// `--hold` (N12b): when set, the `ChildExit` fold skips
     /// `event_loop.exit()`; the window keeps its final frame.
     hold: bool,
-    /// The last grid sent to the pump as `PumpMsg::Resize` (N11a);
-    /// `(0, 0)` = never sent. The `Resized`/`ScaleFactorChanged` arms
-    /// send only when the derived (clamped) grid differs, so repeated
-    /// no-op derivations emit nothing.
-    last_grid: (u16, u16),
     /// Selection drag start in grid `(row, col)` (N14b): `Some` while the
     /// primary button is held down dragging a selection; `None` otherwise.
     selection: Option<(usize, usize)>,
@@ -645,8 +640,11 @@ struct WinApp {
     /// out with no room (a split of a one-row pane, a new tab while
     /// minimized) spawns once it has a non-zero size (audit RV6).
     pane_spawned: std::collections::HashSet<PaneKey>,
-    /// N24b: the last grid sent to the pump as `PumpMsg::Resize` for that
-    /// pane; `(0, 0)` = never sent.
+    /// N24b: the last grid sent to the pump as `PumpMsg::Resize` (or
+    /// `NewPane`) for that pane; `(0, 0)` = never sent. The single record
+    /// for every pane, the active one included: it is never mirrored into
+    /// a window field, so a layout change that resizes the active pane
+    /// cannot leave a stale copy that suppresses a later resize.
     pane_grid: std::collections::HashMap<PaneKey, (u16, u16)>,
     /// N24b: the pump's `ChildExit` payload once delivered for that pane
     /// (`None` = not yet delivered).
@@ -741,7 +739,6 @@ pub fn run_windowed(
         frames: 0,
         child_exit: None,
         hold,
-        last_grid: (0, 0),
         selection: None,
         cursor: (0.0, 0.0),
         pressed_buttons: Vec::new(),
@@ -862,7 +859,6 @@ impl WinApp {
     /// Save the active pane's mirrored state into its per-pane maps (N24b).
     fn save_active_pane(&mut self, pane: PaneKey) {
         self.pane_slots.insert(pane, self.slot.clone());
-        self.pane_grid.insert(pane, self.last_grid);
         self.pane_exit.insert(pane, self.child_exit);
         self.pane_render.insert(pane, self.state.clone());
         self.pane_ime.insert(
@@ -901,7 +897,6 @@ impl WinApp {
             .entry(pane)
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
-        self.last_grid = self.pane_grid.remove(&pane).unwrap_or((0, 0));
         self.child_exit = self.pane_exit.remove(&pane).unwrap_or(None);
         self.state = self.pane_render.remove(&pane).unwrap_or_default();
         self.ime = self.pane_ime.remove(&pane).unwrap_or_default();
@@ -1137,7 +1132,6 @@ impl WinApp {
         } else {
             // The layout is empty: reset the single fields to a fresh pane.
             self.slot = Arc::new(Mutex::new(None));
-            self.last_grid = (0, 0);
             self.child_exit = None;
             self.state = RenderState::default();
             self.ime = nora::ime::ImeState::new();
@@ -2406,9 +2400,6 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // resizes reach the pump); the next pulse carries each
                 // pane's post-resize `Full` snapshot.
                 self.resize_all_panes();
-                if let Some(pane) = self.active_pane_key() {
-                    self.last_grid = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
-                }
 
                 // (e) Coalesce the redraw.
                 window.request_redraw(); // redraw SITE 2
@@ -2453,9 +2444,6 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // `Full` snapshot — no `request_redraw` in this arm,
                 // keeping the pinned exactly-three call sites intact.
                 self.resize_all_panes();
-                if let Some(pane) = self.active_pane_key() {
-                    self.last_grid = self.pane_grid.get(&pane).copied().unwrap_or((0, 0));
-                }
                 if debug_enabled() {
                     eprintln!("debug: scale factor changed, grid {rows}x{cols}");
                 }
