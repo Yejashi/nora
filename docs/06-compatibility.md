@@ -21,7 +21,7 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | Hyperlinks | Preserve metadata; explicit user activation | URL validation + selection tests |
 | IME | Preedit UI and one commit; proper candidate area | Native tests and event replay |
 | Shell integration | OSC 133 A/B/C/D markers, OSC 7 cwd, OSC 8 hyperlinks; opt-in shell script, engine-level features (jump-to-prompt, previous-command selection, hyperlink activation) | Filter tests (`prompt_marker`), PTY shared-state tests (`pty_session`), navigation tests (`scrollback`) |
-| Graphics (kitty protocol) | Documented subset: upload/place/query/delete, f=24/f=32, chunk assembly (`m`), multiple placements, 128 MiB budgets; f=100 (PNG) a later slice | Protocol fixtures (`graphics_filter`/`graphics_image`/`graphics_protocol`) + PTY APC tests |
+| Graphics (kitty protocol) | Displayed (ADR-014): transmit, display, put, query, delete; RGB, RGBA, PNG, zlib; direct and file media; z bands; scrolls with the text; see below | `tests/graphics_image.rs`, `tests/graphics_protocol.rs`, PTY test, e2e `graphics` |
 
 **Engine-level evidence so far (headless, N03).** The following rows have passing fixtures in `tests/engine_adapter.rs`: Text/UTF-8 — whole/split (every byte boundary) and seeded random-chunk replay; Cursor/erase/style — overwrite/CUP, pending wrap, SGR flags+colors until reset; Screens/scrolling — ?1049 alternate-screen isolation and restore; Queries — DSR and OSC-title replies captured in order via `Recorder`. These prove engine semantics only; PTY-level proof (exact reply bytes/timeouts, TUI runs) and all other rows remain open until N04+. Full per-row status tracking starts at N04 in `docs/status/COMPATIBILITY.md`.
 
@@ -88,6 +88,29 @@ modes).
 
 Not reported: lock modifiers (Caps/Num Lock state is not exposed by
 winit), Hyper and Meta.
+
+### Kitty graphics protocol (ADR-014)
+
+Images are handled on the reader thread at their place in the output
+(`src/stream.rs`, `src/graphics_image.rs`) and drawn as textures
+(`src/app/images.rs`).
+
+| Area | Behavior | Proof |
+| --- | --- | --- |
+| Actions | `t` store, `T` store and display, `p` display a stored image (by `i`, or the newest with `I`), `q` check without storing, `d` delete | `tests/graphics_image.rs` |
+| Data | formats 24 (RGB), 32 (RGBA), 100 (PNG); `o=z` zlib; media `d` (inline, chunked with `m`), `f` and `t` (regular files only; `/proc`, `/sys`, `/dev` refused; one `EBADF` for every failure; `t` removes only temp files whose path contains `tty-graphics-protocol`) | `tests/graphics_image.rs` |
+| Limits | 64 MiB per decoded image, 256 MiB in all (unplaced images evicted first), 8192 px per side, 64 MiB per transfer, 1024 placements | `tests/graphics_image.rs` |
+| Replies | `ESC _ G i=..[,I=..][,p=..];OK ESC \` or `;CODE:message`, only for commands naming an image; `q=1` drops OK, `q=2` errors; ordered with the parser's replies (a query then `CSI c` answers in that order) | `tests/graphics_protocol.rs` |
+| Placement | at the cursor; size from `c`/`r` (aspect kept for one of them) or the image's pixels; source rectangle `x,y,w,h`; offset `X,Y` inside the cell; scales with the cell on zoom | `tests/graphics_image.rs`; e2e `graphics` |
+| Cursor | moves right by the columns and down by the rows minus one (scrolling at the bottom; to the next line at the right edge); `C=1` keeps it | `tests/graphics_protocol.rs`; e2e `graphics` |
+| Scrolling | placements scroll with the text and survive vertical resizes; dropped once out of the history | `tests/graphics_protocol.rs` |
+| Layers | z below -1 073 741 824 under cell backgrounds, other negative z under the text, z >= 0 over it | e2e `graphics` (z=-1 and z=0 checked) |
+| Deletes and clears | `d=` a i n c p q x y z r (uppercase frees unused images); `CSI 2 J` deletes the screen's placements, `CSI 3 J` the scrollback's, `ESC c` everything; the alternate screen has its own placements, dropped when it is left | `tests/graphics_image.rs`, `tests/graphics_protocol.rs` |
+
+Not implemented (an error reply where one is due): shared memory (`t=s`),
+animation (`a=f`, `a=a`, `a=c`), relative placements (`P`, `Q`, `H`,
+`V`), Unicode placeholders (`U=1`). Tools that probe for shared memory
+fall back to direct transfer.
 
 ## Paste
 

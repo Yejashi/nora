@@ -60,6 +60,9 @@ kill/yank, which a terminal that guesses from the screen gets wrong.
   wide characters with per-glyph font fallback, and a `nora` terminfo
   entry that is a subset of `xterm-256color`. vim, Neovim, tmux and htop
   are exercised in CI.
+- **Images.** The kitty graphics protocol: PNG and raw RGB(A) images,
+  inline or from a file, drawn at the cursor under or over the text and
+  scrolling with it.
 - **Live configuration.** One TOML file, validated, applied on save.
   Covers fonts, colors, cursor, scrollback and key bindings.
 - **Bounded and safe by default.** Size caps on control sequences and
@@ -277,10 +280,8 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   tests, but no one has used the window on them yet, and there are no
   installers; work on them is deferred. See
   [docs/15-platforms.md](docs/15-platforms.md).
-- **Not supported yet:**
-  - drawing images from the kitty graphics protocol (it is parsed, not
-    displayed);
-  - font ligatures.
+- **Not supported yet:** font ligatures; kitty graphics animation, shared
+  memory transfer and Unicode placeholders (images themselves are shown).
 - **Input methods.** Composition is checked end to end with ibus over
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
   Wayland text-input path and the drawing of a candidate window have not
