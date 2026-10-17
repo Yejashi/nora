@@ -434,3 +434,55 @@ fn huge_cell_counts_are_clamped() {
     assert_eq!(out.move_cursor, Some((MAX, MAX)));
     assert_eq!(g.placements().last().unwrap().size, (MAX * 10, MAX * 20));
 }
+
+/// An image stored without an id or number gets an internal id the client
+/// never learns; a client using that id (they are 2^31 and up) reaches its
+/// own image, never the internal one.
+#[test]
+fn clients_never_address_internal_images() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,f=32,s=1,v=1", &rgba(1, 1)), &at(0, 0));
+    let hidden = g.placements().last().unwrap().image_id;
+    assert!(hidden >= 1 << 31 && g.image(hidden).unwrap().internal);
+    let keys = format!("a=p,i={hidden}");
+    let out = g.handle(&cmd(&keys, &[]), &at(1, 0));
+    assert_eq!(
+        reply(&out),
+        Some(format!("\x1b_Gi={hidden};ENOENT:No such image\x1b\\"))
+    );
+    for delete in [
+        format!("a=d,d=I,i={hidden}"),
+        format!("a=d,d=R,x={hidden},y={hidden}"),
+        "a=d,d=R,x=1,y=4294967295".to_string(),
+    ] {
+        g.handle(&cmd(&delete, &[]), &at(0, 0));
+        assert_eq!(g.placements().count(), 1, "{delete}");
+        assert!(g.image(hidden).is_some(), "{delete}");
+    }
+    // Transmitting with that id moves the internal image (and its
+    // placement) to a fresh id instead of replacing it.
+    let keys = format!("a=t,f=32,s=2,v=1,i={hidden}");
+    let out = g.handle(&cmd(&keys, &rgba(2, 1)), &at(0, 0));
+    assert_eq!(reply(&out), Some(format!("\x1b_Gi={hidden};OK\x1b\\")));
+    let client = g.image(hidden).unwrap();
+    assert_eq!((client.width, client.internal), (2, false));
+    assert_eq!(g.image_count(), 2);
+    let moved = g.placements().last().unwrap().image_id;
+    assert_ne!(moved, hidden);
+    let image = g.image(moved).unwrap();
+    assert_eq!((image.id, image.width, image.internal), (moved, 1, true));
+    // A position delete still removes it (it is on the screen).
+    g.handle(&cmd("a=d,d=A", &[]), &at(0, 0));
+    assert!(g.image(moved).is_none());
+    // A numbered image's id is told to the client: it is addressable.
+    let out = g.handle(&cmd("a=t,f=32,s=1,v=1,I=3", &rgba(1, 1)), &at(0, 0));
+    let text = reply(&out).unwrap();
+    let id: u32 = text["\x1b_Gi=".len()..text.find(',').unwrap()]
+        .parse()
+        .unwrap();
+    let keys = format!("a=p,i={id}");
+    assert_eq!(
+        reply(&g.handle(&cmd(&keys, &[]), &at(0, 0))),
+        Some(format!("\x1b_Gi={id};OK\x1b\\"))
+    );
+}

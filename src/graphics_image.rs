@@ -48,6 +48,10 @@ pub struct Image {
     pub pixels: Arc<[u8]>,
     /// Distinguishes uploads under the same id (for texture caches).
     pub generation: u64,
+    /// Stored without an id or a number: its id was never told to the
+    /// client, so no client command (put, delete by id or range, transmit
+    /// over it, placeholder) addresses it.
+    pub internal: bool,
 }
 
 /// Where a command arrived: the cursor and screen at that point.
@@ -266,7 +270,7 @@ impl GraphicsState {
                     let target = if number != 0 {
                         self.newest_with_number(number)
                     } else {
-                        self.images.contains_key(&id).then_some(id)
+                        self.client_image(id)
                     };
                     match target {
                         Some(image) => {
@@ -309,7 +313,13 @@ impl GraphicsState {
     /// Store an image, replacing one with the same id (and its
     /// placements), evicting others to stay within the budget.
     fn store(&mut self, id: u32, number: u32, width: u32, height: u32, pixels: Vec<u8>) -> u32 {
-        let id = if id != 0 { id } else { self.internal_id() };
+        let internal = id == 0 && number == 0;
+        let id = if id != 0 {
+            self.move_internal_image(id);
+            id
+        } else {
+            self.internal_id()
+        };
         if let Some(old) = self.images.remove(&id) {
             self.total_bytes -= old.pixels.len();
             self.placements.retain(|p| p.image_id != id);
@@ -341,9 +351,36 @@ impl GraphicsState {
                 height,
                 pixels: pixels.into(),
                 generation: self.generation,
+                internal,
             },
         );
         id
+    }
+
+    /// Image `id` if a client command may address it (it exists and is
+    /// not internal).
+    fn client_image(&self, id: u32) -> Option<u32> {
+        self.images
+            .get(&id)
+            .is_some_and(|image| !image.internal)
+            .then_some(id)
+    }
+
+    /// The client is storing image `id`: an internal image that has this id
+    /// moves (with its placements) to a fresh internal id, so the client's
+    /// image does not replace it.
+    fn move_internal_image(&mut self, id: u32) {
+        if !self.images.get(&id).is_some_and(|image| image.internal) {
+            return;
+        }
+        let fresh = self.internal_id();
+        if let Some(mut image) = self.images.remove(&id) {
+            image.id = fresh;
+            self.images.insert(fresh, image);
+        }
+        for p in self.placements.iter_mut().filter(|p| p.image_id == id) {
+            p.image_id = fresh;
+        }
     }
 
     fn internal_id(&mut self) -> u32 {
@@ -472,9 +509,13 @@ impl GraphicsState {
             let row = i64::from(row) - 1;
             row >= top && row < top + i64::from(p.rows)
         };
+        // Deletes by id or range never reach an internal image.
+        let images = &self.images;
+        let internal = |id: u32| images.get(&id).is_some_and(|image| image.internal);
+        let in_range = |id: u32| id >= x && id <= y && !internal(id);
         let target_image = match what.to_ascii_lowercase() {
             'n' => self.newest_with_number(number),
-            _ => Some(id),
+            _ => (!internal(id)).then_some(id),
         };
         let doomed = |p: &Placement| -> bool {
             if p.is_virtual {
@@ -486,7 +527,7 @@ impl GraphicsState {
                             Some(p.image_id) == target_image && (pid == 0 || p.placement_id == pid)
                         }
                         'z' => p.z == z,
-                        _ => p.image_id >= x && p.image_id <= y,
+                        _ => in_range(p.image_id),
                     }
                 };
             }
@@ -507,7 +548,7 @@ impl GraphicsState {
                 'x' => covers_col(p, x),
                 'y' => covers_row(p, y),
                 'z' => p.z == z,
-                'r' => p.image_id >= x && p.image_id <= y,
+                'r' => in_range(p.image_id),
                 _ => false,
             }
         };
@@ -526,7 +567,12 @@ impl GraphicsState {
                 candidates.push(image);
             }
             if what == 'R' {
-                candidates.extend(self.images.range(x..=y.max(x)).map(|(id, _)| *id));
+                candidates.extend(
+                    self.images
+                        .range(x..=y.max(x))
+                        .filter(|(_, image)| !image.internal)
+                        .map(|(id, _)| *id),
+                );
             }
             for image in candidates {
                 if !self.placements.iter().any(|p| p.image_id == image)
@@ -638,7 +684,7 @@ impl GraphicsState {
             .filter(|p| p.is_virtual && p.image_id == image_id)
             .filter(|p| placement_id == 0 || p.placement_id == placement_id)
             .max_by_key(|p| p.serial)?;
-        let image = self.images.get(&image_id)?;
+        let image = self.images.get(&image_id).filter(|image| !image.internal)?;
         let (cw, ch) = (f64::from(cell.0.max(1)), f64::from(cell.1.max(1)));
         let [sx, sy, sw, sh] = p.source;
         let (iw, ih) = (f64::from(sw.max(1)), f64::from(sh.max(1)));
