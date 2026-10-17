@@ -1258,7 +1258,11 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // nora: a VT220 with ANSI color (`?62;22c`; kitty and foot also
+                // report level 62) instead of a bare VT102 (`?6c`): kitty's icat
+                // ends its support detection only on a DA1 reply longer
+                // than `?6c`, so with it every image waited for a timeout.
+                let text = String::from("\x1b[?62;22c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {

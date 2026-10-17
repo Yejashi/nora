@@ -29,10 +29,9 @@ fn detection_reply_comes_before_the_device_attributes() {
     let replies = e.replies();
     assert_eq!(replies.len(), 2, "{replies:?}");
     assert_eq!(replies[0], "\x1b_Gi=31;OK\x1b\\");
-    assert!(
-        replies[1].starts_with("\x1b[?"),
-        "then the DA reply: {replies:?}"
-    );
+    // Then DA1: a VT220 with ANSI color, longer than `?6c` (kitty's icat
+    // ignores a shorter reply and waits for its timeout).
+    assert_eq!(replies[1], "\x1b[?62;22c");
 }
 
 #[test]
