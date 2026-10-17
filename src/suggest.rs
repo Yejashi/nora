@@ -433,10 +433,18 @@ pub fn complete_word(
     home: Option<&str>,
     executables: &[String],
 ) -> Option<String> {
-    if buffer.ends_with(char::is_whitespace) {
+    // The shell splits words at ASCII blanks only: a no-break space
+    // (AltGr+Space) or an ideographic space is part of the word. The word
+    // starts after the separator character, whatever its width in bytes.
+    let separator = |c: char| c.is_ascii_whitespace();
+    if buffer.ends_with(separator) {
         return None;
     }
-    let start = buffer.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    let start = buffer
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| separator(c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
     let word = &buffer[start..];
     if word.is_empty() || word.contains(['\'', '"', '\\', '$', '`', '*', '?']) {
         return None;

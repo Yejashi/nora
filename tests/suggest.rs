@@ -322,6 +322,47 @@ mod words {
         );
     }
 
+    /// A no-break space (AltGr+Space) or an ideographic space is several
+    /// bytes and, to the shell, part of the word: neither panics nor
+    /// splits the word.
+    #[test]
+    fn multibyte_spaces_do_not_split_or_panic() {
+        let root = tree("nbsp");
+        let cwd = root.join("project");
+        std::fs::write(cwd.join("a\u{a0}b.txt"), "").unwrap();
+        std::fs::write(cwd.join("\u{3000}wide"), "").unwrap();
+        let cwd = cwd.to_str();
+        let exes: Vec<String> = ["htop"].map(String::from).to_vec();
+        for buffer in [
+            "\u{a0}",
+            "ls\u{a0}",
+            "ls\u{a0}x",
+            "ls\u{3000}",
+            "ls\u{3000}REA",
+            "\u{3000}",
+            "cat \u{3000}",
+            "cat x\u{a0}\u{3000}",
+            "\u{a0}ht",
+        ] {
+            let _ = complete_word(buffer, cwd, None, &exes);
+        }
+        assert_eq!(
+            complete_word("cat a\u{a0}", cwd, None, &[]).as_deref(),
+            Some("b.txt"),
+            "the no-break space is part of the word"
+        );
+        assert_eq!(
+            complete_word("cat \u{3000}w", cwd, None, &[]).as_deref(),
+            Some("ide")
+        );
+        assert_eq!(
+            complete_word("ls\u{a0}REA", cwd, None, &exes),
+            None,
+            "one word: not `ls` then `REA`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_executables_lists_executable_files() {
