@@ -388,6 +388,18 @@ fn run_windowed(
     // Loaded once here (the first PTY needs the grid) and handed to the
     // window loop.
     fonts.measure(window.scale_factor(), nora::config::ZOOM_DEFAULT);
+    // Metrics are rounded at each size, so the scaled cell is not the
+    // scale-1 cell times the factor (at 1.25 a 24 px cell is 31 px, not
+    // 30): ask for the configured grid in the cells actually used. A
+    // request applied later arrives as `Resized`, which resizes the
+    // session like any other resize.
+    let wanted = winit::dpi::PhysicalSize::new(
+        u32::from(columns) * fonts.cell_w,
+        u32::from(lines) * fonts.cell_h(),
+    );
+    if window.inner_size() != wanted {
+        let _ = window.request_inner_size(wanted);
+    }
     let (cols, rows) = app::window_grid(&window, &fonts);
     let (rows, cols) = if rows == 0 || cols == 0 {
         eprintln!("debug: degenerate window grid at spawn; falling back to 24x80");
