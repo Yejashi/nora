@@ -130,7 +130,7 @@ than `?6c`: nora answers `CSI ? 62 ; 22 c` (VT220, ANSI color).
 
 The active pane is an AT-SPI2 `terminal` (role 60) through AccessKit's Unix
 adapter (`src/app/a11y.rs`): its text is the visible rows (trailing blanks
-trimmed, `\n` between rows, wide characters and combining marks as one
+trimmed, except those before the cursor on its row, `\n` between rows, wide characters and combining marks as one
 character each, placeholder cells as spaces), the caret is the cursor (the
 selection when there is one), and character extents come from the cell
 grid. Trees are sent only while an assistive technology has activated the

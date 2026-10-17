@@ -91,8 +91,16 @@ impl TextModel {
                 line.widths.push(span * cw);
                 line.columns.push(cell.col);
             }
-            // Trailing blanks are not text.
-            while line.text.ends_with(' ') && line.lengths.last() == Some(&1) {
+            // Trailing blanks are not text, except before the cursor on its
+            // row: a typed space is reported and the caret stays on it.
+            let keep_before = match snap.cursor {
+                Some((cursor_row, cursor_col)) if cursor_row == row => cursor_col,
+                _ => 0,
+            };
+            while line.text.ends_with(' ')
+                && line.lengths.last() == Some(&1)
+                && line.columns.last().is_some_and(|&col| col >= keep_before)
+            {
                 line.text.pop();
                 line.lengths.pop();
                 line.positions.pop();
@@ -401,9 +409,14 @@ mod tests {
         let m = model(b"ab\x1b[1;8H");
         assert_eq!(
             m.selection,
-            Some(((0, 2), (0, 2))),
-            "end of the trimmed text"
+            Some(((0, 7), (0, 7))),
+            "blanks before the cursor are kept, so the caret is on it"
         );
+        assert_eq!(m.lines[0].text, "ab     \n");
+        // Past the cursor, and on other rows, trailing blanks are trimmed.
+        let m = model(b"ab  \r\nls \x1b[2;4H");
+        assert_eq!(m.text(), "ab\nls \n");
+        assert_eq!(m.selection, Some(((1, 3), (1, 3))), "caret after the space");
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
