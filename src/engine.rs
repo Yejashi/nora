@@ -62,6 +62,8 @@ pub struct Engine {
     graphics: Arc<Mutex<crate::graphics_image::GraphicsState>>,
     /// The graphics version the last snapshot showed.
     graphics_seen: u64,
+    /// The cursor state the last snapshot showed (see [`CursorCells`]).
+    cursor_seen: Option<CursorCells>,
     /// Byte-bounded queue of prompt-marker events, shared between the
     /// headless `Engine::feed` path and the PTY `EventLoop` filter (N35a).
     marker_queue: Arc<Mutex<crate::prompt_marker::MarkerQueue>>,
@@ -605,6 +607,7 @@ impl Engine {
             stream,
             graphics: targets.graphics,
             graphics_seen: 0,
+            cursor_seen: None,
             marker_queue: targets.markers,
             marker_store: crate::prompt_marker::MarkerStore::new(),
             cwd: targets.cwd,
@@ -731,6 +734,19 @@ impl Engine {
     /// due although the grid has no damage.
     pub fn graphics_changed(&self) -> bool {
         self.graphics().version() != self.graphics_seen
+    }
+
+    /// Whether the cursor, or the cells next to it, changed since the last
+    /// snapshot in a way the term's damage does not report. The pinned
+    /// `Term` damages no cell on `input` and relies on the old and new
+    /// cursor positions, so a change that leaves the cursor in place (a
+    /// character written into the last column with a wrap pending, a
+    /// combining mark on the cell before the cursor, EL/ECH that clears
+    /// only the cursor cell, DECTCEM, DECSCUSR) has the same damage shape
+    /// as "nothing happened" (`is_noop_damage`).
+    pub fn cursor_changed(&self) -> bool {
+        let term = self.term.lock();
+        self.cursor_seen.as_ref() != Some(&CursorCells::of(&term))
     }
 
     /// Drain the prompt-marker queue (N35a), returning all pending
@@ -1508,6 +1524,7 @@ impl Engine {
             display_offset,
             images,
         };
+        self.cursor_seen = Some(CursorCells::of(&term));
         term.reset_damage();
         snapshot
     }
@@ -1674,4 +1691,60 @@ fn placeholder_tiles(
         }
     }
     tiles
+}
+
+/// What a frame shows at and next to the cursor that the pinned `Term`'s
+/// damage can miss: the cursor's position, visibility, style and pending
+/// wrap, and the cells from two columns left of it (where a combining
+/// mark lands after a wide character) to the cursor cell.
+#[derive(Clone, Debug, PartialEq)]
+struct CursorCells {
+    point: (i32, usize),
+    visible: bool,
+    style: alacritty_terminal::vte::ansi::CursorStyle,
+    wrap_pending: bool,
+    cells: [Option<CursorCell>; 3],
+}
+
+/// One cell's visible content for [`CursorCells`].
+#[derive(Clone, Debug, PartialEq)]
+struct CursorCell {
+    ch: char,
+    zerowidth: Vec<char>,
+    flags: Flags,
+    fg: Color,
+    bg: Color,
+}
+
+impl CursorCells {
+    fn of(term: &Term<Recorder>) -> Self {
+        let grid = term.grid();
+        let cursor = &grid.cursor;
+        let line = cursor.point.line;
+        let col = cursor.point.column.0;
+        let row = &grid[line];
+        let cell = |c: Option<usize>| {
+            c.filter(|&c| c < grid.columns()).map(|c| {
+                let cell = &row[Column(c)];
+                CursorCell {
+                    ch: cell.c,
+                    zerowidth: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
+                    flags: cell.flags,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                }
+            })
+        };
+        Self {
+            point: (line.0, col),
+            visible: term.mode().contains(TermMode::SHOW_CURSOR),
+            style: term.cursor_style(),
+            wrap_pending: cursor.input_needs_wrap,
+            cells: [
+                cell(col.checked_sub(2)),
+                cell(col.checked_sub(1)),
+                cell(Some(col)),
+            ],
+        }
+    }
 }

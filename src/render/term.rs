@@ -96,6 +96,10 @@ pub fn cursor_visible(snap: &Snapshot) -> bool {
 /// reports when only the cursor moved in place — or an empty `Partial`
 /// (nothing damaged, whatever the cursor). Anything wider, on another row,
 /// `Full`, or a span with no cursor to account for it is real damage.
+///
+/// The no-op shape can hide a change in place at the cursor (a character
+/// in the last column, a combining mark, DECTCEM, DECSCUSR); callers also
+/// check `Engine::cursor_changed`.
 pub fn is_noop_damage(damage: &Damage, cursor: Option<(usize, usize)>) -> bool {
     let Damage::Partial(lines) = damage else {
         return false;

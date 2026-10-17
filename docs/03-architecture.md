@@ -104,6 +104,8 @@ The window wires the layout into the event loop. `WinApp` owns a per-tab `Layout
 
 Use engine damage for content plus nora-owned invalidation for cursor, selection, search, focus, DPI, palette, atlas rebuild and viewport changes. Upstream damage excludes some UI-controlled elements [S07].
 
+The pump skips a frame when the damage is only the always-damaged cursor cell (`is_noop_damage`). That shape also covers real changes in place at the cursor, because the pinned `Term` damages no cell on input and relies on the old and new cursor positions: a character written into the last column (wrap pending), a combining mark on the cell before the cursor, EL0/EL1 that clear only the cursor cell, DECTCEM and DECSCUSR. `Engine::snapshot` therefore records the cursor's position, visibility, style, pending wrap and the cells from two columns left of it to the cursor, and `Engine::cursor_changed` reports a difference as a frame (`tests/cursor_damage.rs`).
+
 Reset engine damage only after its information/content have been captured into durable renderer-side state while holding the lock. A lost/superseded frame must not lose updates. The initial renderer keeps a complete latest visible snapshot. When snapshots become deltas, use a base revision and require a full rebuild on any mismatch. Do not build an unbounded queue of deltas.
 
 Coalesce redraw wakeups: one pending wake per instance is sufficient, with a race-safe clear/recheck of dirty generations. A PTY event arriving while the UI clears the flag must still schedule work. Do not queue a cloned screen for every parser read.

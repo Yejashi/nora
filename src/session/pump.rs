@@ -65,8 +65,13 @@ pub fn pump_tick_with(session: &mut PtySession, want_snapshot: bool) -> PumpOutc
     let mut snapshot = None;
     if !terminated && want_snapshot {
         let (damage, cursor) = session.engine().probe();
-        // An image change is a frame even without grid damage.
-        if !is_noop_damage(&damage, cursor) || session.engine().graphics_changed() {
+        // An image change is a frame even without grid damage, and so is
+        // a change at the cursor the term reports as cursor-only damage
+        // (`Engine::cursor_changed`).
+        if !is_noop_damage(&damage, cursor)
+            || session.engine().cursor_changed()
+            || session.engine().graphics_changed()
+        {
             snapshot = Some(session.engine().snapshot());
         }
     }
@@ -838,7 +843,7 @@ fn tick_pane(
         let finished = pane_pump.session.wait_drain(Duration::from_millis(10));
         let stored = {
             let (damage, cursor) = pane_pump.session.engine().probe();
-            if !is_noop_damage(&damage, cursor) {
+            if !is_noop_damage(&damage, cursor) || pane_pump.session.engine().cursor_changed() {
                 let snapshot = pane_pump.session.engine().snapshot();
                 let (rows, cols) = (snapshot.rows, snapshot.cols);
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
