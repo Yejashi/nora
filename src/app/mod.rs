@@ -280,18 +280,34 @@ fn contains_pane(node: &LayoutNode, pane: PaneId) -> bool {
     }
 }
 
-/// The first leaf of `node` in pre-order (N24b): the leftmost/topmost pane.
-fn first_leaf(node: &LayoutNode) -> Option<PaneId> {
+/// The leaf of `node` on the edge a move in `dir` enters from: moving
+/// left enters a subtree from its right edge (so a horizontal split takes
+/// its second child), moving up enters from the bottom; a split across the
+/// move takes its first (top/left) child.
+fn entry_leaf(node: &LayoutNode, dir: FocusDir) -> PaneId {
     match node {
-        LayoutNode::Leaf(id) => Some(*id),
-        LayoutNode::Split { first, .. } => first_leaf(first),
+        LayoutNode::Leaf(id) => *id,
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => {
+            let from_far_edge = matches!(
+                (dir, direction),
+                (FocusDir::Left, SplitDirection::Horizontal)
+                    | (FocusDir::Up, SplitDirection::Vertical)
+            );
+            entry_leaf(if from_far_edge { second } else { first }, dir)
+        }
     }
 }
 
 /// Find the pane adjacent to `active` in `dir` (N24b), walking the layout
 /// tree. Returns `None` when the active pane is at the edge in that
-/// direction (no adjacent pane). For a split whose sibling is itself a
-/// split, the sibling's first leaf (pre-order) is chosen.
+/// direction (no adjacent pane). The innermost split holding the active
+/// pane is tried first, so a nearer sibling wins over an outer one; a
+/// sibling subtree is entered at the leaf on its near edge.
 fn adjacent_pane(node: &LayoutNode, active: PaneId, dir: FocusDir) -> Option<PaneId> {
     match node {
         LayoutNode::Leaf(_) => None,
@@ -304,28 +320,22 @@ fn adjacent_pane(node: &LayoutNode, active: PaneId, dir: FocusDir) -> Option<Pan
             let first_has = contains_pane(first, active);
             let second_has = contains_pane(second, active);
             match (first_has, second_has) {
-                (true, false) => {
-                    if matches!(
+                (true, false) => adjacent_pane(first, active, dir).or_else(|| {
+                    matches!(
                         (dir, direction),
                         (FocusDir::Right, SplitDirection::Horizontal)
                             | (FocusDir::Down, SplitDirection::Vertical)
-                    ) {
-                        first_leaf(second)
-                    } else {
-                        adjacent_pane(first, active, dir)
-                    }
-                }
-                (false, true) => {
-                    if matches!(
+                    )
+                    .then(|| entry_leaf(second, dir))
+                }),
+                (false, true) => adjacent_pane(second, active, dir).or_else(|| {
+                    matches!(
                         (dir, direction),
                         (FocusDir::Left, SplitDirection::Horizontal)
                             | (FocusDir::Up, SplitDirection::Vertical)
-                    ) {
-                        first_leaf(first)
-                    } else {
-                        adjacent_pane(second, active, dir)
-                    }
-                }
+                    )
+                    .then(|| entry_leaf(first, dir))
+                }),
                 _ => None,
             }
         }
@@ -2889,5 +2899,102 @@ mod suggestion_tests {
         assert_eq!(super::next_word(" --short"), " --short");
         assert_eq!(super::next_word("  a b"), "  a");
         assert_eq!(super::next_word("x"), "x");
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::{FocusDir, LayoutNode, PaneId, SplitDirection, adjacent_pane};
+
+    fn leaf(id: u32) -> LayoutNode {
+        LayoutNode::Leaf(PaneId(id))
+    }
+
+    fn split(direction: SplitDirection, first: LayoutNode, second: LayoutNode) -> LayoutNode {
+        LayoutNode::Split {
+            direction,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn nearer_sibling_wins_over_outer_split() {
+        // H{A, H{B, C}}: left of C is B, left of B is A.
+        let tree = split(
+            SplitDirection::Horizontal,
+            leaf(0),
+            split(SplitDirection::Horizontal, leaf(1), leaf(2)),
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(2), FocusDir::Left),
+            Some(PaneId(1))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(1), FocusDir::Left),
+            Some(PaneId(0))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(0), FocusDir::Right),
+            Some(PaneId(1))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(1), FocusDir::Right),
+            Some(PaneId(2))
+        );
+        assert_eq!(adjacent_pane(&tree, PaneId(0), FocusDir::Left), None);
+        assert_eq!(adjacent_pane(&tree, PaneId(2), FocusDir::Right), None);
+    }
+
+    #[test]
+    fn subtree_is_entered_at_its_near_edge() {
+        // H{H{0, 2}, 1}: left of 1 is 2 (the near edge), not 0.
+        let tree = split(
+            SplitDirection::Horizontal,
+            split(SplitDirection::Horizontal, leaf(0), leaf(2)),
+            leaf(1),
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(1), FocusDir::Left),
+            Some(PaneId(2))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(2), FocusDir::Right),
+            Some(PaneId(1))
+        );
+        // V{V{0, 2}, 1}: up from 1 is 2.
+        let tree = split(
+            SplitDirection::Vertical,
+            split(SplitDirection::Vertical, leaf(0), leaf(2)),
+            leaf(1),
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(1), FocusDir::Up),
+            Some(PaneId(2))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(0), FocusDir::Down),
+            Some(PaneId(2))
+        );
+    }
+
+    #[test]
+    fn perpendicular_split_is_crossed_to_the_outer_sibling() {
+        // H{A, V{B, C}}: left of C is A; up from C is B.
+        let tree = split(
+            SplitDirection::Horizontal,
+            leaf(0),
+            split(SplitDirection::Vertical, leaf(1), leaf(2)),
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(2), FocusDir::Left),
+            Some(PaneId(0))
+        );
+        assert_eq!(
+            adjacent_pane(&tree, PaneId(2), FocusDir::Up),
+            Some(PaneId(1))
+        );
+        assert_eq!(adjacent_pane(&tree, PaneId(1), FocusDir::Up), None);
     }
 }
