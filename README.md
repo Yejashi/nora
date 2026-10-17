@@ -63,6 +63,9 @@ kill/yank, which a terminal that guesses from the screen gets wrong.
 - **Images.** The kitty graphics protocol: PNG and raw RGB(A) images,
   inline or from a file, drawn at the cursor under or over the text and
   scrolling with it.
+- **Screen readers.** The active pane's text, cursor and selection are
+  exposed over AT-SPI2 (Linux) through AccessKit, with change events for
+  new output.
 - **Live configuration.** One TOML file, validated, applied on save.
   Covers fonts, colors, cursor, scrollback and key bindings.
 - **Bounded and safe by default.** Size caps on control sequences and
@@ -282,6 +285,8 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   [docs/15-platforms.md](docs/15-platforms.md).
 - **Not supported yet:** font ligatures; kitty graphics animation and
   relative placements (images, including in tmux, are shown).
+- **Screen readers.** Verified over AT-SPI2 (text, caret, live updates);
+  Orca's speech has not been checked in a real session yet.
 - **Input methods.** Composition is checked end to end with ibus over
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
   Wayland text-input path and the drawing of a candidate window have not

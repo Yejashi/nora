@@ -115,6 +115,9 @@ impl PaneKey {
 /// longer exists (stale).
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    /// An assistive technology asked for the accessibility tree (N37); the
+    /// window sends it.
+    Accessibility,
     /// The pump fetched a snapshot for the pane (stored in that pane's
     /// slot); non-noop damage.
     DirtyPulse { pane: PaneKey },

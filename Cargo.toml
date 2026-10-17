@@ -50,6 +50,13 @@ unicode-width = "0.2.2"
 wgpu = "30.0.1"
 winit = "0.30.13"
 
+# Screen readers (N37, ADR-015): the terminal text as an AT-SPI2 tree
+# through AccessKit's Unix adapter (D-Bus via zbus). Linux and the BSDs
+# only; other platforms have no provider yet.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+accesskit = "0.25.1"
+accesskit_unix = "0.24.0"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

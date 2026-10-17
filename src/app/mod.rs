@@ -4,6 +4,7 @@
 //! surface to it and reports backend/device metadata. No terminal content is
 //! rendered yet; the terminal arrives with the N03 engine adapter.
 
+mod a11y;
 pub mod glyphs;
 mod graphics;
 mod images;
@@ -137,6 +138,26 @@ fn platform_hint() -> String {
     } else {
         "unknown (neither WAYLAND_DISPLAY nor DISPLAY is set)".to_owned()
     }
+}
+
+/// The window's outer and inner rectangles on the screen (x, y, width,
+/// height), for accessibility; positions are 0 where the platform does
+/// not tell them (Wayland).
+fn window_bounds(window: &Window) -> ([f64; 4], [f64; 4]) {
+    let rect = |position: Option<winit::dpi::PhysicalPosition<i32>>,
+                size: winit::dpi::PhysicalSize<u32>| {
+        let position = position.unwrap_or_default();
+        [
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(size.width),
+            f64::from(size.height),
+        ]
+    };
+    (
+        rect(window.outer_position().ok(), window.outer_size()),
+        rect(window.inner_position().ok(), window.inner_size()),
+    )
 }
 
 /// Whether `window` is an X11 window (by its raw handle, not by guessing
@@ -515,6 +536,11 @@ struct WinApp {
     config_state: nora::config::ConfigState,
     /// Wakes this window from other threads (the font loader).
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    /// Screen readers (N37): the active pane's text over AT-SPI2.
+    accessibility: a11y::Accessibility,
+    /// The active pane's origin and cell size at the last frame, to build
+    /// its accessible text when a screen reader starts listening.
+    a11y_geometry: Option<((f32, f32), (f32, f32))>,
     /// The full font system being built in the background.
     full_fonts: Option<Arc<Mutex<Option<glyphon::FontSystem>>>>,
     /// Each pane's title (OSC 0/2); the window shows the active pane's.
@@ -730,6 +756,8 @@ pub fn run_windowed(
         last_motion_cell: None,
         pane_titles: std::collections::HashMap::new(),
         proxy: event_loop.create_proxy(),
+        accessibility: a11y::Accessibility::new(event_loop.create_proxy()),
+        a11y_geometry: None,
         full_fonts: None,
         pane_last: std::collections::HashMap::new(),
         suggestions: std::collections::HashMap::new(),
@@ -1489,6 +1517,21 @@ impl WinApp {
     /// decide whether to exit).
     fn on_pane_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) -> Action {
         match event {
+            AppEvent::Accessibility => {
+                // A screen reader started listening: the full tree of what is
+                // on screen now (there may be no new frame for a while).
+                let built = self.active_pane_key().zip(self.a11y_geometry).and_then(
+                    |(active, (origin, cell))| {
+                        let snap = self.pane_last.get(&active)?;
+                        let title = self.window.as_ref().map(|w| w.title()).unwrap_or_default();
+                        Some(a11y::TextModel::of(snap, origin, cell, &title))
+                    },
+                );
+                match built {
+                    Some(model) => self.accessibility.update(model),
+                    None => self.accessibility.resend(),
+                }
+            }
             AppEvent::DirtyPulse { pane } => {
                 if self.pane_is_live(&pane) {
                     if self.active_pane_key() == Some(pane) {
@@ -2075,6 +2118,20 @@ impl WinApp {
                         line1
                     );
                 }
+                // Screen readers (N37): the active pane's text, while one listens.
+                if let Some((_, x, y, ..)) = panes.iter().find(|p| p.0 == active) {
+                    self.a11y_geometry = Some((
+                        (f32::from(*x) * layout.cell_w, f32::from(*y) * layout.cell_h),
+                        (layout.cell_w, layout.cell_h),
+                    ));
+                }
+                if self.accessibility.is_active()
+                    && let Some((.., Some(snap))) = panes.iter().find(|p| p.0 == active)
+                    && let Some((origin, cell)) = self.a11y_geometry
+                {
+                    let model = a11y::TextModel::of(snap, origin, cell, &window.title());
+                    self.accessibility.update(model);
+                }
                 for (key, .., snap) in panes {
                     if let Some(snap) = snap {
                         self.pane_last.insert(key, snap);
@@ -2299,6 +2356,8 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 self.attempt_render(event_loop, true);
             }
             WindowEvent::Resized(size) => {
+                let (outer, inner) = window_bounds(&window);
+                self.accessibility.set_bounds(outer, inner);
                 if size.width == 0 || size.height == 0 {
                     // No set_size, no PumpMsg, no redraw: just record.
                     let (state, _action) =
@@ -2801,6 +2860,9 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 }
             },
             WindowEvent::Focused(focused) => {
+                self.accessibility.set_focused(focused);
+                let (outer, inner) = window_bounds(&window);
+                self.accessibility.set_bounds(outer, inner);
                 // N16b: report the focus change when the engine has
                 // focus reporting enabled (`FOCUS_IN_OUT`);
                 // `encode_focus_event` returns `None` otherwise. The

@@ -124,6 +124,21 @@ stream transfer) and `chafa -f kitty` draw their images (e2e `imagetools`;
 CI runs chafa, icat ran locally). The detection needs a DA1 reply longer
 than `?6c`: nora answers `CSI ? 62 ; 22 c` (VT220, ANSI color).
 
+### Screen readers (N37, ADR-015)
+
+The active pane is an AT-SPI2 `terminal` (role 60) through AccessKit's Unix
+adapter (`src/app/a11y.rs`): its text is the visible rows (trailing blanks
+trimmed, `\n` between rows, wide characters and combining marks as one
+character each, placeholder cells as spaces), the caret is the cursor (the
+selection when there is one), and character extents come from the cell
+grid. Trees are sent only while an assistive technology has activated the
+adapter, and only when the text, caret or selection changed; AccessKit
+derives the AT-SPI2 events (text changed, caret moved) from them. Proof:
+unit tests in `src/app/a11y.rs`; e2e `a11y` reads the role, the text, the
+caret offset and a live update over AT-SPI2 with gdbus. Not verified:
+Orca's speech (Orca aborts under Xvfb); other panes and the tab bar are not
+exposed; scrollback is exposed only as far as the view is scrolled.
+
 ## Paste
 
 Read clipboard text through the platform adapter. Validate maximum accepted size before any bytes are written. Normalize newlines by a documented policy (CRLF/LF to CR for terminal paste), and distinguish ordinary paste from bracketed paste. Prevent injected bracket terminators according to a tested sanitization policy; never let pasted escape delimiters prematurely terminate the transaction. Explain any removed control characters in the user docs.

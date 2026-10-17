@@ -1,7 +1,12 @@
 # N37: Accessible terminal-text exposure (Linux AT-SPI2)
 
-Implementation status: not_started. This card is a plan, not evidence of
-completion.
+Implementation status: done 2026-10-17 through AccessKit (ADR-015):
+N37a and N37b (tree, terminal text over AT-SPI2) and the caret, selection
+and text-change events of N37c (derived by AccessKit from tree diffs).
+Evidence: unit tests in `src/app/a11y.rs`, e2e `a11y` (role, text, caret
+and a live update read over AT-SPI2 with gdbus). Orca's speech is not
+verified: Orca aborts under Xvfb (XInput `BadWindow`); a manual check in a
+real session is pending.
 
 - Dependencies: N36 (ADR-012).
 - Read: [13-extensions.md](../13-extensions.md), [03-architecture.md](../03-architecture.md), [ADR-012](../adr/ADR-012-accessible-terminal-text.md).

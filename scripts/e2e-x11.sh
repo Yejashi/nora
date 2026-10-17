@@ -1312,6 +1312,89 @@ CHILD
     pass less
 }
 
+# Screen readers (N37, ADR-015): over AT-SPI2 (a private session bus, the
+# accessibility bus and its registry), nora's terminal node has the
+# terminal role, its text is the screen, the caret is at the cursor, and
+# new output updates the text.
+scenario_a11y() {
+    local launcher registryd
+    launcher=$(ls /usr/lib/at-spi-bus-launcher /usr/libexec/at-spi-bus-launcher 2>/dev/null | head -1)
+    registryd=$(ls /usr/lib/at-spi2-registryd /usr/libexec/at-spi2-registryd 2>/dev/null | head -1)
+    [ -n "$launcher" ] && [ -n "$registryd" ] || { echo "SKIP a11y: at-spi2-core not installed"; return; }
+    have gdbus a11y || return
+    have dbus-daemon a11y || return
+    local dir="$OUT/a11y"; rm -rf "$dir"; mkdir -p "$dir"
+    local bus_info bus_pid launcher_pid registry_pid
+    bus_info=$(dbus-daemon --session --fork --print-address=1 --print-pid=1)
+    bus_pid=$(echo "$bus_info" | sed -n 2p)
+    export DBUS_SESSION_BUS_ADDRESS=$(echo "$bus_info" | sed -n 1p)
+    "$launcher" --launch-immediately >"$dir/launcher.log" 2>&1 &
+    launcher_pid=$!
+    local address=""
+    for _ in $(seq 1 50); do
+        address=$(gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
+            --method org.a11y.Bus.GetAddress 2>/dev/null | sed "s/^('\(.*\)',)\$/\1/")
+        [ -n "$address" ] && break
+        sleep 0.1
+    done
+    "$registryd" >"$dir/registryd.log" 2>&1 &
+    registry_pid=$!
+    gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
+        --method org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<true>' >/dev/null
+    stop_a11y() {
+        kill "$registry_pid" "$launcher_pid" "$bus_pid" 2>/dev/null
+        unset DBUS_SESSION_BUS_ADDRESS
+    }
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+printf 'HELLO ACCESSIBLE WORLD\r\nsecond line'
+while [ ! -e "$dir/more" ]; do sleep 0.1; done
+printf '\r\nthird line'
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch a11y "$dir/child.sh" || { stop_a11y; fail a11y "no window"; return; }
+    call() { gdbus call --address "$address" --dest "$1" --object-path "$2" --method "$3" "${@:4}" 2>/dev/null; }
+    # Walk the registry to the node with the terminal role (60).
+    local found="" node
+    for _ in $(seq 1 50); do
+        local queue=("org.a11y.atspi.Registry|/org/a11y/atspi/accessible/root") seen=0
+        while [ ${#queue[@]} -gt 0 ] && [ "$seen" -lt 50 ]; do
+            node=${queue[0]}; queue=("${queue[@]:1}"); seen=$((seen + 1))
+            if [ "$(call "${node%%|*}" "${node##*|}" org.a11y.atspi.Accessible.GetRole)" = "(uint32 60,)" ]; then
+                found=$node; break
+            fi
+            local child
+            for child in $(call "${node%%|*}" "${node##*|}" org.a11y.atspi.Accessible.GetChildren \
+                | grep -o "('[^']*', objectpath '[^']*')" | sed "s/('\([^']*\)', objectpath '\([^']*\)')/\1|\2/"); do
+                queue+=("$child")
+            done
+        done
+        [ -n "$found" ] && break
+        sleep 0.2
+    done
+    local text caret text2=""
+    if [ -n "$found" ]; then
+        text=$(call "${found%%|*}" "${found##*|}" org.a11y.atspi.Text.GetText 0 "int32 -1")
+        caret=$(gdbus call --address "$address" --dest "${found%%|*}" --object-path "${found##*|}" \
+            --method org.freedesktop.DBus.Properties.Get org.a11y.atspi.Text CaretOffset 2>/dev/null)
+        : >"$dir/more"
+        for _ in $(seq 1 30); do
+            text2=$(call "${found%%|*}" "${found##*|}" org.a11y.atspi.Text.GetText 0 "int32 -1")
+            case "$text2" in *"third line"*) break ;; esac
+            sleep 0.1
+        done
+    fi
+    finish
+    stop_a11y
+    echo "  terminal node: ${found:-none}; text: $(printf '%s' "$text" | cut -c1-50); caret: $caret"
+    [ -n "$found" ] || { fail a11y "no node with the terminal role"; return; }
+    case "$text" in "('HELLO ACCESSIBLE WORLD\\nsecond line\\n"*) ;; *) fail a11y "text differs: $text"; return ;; esac
+    [ "$caret" = "(<34>,)" ] || { fail a11y "caret $caret, expected 34 (after 'second line')"; return; }
+    case "$text2" in *"second line\\nthird line\\n"*) ;; *) fail a11y "new output not in the text: $text2"; return ;; esac
+    pass a11y
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -1351,7 +1434,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale graphics imagetools atlas zshell suggest prompts ime vim nvim less ssh a11y tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done
