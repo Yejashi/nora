@@ -77,9 +77,13 @@ codegen-units = 1
 # `EventLoop::filter` field, `EventLoop::with_filter`, the `pty_read` hook
 # and `at_marker_position` (markers inside a synchronized update), the
 # in-flight input counter, deferring a `pty_read` error until already-read
-# bytes are parsed and woken for (no lost final output), `send` accepting a
-# queued message whatever the waker reports, the DA1 reply (`?62;22c`), and
-# `grow_lines` not counting its history scroll as a shift. See
+# bytes are parsed and woken for (no lost final output), `pty_read`
+# returning the bytes it parsed and the exit drain repeating it (bounded),
+# no redraw while a synchronized update is pending (`with_sync_pending`),
+# the filter's `needs_unlocked`/`run_unlocked` hooks (file media read with
+# the lock released), `send` accepting a queued message whatever the waker
+# reports, the DA1 reply (`?62;22c`), and `grow_lines` not counting its
+# history scroll as a shift. See
 # docs/adr/ADR-011-graphics-apc-hook.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
