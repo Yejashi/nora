@@ -367,6 +367,11 @@ impl Fonts {
         self.metrics.cell_h
     }
 
+    /// The scale factor of the last [`Fonts::measure`].
+    pub fn measured_scale(&self) -> f64 {
+        self.scale
+    }
+
     /// Build the full font system (every installed font, for per-glyph
     /// fallback) on a background thread. The returned slot is filled when
     /// it is ready, after which `notify` runs (to wake the window).
@@ -548,6 +553,9 @@ mod font_resolution_tests {
         assert!((i64::from(m2.cell_h) - 2 * i64::from(m1.cell_h)).abs() <= 1);
         assert_eq!(fonts.measure(1.0, 2.0), m2, "zoom 2 at scale 1 == scale 2");
         let m125 = fonts.measure(1.25, 1.0);
+        // `Resized` compares this with the window's scale to catch a
+        // scale change it missed while zero-sized.
+        assert_eq!(fonts.measured_scale(), 1.25);
         for m in [m1, m125, m2] {
             let (cols, rows) = grid_size(1000, 700, m.cell_w, m.cell_h);
             assert!(u32::from(cols) * m.cell_w <= 1000);

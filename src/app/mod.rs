@@ -2428,9 +2428,16 @@ impl ApplicationHandler<AppEvent> for WinApp {
 
                 // (b) The grid that fits the new *logical* size from the
                 // pinned mono metrics (N11a: logical derivation; pure: no
-                // GPU, no display).
-                let (cols, rows) = match self.fonts.as_ref() {
-                    Some(fonts) => window_grid(&window, fonts),
+                // GPU, no display). A scale-factor change that arrived
+                // while the window was zero-sized (or never arrived as an
+                // event) is measured here, before the grid is derived.
+                let (cols, rows) = match self.fonts.as_mut() {
+                    Some(fonts) => {
+                        if fonts.measured_scale() != window.scale_factor() {
+                            fonts.measure(window.scale_factor(), self.zoom);
+                        }
+                        window_grid(&window, fonts)
+                    }
                     None => (0, 0),
                 };
 
