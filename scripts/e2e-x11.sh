@@ -860,7 +860,7 @@ RC
     [ "$ghost" -gt $((plain + 50)) ] || { fail suggest "no ghost text drawn"; return; }
     [ "$(cat "$dir/out.txt")" = "$(printf 'ghost-alpha-1\nghost-alpha-1')" ] \
         || { fail suggest "accepted command differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
-    grep -q '^shell: suggestion Some("1.sh")' "$OUT/suggest/nora.log" || { fail suggest "no path completion for scripts/e2e-x1"; return; }
+    grep -Eq '^shell: (path )?suggestion Some\("1.sh"\)' "$OUT/suggest/nora.log" || { fail suggest "no path completion for scripts/e2e-x1"; return; }
     [ "$exited" = yes ] || { fail suggest "nora did not exit within 5 s of SIGTERM"; return; }
     grep -q "termination signal" "$OUT/suggest/nora.log" || { fail suggest "SIGTERM not handled"; return; }
     grep -q "echo ghost-alpha-1" "$hist" 2>/dev/null || { fail suggest "history not saved at $hist"; return; }
