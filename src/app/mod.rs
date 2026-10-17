@@ -576,9 +576,10 @@ struct WinApp {
     trace_suggest_key_at: Option<std::time::Instant>,
     trace_suggest_pending: bool,
     /// Keys whose press went to the application, each with whether kitty
-    /// event types were on then: only such a key's release is reported,
-    /// so the application never sees a release without its press.
-    sent_keys: std::collections::HashMap<winit::keyboard::PhysicalKey, bool>,
+    /// event types were on then and the pane it went to: only such a key's
+    /// release is reported, to that pane, so the application never sees a
+    /// release without its press (bounded by the number of physical keys).
+    sent_keys: std::collections::HashMap<winit::keyboard::PhysicalKey, (PaneKey, bool)>,
     trace_latency: bool,
     /// `NORA_TRACE_FRAMES`: log a per-phase timing line for every frame.
     trace_frames: bool,
@@ -1341,7 +1342,20 @@ impl WinApp {
     /// `false` (the key goes to the application) when there is none to
     /// accept.
     /// Encode a key event under the active kitty keyboard flags.
-    fn encode_kitty(&self, event: &winit::event::KeyEvent) -> Kitty {
+    /// `pane`'s live terminal modes: the mirrored field for the active
+    /// pane, its parked entry otherwise.
+    fn modes_of(&self, pane: PaneKey) -> TermMode {
+        if self.active_pane_key() == Some(pane) {
+            self.modes
+        } else {
+            self.pane_modes
+                .get(&pane)
+                .copied()
+                .unwrap_or(TermMode::SHOW_CURSOR)
+        }
+    }
+
+    fn encode_kitty(&self, event: &winit::event::KeyEvent, modes: TermMode) -> Kitty {
         use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
         let unshifted = event.key_without_modifiers();
         let kind = match (event.state, event.repeat) {
@@ -1359,7 +1373,7 @@ impl WinApp {
                 kind,
                 text: event.text.as_deref(),
             },
-            self.modes,
+            modes,
         )
     }
 
@@ -2478,21 +2492,28 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 ..
             } => {
                 // N09b: held-key focus-gain presses are synthetic
-                // duplicates.
-                if is_synthetic {
+                // duplicates. A synthetic release (focus loss with the key
+                // held) still ends a press the application saw, so it
+                // goes through to the release path below.
+                if is_synthetic && event.state == ElementState::Pressed {
                     return;
                 }
                 // A release is reported only under the kitty protocol's
                 // event types, and only for a key whose press reached the
                 // application with them on (not one a local binding
-                // consumed, nor one pressed before the flags changed).
+                // consumed, nor one pressed before the flags changed). It
+                // goes to the pane that got the press, with that pane's
+                // modes, even if focus moved to another pane since.
                 if event.state == ElementState::Released {
-                    if self.sent_keys.remove(&event.physical_key) == Some(true)
-                        && kitty::active(self.modes)
-                        && let Kitty::Send(bytes) = self.encode_kitty(&event)
-                        && let Some(pane) = self.active_pane_key()
+                    if let Some((pane, true)) = self.sent_keys.remove(&event.physical_key)
+                        && self.pane_is_live(&pane)
                     {
-                        let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                        let modes = self.modes_of(pane);
+                        if kitty::active(modes)
+                            && let Kitty::Send(bytes) = self.encode_kitty(&event, modes)
+                        {
+                            let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
+                        }
                     }
                     return;
                 }
@@ -2572,7 +2593,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // its flags; where it keeps the legacy bytes, the legacy
                 // encoder below runs.
                 let kitty_bytes = if kitty::active(self.modes) {
-                    match self.encode_kitty(&event) {
+                    match self.encode_kitty(&event, self.modes) {
                         Kitty::Send(bytes) => Some(bytes),
                         Kitty::Legacy => None,
                         Kitty::Nothing => return,
@@ -2596,7 +2617,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                         InputAction::Send(bytes) => {
                             if let Some(pane) = self.active_pane_key() {
                                 let types = self.modes.contains(TermMode::REPORT_EVENT_TYPES);
-                                self.sent_keys.insert(event.physical_key, types);
+                                self.sent_keys.insert(event.physical_key, (pane, types));
                                 // The buffer is about to change: a stale
                                 // suggestion must not be accepted before
                                 // the shell reports the new one.
