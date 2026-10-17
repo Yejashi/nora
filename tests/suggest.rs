@@ -452,3 +452,93 @@ mod words {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// Path completion runs off the caller's thread (a dead network mount
+/// must not stall the pump): one lookup at a time, a newer request waits
+/// in one slot, and discarded requests never come back.
+mod background_paths {
+    use nora::suggest::{PathCompleter, PathQuery, WordCompletion, plan_word};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    fn poll_until<K>(
+        paths: &mut PathCompleter<K>,
+        woken: &mpsc::Receiver<()>,
+    ) -> Option<(K, Option<String>)> {
+        loop {
+            if let Some(result) = paths.poll() {
+                return Some(result);
+            }
+            if !paths.is_busy() {
+                return None;
+            }
+            woken
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the worker wakes the caller");
+        }
+    }
+
+    #[test]
+    fn plan_word_leaves_the_filesystem_to_the_worker() {
+        let exes: Vec<String> = ["htop"].map(String::from).to_vec();
+        assert_eq!(
+            plan_word("ht", None, None, &exes),
+            WordCompletion::Done(Some("op".to_string()))
+        );
+        assert_eq!(
+            plan_word("cat src/ma", Some("/nonexistent/cwd"), None, &exes),
+            WordCompletion::Path(PathQuery {
+                dir: "/nonexistent/cwd/src/".into(),
+                name: "ma".to_string(),
+            }),
+            "no directory read to plan"
+        );
+        assert_eq!(
+            plan_word("cat x", None, None, &exes),
+            WordCompletion::Done(None),
+            "no cwd"
+        );
+    }
+
+    #[test]
+    fn results_come_back_keyed_and_stale_ones_are_dropped() {
+        let root = std::env::temp_dir().join(format!("nora-bg-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.txt"), "").unwrap();
+        std::fs::write(root.join("beta.txt"), "").unwrap();
+        let (tx, woken) = mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let mut paths = PathCompleter::new(Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        }));
+        let query = |name: &str| PathQuery {
+            dir: root.clone(),
+            name: name.to_string(),
+        };
+
+        paths.request(1u64, query("al"));
+        assert_eq!(
+            poll_until(&mut paths, &woken),
+            Some((1, Some("pha.txt".to_string())))
+        );
+
+        // A request while one runs waits; a newer one replaces it.
+        paths.request(2, query("al"));
+        paths.request(3, query("be"));
+        paths.request(4, query("zz"));
+        let mut got = Vec::new();
+        while let Some(result) = poll_until(&mut paths, &woken) {
+            got.push(result);
+        }
+        assert_eq!(got, vec![(2, Some("pha.txt".to_string())), (4, None)]);
+
+        // Discarded requests, running or waiting, never come back.
+        paths.request(5, query("al"));
+        paths.request(6, query("be"));
+        paths.discard(|&k| k == 5 || k == 6);
+        assert_eq!(poll_until(&mut paths, &woken), None);
+        assert!(!paths.is_busy());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

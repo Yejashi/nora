@@ -145,8 +145,10 @@ Option 4, with these parts:
    (the matches' common prefix, `/` after a single directory), no hidden
    names unless typed, none for words with quotes, escapes or globs, and
    none whose added text has a blank or a shell metacharacter
-   (`;|&()<>$`\"'*?[]{}!#~^=`; it would be typed unquoted). At
-   most 4 096 entries are read per directory. PATH is listed on a
+   (`` ;|&()<>$`\"'*?[]{}!#~^= ``; it would be typed unquoted). At
+   most 4 096 entries are read per directory, on a background thread
+   (one lookup at a time; a stale result is dropped), so a dead network
+   mount cannot stall the pump. PATH is listed on a
    background thread (cold scan measured at 223 ms for 1 921 executables
    in 16 directories, warm 13 ms) and again every 5 minutes.
 4. Rendering and acceptance; e2e: a suggestion appears for a prefix of a

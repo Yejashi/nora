@@ -140,3 +140,11 @@ Evidence: `tests/pty_session.rs` `input_to_a_non_reading_child_is_bounded`.
 The window-to-pump channel is drained on every pump pass. A session close
 can still stall the pump for up to 5 s (audit P6, next slice); during that
 window the channel holds whatever the window sent.
+
+## Suggestions (ADR-013)
+
+| Limit | Value | Past the limit | Evidence |
+| --- | --- | --- | --- |
+| Directory entries per path completion (`suggest::MAX_DIR_ENTRIES`) | 4 096 | no completion | `tests/suggest.rs` `truncated_listing_offers_no_completion` |
+| Path completion lookups (`suggest::PathCompleter`) | 1 running on a `nora-path-complete` thread, 1 waiting | a newer request replaces the waiting one; a lookup that never returns (dead network mount) holds that one thread and blocks later path completions, never the pump | `tests/suggest.rs` `background_paths` |
+| PATH listing (`suggest::MAX_PATH_ENTRIES`, `MAX_PATH_EXECUTABLES`) | 262 144 entries, 65 536 names, on a background thread every 5 min | no executable completion | `tests/suggest.rs` `path_executables_lists_executable_files` |

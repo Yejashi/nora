@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// Most distinct command lines kept.
 pub const MAX_ENTRIES: usize = 5_000;
@@ -427,20 +428,58 @@ pub const MAX_DIR_ENTRIES: usize = 4096;
 /// text), nor do hidden names unless the word starts them with `.`, nor
 /// paths in a directory of more than [`MAX_DIR_ENTRIES`] entries (the
 /// matches past the cap are unknown). An extension with a blank or a
-/// character special to the shell (`;|&()<>$`\"'*?[]{}!#~^=`) is not
+/// character special to the shell (`` ;|&()<>$`\"'*?[]{}!#~^= ``) is not
 /// offered: it is inserted as typed text, unquoted.
+///
+/// This reads the directory on the calling thread; [`plan_word`] and
+/// [`complete_path`] split it into the part that never touches the
+/// filesystem and the part that does.
 pub fn complete_word(
     buffer: &str,
     cwd: Option<&str>,
     home: Option<&str>,
     executables: &[String],
 ) -> Option<String> {
+    match plan_word(buffer, cwd, home, executables) {
+        WordCompletion::Done(completion) => completion,
+        WordCompletion::Path(query) => complete_path(&query),
+    }
+}
+
+/// A path completion still to be looked up: the directory to list and
+/// the start of the name typed in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathQuery {
+    /// The directory the name is in.
+    pub dir: PathBuf,
+    /// The part of the name typed so far.
+    pub name: String,
+}
+
+/// What [`plan_word`] found for the buffer's last word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WordCompletion {
+    /// Decided without the filesystem: an executable's completion, or none.
+    Done(Option<String>),
+    /// A path, which [`complete_path`] completes from its directory.
+    Path(PathQuery),
+}
+
+/// The filesystem-free part of [`complete_word`]: the executable
+/// completion of a first word, nothing, or the directory listing a path
+/// completion needs.
+pub fn plan_word(
+    buffer: &str,
+    cwd: Option<&str>,
+    home: Option<&str>,
+    executables: &[String],
+) -> WordCompletion {
     // The shell splits words at ASCII blanks only: a no-break space
     // (AltGr+Space) or an ideographic space is part of the word. The word
     // starts after the separator character, whatever its width in bytes.
     let separator = |c: char| c.is_ascii_whitespace();
     if buffer.ends_with(separator) {
-        return None;
+        return WordCompletion::Done(None);
     }
     let start = buffer
         .char_indices()
@@ -449,27 +488,46 @@ pub fn complete_word(
         .map_or(0, |(i, c)| i + c.len_utf8());
     let word = &buffer[start..];
     if word.is_empty() || word.contains(['\'', '"', '\\', '$', '`', '*', '?']) {
-        return None;
+        return WordCompletion::Done(None);
     }
     let first_word = buffer[..start].trim().is_empty();
     if first_word && !word.contains('/') {
         let matches = executables.iter().filter(|e| e.starts_with(word));
-        return common_extension(word, matches.map(String::as_str), false);
+        return WordCompletion::Done(common_extension(word, matches.map(String::as_str), false));
     }
     let (dir_part, name) = match word.rfind('/') {
         Some(i) => (&word[..=i], &word[i + 1..]),
         None => ("", word),
     };
     let dir = if let Some(rest) = dir_part.strip_prefix("~/") {
-        std::path::Path::new(home?).join(rest)
+        let Some(home) = home else {
+            return WordCompletion::Done(None);
+        };
+        Path::new(home).join(rest)
     } else if dir_part.starts_with('/') {
         PathBuf::from(dir_part)
     } else {
-        std::path::Path::new(cwd?).join(dir_part)
+        let Some(cwd) = cwd else {
+            return WordCompletion::Done(None);
+        };
+        Path::new(cwd).join(dir_part)
     };
+    WordCompletion::Path(PathQuery {
+        dir,
+        name: name.to_string(),
+    })
+}
+
+/// Complete `query` from its directory's listing (see [`complete_word`]).
+/// This reads the filesystem, which can block for as long as the
+/// filesystem does (a dead network mount): run it off any thread that
+/// must stay responsive, as [`PathCompleter`] does.
+pub fn complete_path(query: &PathQuery) -> Option<String> {
+    let PathQuery { dir, name } = query;
+    let name = name.as_str();
     let mut names = Vec::new();
     let mut single_is_dir = false;
-    for (read, entry) in std::fs::read_dir(&dir).ok()?.enumerate() {
+    for (read, entry) in std::fs::read_dir(dir).ok()?.enumerate() {
         // A listing cut off at the cap may miss matches, so no extension
         // of what it saw is known to be unambiguous.
         if read >= MAX_DIR_ENTRIES {
@@ -558,6 +616,99 @@ fn shell_special(c: char) -> bool {
                 | '^'
                 | '='
         )
+}
+
+/// Runs [`complete_path`] on a background thread, so a slow or hung
+/// filesystem (a dead sshfs or NFS mount) never stalls the thread that
+/// asks. At most one lookup runs at a time; a request made meanwhile waits
+/// in a single slot, replacing any older waiting one. A lookup that never
+/// returns therefore holds one thread and blocks later path completions,
+/// nothing else.
+///
+/// Each request carries a key (say, the pane and the input it answers);
+/// [`PathCompleter::discard`] drops the requests a newer state made
+/// stale, so [`PathCompleter::poll`] returns only current results.
+pub struct PathCompleter<K> {
+    /// Called on the worker thread after its result is ready.
+    wake: Arc<dyn Fn() + Send + Sync>,
+    /// The running lookup: its key (`None` once discarded) and where its
+    /// result arrives.
+    running: Option<(Option<K>, mpsc::Receiver<Option<String>>)>,
+    /// The request waiting for the running lookup to finish.
+    queued: Option<(K, PathQuery)>,
+}
+
+impl<K> PathCompleter<K> {
+    /// No lookup running; `wake` is called on the worker thread each
+    /// time a result is ready to [`PathCompleter::poll`].
+    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            wake,
+            running: None,
+            queued: None,
+        }
+    }
+
+    /// Complete `query` in the background; its result is returned by a
+    /// later [`PathCompleter::poll`] with `key`.
+    pub fn request(&mut self, key: K, query: PathQuery) {
+        if self.running.is_some() {
+            self.queued = Some((key, query));
+        } else {
+            self.start(key, query);
+        }
+    }
+
+    /// Drop the waiting and running requests whose key matches: their
+    /// results are never returned.
+    pub fn discard(&mut self, stale: impl Fn(&K) -> bool) {
+        if self.queued.as_ref().is_some_and(|(key, _)| stale(key)) {
+            self.queued = None;
+        }
+        if let Some((key, _)) = &mut self.running
+            && key.as_ref().is_some_and(&stale)
+        {
+            *key = None;
+        }
+    }
+
+    /// Whether a lookup is running or waiting.
+    pub fn is_busy(&self) -> bool {
+        self.running.is_some() || self.queued.is_some()
+    }
+
+    /// The finished lookup's key and completion, if one finished and was
+    /// not discarded; starts the waiting request, if any.
+    pub fn poll(&mut self) -> Option<(K, Option<String>)> {
+        let (_, results) = self.running.as_ref()?;
+        let completion = match results.try_recv() {
+            Ok(completion) => completion,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            // The worker panicked or could not send: no completion.
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let (key, _) = self.running.take()?;
+        if let Some((next, query)) = self.queued.take() {
+            self.start(next, query);
+        }
+        key.map(|key| (key, completion))
+    }
+
+    fn start(&mut self, key: K, query: PathQuery) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let wake = self.wake.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nora-path-complete".to_string())
+            .spawn(move || {
+                let _ = tx.send(complete_path(&query));
+                wake();
+            });
+        // Without a thread there is no completion; the next request tries
+        // again.
+        if spawned.is_ok() {
+            self.running = Some((Some(key), rx));
+        }
+    }
 }
 
 /// Most directory entries read across all of `PATH` when listing

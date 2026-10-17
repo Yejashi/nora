@@ -584,13 +584,18 @@ struct Suggestions {
     /// of milliseconds); empty until the first listing finishes.
     executables: Arc<Mutex<Arc<Vec<String>>>>,
     executables_at: Option<Instant>,
+    /// Path completions, looked up on a background thread (a dead
+    /// network mount must not stall the pump), keyed by pane and input
+    /// sequence number.
+    paths: crate::suggest::PathCompleter<(PaneKey, u64)>,
 }
 
 impl Suggestions {
     /// Load the user's history. A file that cannot be read starts an
     /// empty history that is not saved this session (one message), so
-    /// the file is never overwritten.
-    fn load() -> Self {
+    /// the file is never overwritten. `wake` wakes the pump when a path
+    /// completion is ready.
+    fn load(wake: crate::engine::Waker) -> Self {
         let mut path = crate::suggest::History::default_path();
         let loaded = path.as_deref().map(crate::suggest::History::load);
         let history = match loaded {
@@ -613,6 +618,7 @@ impl Suggestions {
             saving: None,
             executables: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             executables_at: None,
+            paths: crate::suggest::PathCompleter::new(wake),
         };
         suggestions.refresh_executables();
         suggestions
@@ -641,8 +647,16 @@ impl Suggestions {
     }
 
     /// The best suggestion for `buffer`: history first, else an
-    /// unambiguous path or executable completion of the last word.
-    fn suggest(&mut self, buffer: &str, cwd: Option<&str>, now: u64) -> Option<String> {
+    /// unambiguous executable completion of the last word. A path
+    /// completion is requested in the background under `key` instead
+    /// (`None` now; [`Suggestions::paths`] returns it later).
+    fn suggest(
+        &mut self,
+        key: (PaneKey, u64),
+        buffer: &str,
+        cwd: Option<&str>,
+        now: u64,
+    ) -> Option<String> {
         if let Some(full) = self.history.suggest(buffer, cwd, now) {
             return Some(full[buffer.len()..].to_string());
         }
@@ -653,7 +667,13 @@ impl Suggestions {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let home = std::env::var("HOME").ok();
-        crate::suggest::complete_word(buffer, cwd, home.as_deref(), &executables)
+        match crate::suggest::plan_word(buffer, cwd, home.as_deref(), &executables) {
+            crate::suggest::WordCompletion::Done(completion) => completion,
+            crate::suggest::WordCompletion::Path(query) => {
+                self.paths.request(key, query);
+                None
+            }
+        }
     }
 
     /// Save when changed, at most every `interval`, on a background
@@ -763,6 +783,11 @@ fn update_suggestion(
     if buffer == pane_pump.shell_buffer && password_input == pane_pump.password_input {
         return;
     }
+    let seq = pane_pump.fed_seq;
+    if let Some(s) = suggestions.as_mut() {
+        // A path completion still looked up for this pane is stale now.
+        s.paths.discard(|&(p, _)| p == pane);
+    }
     let engine = pane_pump.session.engine();
     let suffix = match (&buffer, suggestions.as_mut()) {
         (Some(b), Some(s))
@@ -771,7 +796,7 @@ fn update_suggestion(
                 && !engine.modes().contains(TermMode::ALT_SCREEN)
                 && pane_pump.paste_block.is_none() =>
         {
-            s.suggest(&b.text, engine.cwd().as_deref(), now)
+            s.suggest((pane, seq), &b.text, engine.cwd().as_deref(), now)
         }
         _ => None,
     };
@@ -792,7 +817,6 @@ fn update_suggestion(
     // engine parsed only after the key was fed, is tagged with the key's
     // number although it shows the older buffer; the next report (the
     // key's echo) replaces it.
-    let seq = pane_pump.fed_seq;
     let _ = events.send_event(AppEvent::Suggestion { pane, suffix, seq });
 }
 
@@ -950,7 +974,9 @@ pub fn pump_thread(
     sessions.insert(first_pane, PanePump::new(first_session));
     slots.insert(first_pane, first_slot);
 
-    let mut suggestions = options.autocomplete.then(Suggestions::load);
+    let mut suggestions = options
+        .autocomplete
+        .then(|| Suggestions::load(waker.clone()));
     let mut timeout = Duration::ZERO;
     loop {
         // (0) Block until a command, a wake (PTY output, child exit), or
@@ -970,6 +996,17 @@ pub fn pump_thread(
                     update_suggestion(*pane, pane_pump, &mut suggestions, &events);
                 }
             }
+        }
+        // A path completion finished in the background (it woke the
+        // pump); results made stale by a later buffer were discarded.
+        if let Some(s) = suggestions.as_mut()
+            && let Some(((pane, seq), suffix)) = s.paths.poll()
+            && sessions.contains_key(&pane)
+        {
+            if trace_shell() {
+                eprintln!("shell: path suggestion {suffix:?}");
+            }
+            let _ = events.send_event(AppEvent::Suggestion { pane, suffix, seq });
         }
         for pane in removed {
             sessions.remove(&pane);
@@ -1078,7 +1115,7 @@ pub fn pump_thread(
                         if let Some(s) = suggestions.as_mut() {
                             s.save_now();
                         }
-                        suggestions = new.autocomplete.then(Suggestions::load);
+                        suggestions = new.autocomplete.then(|| Suggestions::load(waker.clone()));
                     }
                     if new.cursor_shape != options.cursor_shape {
                         for pane_pump in sessions.values_mut() {
@@ -1324,6 +1361,7 @@ mod tests {
             saving: None,
             executables: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             executables_at: None,
+            paths: crate::suggest::PathCompleter::new(Arc::new(|| {})),
         }
     }
 
