@@ -19,12 +19,10 @@ PREFIX="${HOME}/.local"
 BIN_DIR="$PREFIX/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nora"
 
-# Build when the release binary is missing, so `git clone && ./scripts/install.sh`
-# works from a clean repository; an existing build is reused.
-if [ ! -x target/release/nora ]; then
-    echo "==> building nora (release)"
-    cargo build --release
-fi
+# Always build: cargo is incremental (a current build costs a second),
+# and `git pull && ./scripts/install.sh` must not install a stale binary.
+echo "==> building nora (release)"
+cargo build --release
 
 echo "==> installing binary to $BIN_DIR"
 mkdir -p "$BIN_DIR"
@@ -64,10 +62,10 @@ if command -v tic >/dev/null 2>&1; then
     # Compile the entry into the per-user terminfo database.
     tic -x -o "$HOME/.terminfo" terminfo/nora.terminfo
 else
-    # No tic available: fall back to the source file (compiled entries
-    # are the documented form; this keeps the install functional).
-    mkdir -p "$HOME/.terminfo/n"
-    install -m 0644 terminfo/nora.terminfo "$HOME/.terminfo/n/nora"
+    # ncurses reads only compiled entries; a copied source file would be
+    # an unreadable entry. Without one, nora sets TERM=xterm-256color.
+    echo "    skipped: 'tic' (ncurses) is needed to compile the terminfo entry;"
+    echo "    until it is installed, nora uses TERM=xterm-256color"
 fi
 
 echo "==> installing desktop entry to $PREFIX/share/applications"

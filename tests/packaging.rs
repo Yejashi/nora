@@ -159,9 +159,16 @@ fn install_script_runs() {
         "unexpected --version output: {stdout}"
     );
 
-    assert!(
+    // Only a compiled entry is usable, so without `tic` none is installed
+    // (nora then sets TERM=xterm-256color).
+    let has_tic = Command::new("tic")
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    assert_eq!(
         home.join(".terminfo/n/nora").is_file(),
-        "terminfo entry must be installed to ~/.terminfo"
+        has_tic,
+        "a compiled terminfo entry is installed exactly when tic exists"
     );
     assert!(
         home.join(".local/share/applications/nora.desktop")
