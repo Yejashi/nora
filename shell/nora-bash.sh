@@ -102,8 +102,19 @@ __nora_install_debug_trap() {
 
 # Append our hook to the existing PROMPT_COMMAND (preserving any the user
 # already set). The trap is read only while not yet installed (one
-# command substitution, at the first prompt).
-case "${PROMPT_COMMAND:-}" in
+# command substitution, at the first prompt). An array PROMPT_COMMAND
+# (bash 5.1+) gets a new last element; a string one gets a new line, which
+# is valid after any text (`history -a;` or `cmd &` would make a `; `
+# join a syntax error).
+__nora_prompt_hook='__nora_prompt_start "${__nora_debug_installed:-$(trap -p DEBUG)}"'
+case "${PROMPT_COMMAND[*]-}" in
     *__nora_prompt_start*) ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }"'__nora_prompt_start "${__nora_debug_installed:-$(trap -p DEBUG)}"' ;;
+    *)
+        if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
+            PROMPT_COMMAND+=("$__nora_prompt_hook")
+        else
+            PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}$__nora_prompt_hook"
+        fi
+        ;;
 esac
+unset __nora_prompt_hook
