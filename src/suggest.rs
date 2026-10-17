@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Most distinct command lines kept.
 pub const MAX_ENTRIES: usize = 5_000;
@@ -95,6 +96,19 @@ impl History {
     /// Whether the history changed since it was loaded or last saved.
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// An owned copy to save elsewhere (on another thread); this history
+    /// is marked clean, as [`History::save`] would.
+    pub fn take_snapshot(&mut self) -> Self {
+        self.dirty = false;
+        self.clone()
+    }
+
+    /// Mark the history changed, so it is saved again (after a failed
+    /// save of a snapshot).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     /// Record one execution of `cmdline` in `cwd` that exited with `exit`
@@ -200,8 +214,11 @@ impl History {
         Some(state.join("nora").join("history"))
     }
 
-    /// Load a history file. A missing file is an empty history; lines
-    /// that do not parse are skipped; the caps apply.
+    /// Load a history file. A missing or empty file is an empty history;
+    /// lines that do not parse are skipped; the caps apply. A file that is
+    /// not this format (not UTF-8, or another header) is an
+    /// [`std::io::ErrorKind::InvalidData`] error, and [`History::save`]
+    /// refuses to replace it.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -210,8 +227,15 @@ impl History {
         };
         let mut history = Self::new();
         let mut lines = text.lines();
-        if lines.next() != Some(FILE_HEADER) {
-            return Ok(history);
+        match lines.next() {
+            None => return Ok(history),
+            Some(FILE_HEADER) => {}
+            Some(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("not a \"{FILE_HEADER}\" file"),
+                ));
+            }
         }
         let mut newest = 0;
         for line in lines {
@@ -232,12 +256,52 @@ impl History {
         Ok(history)
     }
 
-    /// Write the history file atomically (a temporary file renamed over
-    /// it), readable by the user only, and mark the history clean.
+    /// Fold `other` (the file another nora process saved) into this
+    /// history, then apply the caps. Per command line: the larger count
+    /// with its failures (each process's count already includes what it
+    /// loaded, so adding would count twice), the newest time, and per
+    /// directory the larger count, keeping the most used.
+    fn merge(&mut self, other: Self) {
+        for theirs in other.entries {
+            let Some(&i) = self.index.get(&theirs.cmdline) else {
+                self.bytes += theirs.cmdline.len();
+                self.index
+                    .insert(theirs.cmdline.clone(), self.entries.len());
+                self.entries.push(theirs);
+                continue;
+            };
+            let mine = &mut self.entries[i];
+            if (theirs.count, theirs.failures) > (mine.count, mine.failures) {
+                mine.count = theirs.count;
+                mine.failures = theirs.failures;
+            }
+            mine.last_used = mine.last_used.max(theirs.last_used);
+            for (dir, n) in theirs.dirs {
+                match mine.dirs.iter_mut().find(|(d, _)| *d == dir) {
+                    Some((_, m)) => *m = (*m).max(n),
+                    None => mine.dirs.push((dir, n)),
+                }
+            }
+            if mine.dirs.len() > MAX_DIRS {
+                mine.dirs.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+                mine.dirs.truncate(MAX_DIRS);
+            }
+        }
+        let newest = self.entries.iter().map(|e| e.last_used).max().unwrap_or(0);
+        self.evict("", newest);
+    }
+
+    /// Write the history file atomically (a temporary file of this
+    /// process's own, renamed over it), readable by the user only, and
+    /// mark the history clean. What the file holds now (another nora
+    /// process may have saved since) is merged in first, so no process
+    /// drops another's commands; a file [`History::load`] rejects is left
+    /// alone and is an error.
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        self.merge(Self::load(path)?);
         let mut text = String::with_capacity(self.bytes + self.entries.len() * 32);
         text.push_str(FILE_HEADER);
         text.push('\n');
@@ -254,20 +318,36 @@ impl History {
             }
             text.push('\n');
         }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            let mut file = options.open(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
+        let tmp = temp_path(path);
+        let written =
+            write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, path)?;
+        written?;
         self.dirty = false;
         Ok(())
     }
+}
+
+/// A temporary file next to `path` that no other save uses: named after
+/// this process and a per-process counter.
+fn temp_path(path: &Path) -> PathBuf {
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let n = SAVES.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// Create `path` (readable by the user only), write `bytes` and sync them.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Whether a (trailing-trimmed) command line may be stored.

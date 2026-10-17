@@ -477,8 +477,13 @@ const EXECUTABLES_REFRESH: Duration = Duration::from_secs(300);
 /// PATH for first-word completion (ADR-013).
 struct Suggestions {
     history: crate::suggest::History,
+    /// Where the history is saved; `None` when it is not saved this
+    /// session (no state directory, or a file nora cannot read).
     path: Option<std::path::PathBuf>,
     last_save: Instant,
+    /// The save running on a background thread (a slow `fsync` must not
+    /// stall the pump), at most one at a time.
+    saving: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     /// Listed on a background thread (a cold scan of PATH takes hundreds
     /// of milliseconds); empty until the first listing finishes.
     executables: Arc<Mutex<Arc<Vec<String>>>>,
@@ -486,21 +491,30 @@ struct Suggestions {
 }
 
 impl Suggestions {
-    /// Load the user's history (an unreadable file starts empty, with a
-    /// message; it is not overwritten until something is recorded).
+    /// Load the user's history. A file that cannot be read starts an
+    /// empty history that is not saved this session (one message), so
+    /// the file is never overwritten.
     fn load() -> Self {
-        let path = crate::suggest::History::default_path();
-        let history = match &path {
-            Some(path) => crate::suggest::History::load(path).unwrap_or_else(|error| {
-                eprintln!("nora: history {}: {error}", path.display());
+        let mut path = crate::suggest::History::default_path();
+        let loaded = path.as_deref().map(crate::suggest::History::load);
+        let history = match loaded {
+            Some(Ok(history)) => history,
+            Some(Err(error)) => {
+                if let Some(file) = path.take() {
+                    eprintln!(
+                        "nora: history {}: {error}; not saving history this session",
+                        file.display()
+                    );
+                }
                 crate::suggest::History::new()
-            }),
+            }
             None => crate::suggest::History::new(),
         };
         let mut suggestions = Self {
             history,
             path,
             last_save: Instant::now(),
+            saving: None,
             executables: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             executables_at: None,
         };
@@ -546,17 +560,84 @@ impl Suggestions {
         crate::suggest::complete_word(buffer, cwd, home.as_deref(), &executables)
     }
 
-    /// Save when changed, at most every `interval`.
+    /// Save when changed, at most every `interval`, on a background
+    /// thread with an owned snapshot. While a save is still running this
+    /// one is deferred to a later call.
     fn save_if_due(&mut self, interval: Duration) {
-        if !self.history.is_dirty() || self.last_save.elapsed() < interval {
+        if self.saving.as_ref().is_some_and(|s| s.is_finished()) {
+            self.finish_save();
+        }
+        if self.saving.is_some() || !self.history.is_dirty() || self.last_save.elapsed() < interval
+        {
             return;
         }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
         self.last_save = Instant::now();
-        if let Some(path) = &self.path
-            && let Err(error) = self.history.save(path)
+        let mut snapshot = self.history.take_snapshot();
+        match std::thread::Builder::new()
+            .name("nora-history-save".to_string())
+            .spawn(move || snapshot.save(&path))
         {
-            eprintln!("nora: saving history {}: {error}", path.display());
+            Ok(handle) => self.saving = Some(handle),
+            Err(error) => {
+                eprintln!("nora: saving history: {error}");
+                self.history.mark_dirty();
+            }
         }
+    }
+
+    /// Save now on this thread, after any background save finished: the
+    /// final save, which must be on disk before the process exits.
+    fn save_now(&mut self) {
+        self.finish_save();
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.history.is_dirty()
+            && let Err(error) = self.history.save(&path)
+        {
+            self.save_failed(&error);
+        }
+    }
+
+    /// Wait for the background save, if any, and report its result.
+    fn finish_save(&mut self) {
+        let Some(handle) = self.saving.take() else {
+            return;
+        };
+        let result = handle
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("the history save thread panicked")));
+        if let Err(error) = result {
+            self.save_failed(&error);
+        }
+    }
+
+    /// Report a failed save. The history is saved again later, unless
+    /// the file has become one nora cannot read (it is left alone).
+    fn save_failed(&mut self, error: &std::io::Error) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            eprintln!(
+                "nora: saving history {}: {error}; not saving history this session",
+                path.display()
+            );
+            self.path = None;
+        } else {
+            eprintln!("nora: saving history {}: {error}", path.display());
+            self.history.mark_dirty();
+        }
+    }
+}
+
+impl Drop for Suggestions {
+    /// A save still running finishes before the history goes away.
+    fn drop(&mut self) {
+        self.finish_save();
     }
 }
 
@@ -893,7 +974,7 @@ pub fn pump_thread(
                     };
                     if new.autocomplete != options.autocomplete {
                         if let Some(s) = suggestions.as_mut() {
-                            s.save_if_due(Duration::ZERO);
+                            s.save_now();
                         }
                         suggestions = new.autocomplete.then(Suggestions::load);
                     }
@@ -1083,7 +1164,7 @@ pub fn pump_thread(
         }
         if stop.load(Ordering::Relaxed) {
             if let Some(s) = suggestions.as_mut() {
-                s.save_if_due(Duration::ZERO);
+                s.save_now();
             }
             // N12a: close before break — the pinned loop panics in
             // `PeekableReceiver::recv` when its sender is dropped
@@ -1118,5 +1199,63 @@ pub fn pump_thread(
         } else {
             Duration::from_millis(500)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::suggest::History;
+
+    fn suggestions_at(path: std::path::PathBuf) -> Suggestions {
+        Suggestions {
+            history: History::new(),
+            path: Some(path),
+            last_save: Instant::now(),
+            saving: None,
+            executables: Arc::new(Mutex::new(Arc::new(Vec::new()))),
+            executables_at: None,
+        }
+    }
+
+    /// The periodic save runs on a background thread (one at a time) so
+    /// a slow `fsync` cannot stall the pump; the final save waits for it
+    /// and writes what is left in place.
+    #[test]
+    fn history_saves_in_the_background_then_finally_in_place() {
+        let dir = std::env::temp_dir().join(format!("nora-pump-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("history");
+        let mut s = suggestions_at(path.clone());
+        assert!(s.history.record("make", Some("/p"), Some(0), 1));
+        s.save_if_due(Duration::ZERO);
+        assert!(s.saving.is_some(), "saving off the pump thread");
+        assert!(!s.history.is_dirty(), "the snapshot is being saved");
+        assert!(s.history.record("cargo test", Some("/p"), Some(0), 2));
+        s.save_if_due(Duration::ZERO);
+        s.save_now();
+        assert!(s.saving.is_none());
+        assert!(!s.history.is_dirty());
+        let disk = History::load(&path).expect("saved");
+        assert!(disk.get("make").is_some() && disk.get("cargo test").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A history file that has become unreadable is left alone and not
+    /// saved again this session.
+    #[test]
+    fn unreadable_history_stops_saving() {
+        let dir = std::env::temp_dir().join(format!("nora-pump-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        std::fs::write(&path, "nora-history 2\n").unwrap();
+        let mut s = suggestions_at(path.clone());
+        assert!(s.history.record("make", None, Some(0), 1));
+        s.save_if_due(Duration::ZERO);
+        s.save_now();
+        assert!(s.path.is_none(), "saving stopped");
+        assert_eq!(std::fs::read(&path).unwrap(), b"nora-history 2\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

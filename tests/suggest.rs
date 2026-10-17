@@ -145,10 +145,80 @@ fn history_file_round_trips_and_tolerates_damage() {
     assert_eq!(loaded.len(), 3);
     assert!(loaded.get("ok line").is_some());
 
-    // A missing file is an empty history; an unknown header is ignored.
+    // A missing or empty file is an empty history.
     assert!(History::load(&dir.join("missing")).unwrap().is_empty());
-    std::fs::write(&path, "other-format 9\n1\t1\t0\tx\n").unwrap();
+    std::fs::write(&path, "").unwrap();
     assert!(History::load(&path).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A history file nora cannot read as its format (another header, or not
+/// UTF-8) is an error to load and is never saved over, so the first save
+/// of a session cannot destroy it.
+#[test]
+fn unreadable_history_is_never_overwritten() {
+    let dir = std::env::temp_dir().join(format!("nora-suggest-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history");
+    let other_format: &[u8] = b"nora-history 2\n1\t1\t0\tx\n";
+    let not_utf8: &[u8] = b"nora-history 1\n1\t1\t0\t\xff\xfe\n";
+    for original in [other_format, not_utf8] {
+        std::fs::write(&path, original).unwrap();
+        let error = History::load(&path).expect_err("not this format");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let mut h = History::new();
+        run(&mut h, "make", 1, "/p", 0, NOW);
+        let error = h.save(&path).expect_err("refuses to replace it");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "file untouched");
+        assert!(h.is_dirty());
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|name| name != "history")
+        .collect();
+    assert!(leftovers.is_empty(), "no temporary files: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two nora processes saving in turn keep each other's commands: a save
+/// merges the file first (larger count, newest time, directories joined)
+/// and writes through its own temporary file.
+#[test]
+fn saves_from_two_processes_merge() {
+    let dir = std::env::temp_dir().join(format!("nora-suggest-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("history");
+    let mut a = History::new();
+    let mut b = History::new();
+    run(&mut a, "cargo build", 2, "/a", 0, NOW);
+    run(&mut a, "make", 1, "/a", 1, NOW);
+    run(&mut b, "git status", 1, "/b", 0, NOW + 10);
+    run(&mut b, "make", 3, "/b", 0, NOW + 20);
+    a.save(&path).expect("a saves");
+    b.save(&path).expect("b saves");
+    a.save(&path).expect("a saves again (idempotent)");
+    let disk = History::load(&path).unwrap();
+    assert_eq!(disk.len(), 3);
+    assert_eq!(disk.get("cargo build").unwrap().count, 2);
+    assert_eq!(disk.get("git status").unwrap().count, 1);
+    let make = disk.get("make").unwrap();
+    assert_eq!(
+        (make.count, make.failures, make.last_used),
+        (3, 0, NOW + 20)
+    );
+    let mut dirs = make.dirs.clone();
+    dirs.sort();
+    assert_eq!(dirs, vec![("/a".to_string(), 1), ("/b".to_string(), 3)]);
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(names, ["history"], "no temporary files left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
