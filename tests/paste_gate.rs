@@ -126,6 +126,71 @@ fn a_stuck_read_is_abandoned_at_the_next_input() {
     );
 }
 
+/// The window polls at the deadline: Ctrl+Shift+V then Enter with a
+/// clipboard owner that never answers sends Enter after the timeout,
+/// without another key.
+#[test]
+fn poll_abandons_a_stuck_read_at_its_deadline() {
+    let now = Instant::now();
+    let mut gate = PasteGate::new();
+    let p = pane(0);
+    let read = read_id(&gate.request(p, now));
+    assert_eq!(gate.deadline(), Some(now + PASTE_READ_TIMEOUT));
+    assert!(gate.input(p, b"\r".to_vec(), now).is_empty());
+    let early = now + PASTE_READ_TIMEOUT - Duration::from_millis(1);
+    assert!(gate.poll(early).is_empty(), "nothing before the deadline");
+    assert!(gate.reading());
+    assert_eq!(gate.poll(now + PASTE_READ_TIMEOUT), vec![input(p, b"\r")]);
+    assert!(!gate.reading());
+    assert_eq!(gate.deadline(), None);
+    assert!(
+        gate.read_done(read, Some("late".to_string()), now)
+            .is_empty()
+    );
+}
+
+/// A queued paste starts its read when the stuck one is abandoned, with
+/// its own deadline.
+#[test]
+fn poll_starts_the_queued_paste_after_an_abandoned_read() {
+    let now = Instant::now();
+    let mut gate = PasteGate::new();
+    let p = pane(0);
+    let first = read_id(&gate.request(p, now));
+    assert!(gate.input(p, b"a".to_vec(), now).is_empty());
+    assert!(gate.request(p, now).is_empty(), "queued behind the read");
+    assert!(gate.input(p, b"b".to_vec(), now).is_empty());
+    let late = now + PASTE_READ_TIMEOUT;
+    let actions = gate.poll(late);
+    assert_eq!(actions[0], input(p, b"a"));
+    let second = read_id(&actions);
+    assert_ne!(first, second);
+    assert_eq!(gate.deadline(), Some(late + PASTE_READ_TIMEOUT));
+    assert_eq!(
+        gate.read_done(second, Some("x".to_string()), late),
+        vec![
+            A::Paste {
+                pane: p,
+                text: "x".to_string()
+            },
+            input(p, b"b")
+        ]
+    );
+}
+
+/// A paste requested after the read timed out starts at once.
+#[test]
+fn a_request_after_the_timeout_starts_a_new_read() {
+    let now = Instant::now();
+    let mut gate = PasteGate::new();
+    let p = pane(0);
+    let first = read_id(&gate.request(p, now));
+    assert!(gate.input(p, b"k".to_vec(), now).is_empty());
+    let actions = gate.request(p, now + PASTE_READ_TIMEOUT);
+    assert_eq!(actions[0], input(p, b"k"));
+    assert_ne!(read_id(&actions), first);
+}
+
 #[test]
 fn held_input_is_bounded() {
     let now = Instant::now();

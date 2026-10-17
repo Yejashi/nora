@@ -1796,8 +1796,9 @@ struct PasteRead {
 /// Held input is bounded by [`INPUT_HEADROOM`] (more is refused, as the
 /// pump refuses keys over its queue), queued pastes by
 /// [`MAX_QUEUED_PASTES`]; a read that takes longer than
-/// [`PASTE_READ_TIMEOUT`] is abandoned at the next input. Pure: the
-/// caller runs the returned actions in order.
+/// [`PASTE_READ_TIMEOUT`] is abandoned by [`PasteGate::poll`], which the
+/// window calls at [`PasteGate::deadline`] (and every call checks it
+/// first). Pure: the caller runs the returned actions in order.
 #[derive(Debug, Default)]
 pub struct PasteGate {
     reading: Option<PasteRead>,
@@ -1816,10 +1817,33 @@ impl PasteGate {
         self.reading.is_some()
     }
 
+    /// When the read in flight times out, for the window's timer: call
+    /// [`Self::poll`] then.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.reading
+            .as_ref()
+            .map(|read| read.started + PASTE_READ_TIMEOUT)
+    }
+
+    /// Abandon the read in flight once it has run [`PASTE_READ_TIMEOUT`]
+    /// (its late text is dropped), releasing what was held behind it in
+    /// order; a queued paste's read then starts. Nothing before then.
+    pub fn poll(&mut self, now: Instant) -> Vec<PasteGateAction> {
+        match self.deadline() {
+            Some(deadline) if now >= deadline => {
+                self.reading = None;
+                self.release(now)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The user asked to paste into `pane`.
     pub fn request(&mut self, pane: PaneKey, now: Instant) -> Vec<PasteGateAction> {
+        let mut actions = self.poll(now);
         if self.reading.is_none() {
-            return vec![self.start(pane, now)];
+            actions.push(self.start(pane, now));
+            return actions;
         }
         let queued = self
             .held
@@ -1829,19 +1853,13 @@ impl PasteGate {
         if queued < MAX_QUEUED_PASTES {
             self.held.push_back(Held::Paste(pane));
         }
-        Vec::new()
+        actions
     }
 
     /// Input for `pane`: sent now, or held when a paste into `pane` is
     /// waiting for its clipboard read.
     pub fn input(&mut self, pane: PaneKey, bytes: Vec<u8>, now: Instant) -> Vec<PasteGateAction> {
-        let mut actions = Vec::new();
-        if let Some(read) = &self.reading
-            && now.duration_since(read.started) >= PASTE_READ_TIMEOUT
-        {
-            self.reading = None;
-            actions = self.release(now);
-        }
+        let mut actions = self.poll(now);
         if !self.waits(pane) {
             actions.push(PasteGateAction::Input { pane, bytes });
         } else if self.held_bytes + bytes.len() <= INPUT_HEADROOM {

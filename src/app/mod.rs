@@ -2478,6 +2478,18 @@ impl ApplicationHandler<AppEvent> for WinApp {
         self.fonts = Some(fonts);
     }
 
+    /// A clipboard read that never answers is abandoned at its deadline
+    /// (input held behind it goes out), not only at the next key: the
+    /// loop wakes then while a read is in flight.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let actions = self.paste_gate.poll(Instant::now());
+        self.run_paste_actions(actions);
+        event_loop.set_control_flow(match self.paste_gate.deadline() {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        });
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         if let AppEvent::Terminate = event {
             eprintln!("nora: termination signal, closing");
