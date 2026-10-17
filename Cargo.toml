@@ -57,6 +57,12 @@ winit = "0.30.13"
 accesskit = "0.25.1"
 accesskit_unix = "0.24.0"
 
+[dev-dependencies]
+# Tests drive the vendored `EventLoop` with a fake PTY, whose
+# `EventedReadWrite` impl names these types; the version alacritty_terminal
+# already pulls in.
+polling = "3.11.0"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -258,6 +258,12 @@ where
                         }
                     },
                     _ if unprocessed > 0 => deferred_err = Some(err),
+                    // nora: bytes parsed on an earlier pass still need the
+                    // redraw below before the error is returned.
+                    _ if processed > 0 => {
+                        deferred_err = Some(err);
+                        break;
+                    },
                     _ => return Err(err),
                 },
             }
