@@ -232,7 +232,7 @@ fn bash_prompt_command_ending_in_semicolon() {
     assert!(!out.grid.contains("syntax error"), "grid:\n{}", out.grid);
     assert_eq!(
         out.kinds(),
-        vec![D, A, B, C, D, A, B, C],
+        vec![A, B, C, D, A, B, C],
         "grid:\n{}",
         out.grid
     );
@@ -266,7 +266,7 @@ fn bash_array_prompt_command_keeps_hook_last() {
     let out = shell.exit();
     assert_eq!(
         out.kinds(),
-        vec![D, A, B, C, D, A, B, C],
+        vec![A, B, C, D, A, B, C],
         "grid:\n{}",
         out.grid
     );
@@ -343,7 +343,7 @@ fn bash_markers_bypass_redirections_and_stay_private() {
     );
     assert_eq!(
         out.kinds(),
-        vec![D, A, B, C, D, A, B, C, D, A, B, C],
+        vec![A, B, C, D, A, B, C, D, A, B, C],
         "grid:\n{}",
         out.grid
     );
@@ -353,4 +353,48 @@ fn bash_markers_bypass_redirections_and_stay_private() {
         .filter(|line| line.starts_with("/dev/pts/"))
         .count();
     assert_eq!(terminal_fds, 2, "the child's fds:\n{fds}");
+}
+
+/// bash sends `D` only after a command line ran, carrying its exit status
+/// (`133;D;<status>`), even with a PROMPT_COMMAND entry before nora's that
+/// resets `$?`; an empty or blank Enter gets a new prompt (`A`) only.
+#[test]
+fn bash_command_end_carries_status_and_skips_empty_lines() {
+    let Some(bash) = bash() else {
+        eprintln!("bash not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("bash-status");
+    let log = dir.path("markers.log");
+    // Log every marker's parameters (then send it as before).
+    let rc = format!(
+        "PS1='$ '\nPROMPT_COMMAND='history -a'\nsource {}\n\
+         eval \"__nora_test_osc133() $(declare -f __nora_osc133 | tail -n +2)\"\n\
+         __nora_osc133() {{ printf '%s\\n' \"$1\" >> {}; __nora_test_osc133 \"$1\"; }}\n",
+        script("nora-bash.sh").display(),
+        log.display()
+    );
+    let mut shell = Shell::bash(bash, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    shell.send(b"false\n\n   \n(exit 7)\ntrue\n");
+    let out = shell.exit();
+    let logged = std::fs::read_to_string(&log).expect("markers.log");
+    let logged: Vec<&str> = logged.lines().collect();
+    assert_eq!(
+        logged,
+        [
+            "A", // first prompt
+            "B", "C", "D;1", "A", // false
+            "A", "A", // empty and blank lines
+            "B", "C", "D;7", "A", // (exit 7)
+            "B", "C", "D;0", "A", // true
+            "B", "C", // exit
+        ],
+        "grid:\n{}",
+        out.grid
+    );
+    assert_eq!(
+        out.kinds(),
+        vec![A, B, C, D, A, A, A, B, C, D, A, B, C, D, A, B, C]
+    );
 }

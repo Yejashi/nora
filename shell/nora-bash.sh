@@ -6,17 +6,20 @@
 #   A — prompt start (before the prompt is drawn)
 #   B — command start (after the prompt, before the command)
 #   C — output start (after the command, before the output)
-#   D — output end (after the output, before the next prompt)
+#   D — output end with the exit status (`133;D;<status>`, after the
+#       output, before the next prompt; only when a command line ran)
 #
-# Safe to source in a normal bash session: it only appends to
-# PROMPT_COMMAND and, at the first prompt, adds to the DEBUG trap (a DEBUG
-# trap set before that keeps running first), and it does not source
-# anything else. Sourcing it twice in the same shell is a no-op; it does
-# nothing in a non-interactive shell.
+# Safe to source in a normal bash session: it adds one entry before and
+# one after the existing PROMPT_COMMAND, appends an empty expansion to PS0
+# (bash 4.4+, to tell a command line from an empty Enter) and, at the
+# first prompt, adds to the DEBUG trap (a DEBUG trap set before that keeps
+# running first); it does not source anything else. Sourcing it twice in
+# the same shell is a no-op; it does nothing in a non-interactive shell.
 #
 # Keep `__nora_prompt_start` the last PROMPT_COMMAND entry (hooks such as
-# direnv, zoxide and starship prepend themselves, which is fine): the first
-# command after it is taken as the user's command.
+# direnv, zoxide and starship prepend themselves, which is fine as long as
+# they keep `$?`, which the exit status is read from): the first command
+# after a command line is entered is taken as the user's command.
 
 [[ $- == *i* ]] || return 0
 [[ -n ${__nora_bash_loaded-} ]] && return 0
@@ -62,20 +65,44 @@ __nora_osc7() {
     printf '\033]7;file://%s%s\033\\' "${HOSTNAME-}" "$out" >&"${__nora_fd:-1}"
 }
 
-# Set once a prompt is drawn, cleared by the first command after it.
+# Set once a command line is entered (or, without PS0, once a prompt is
+# drawn), cleared by the first command after it.
 __nora_at_prompt=
+# Set while a command line's output is open (C sent, D not yet).
+__nora_running=
+# The exit status of the last command line, taken by the first
+# PROMPT_COMMAND entry.
+__nora_status=0
+
+# PS0 (bash 4.4+) is expanded only after a non-empty command line is read,
+# so it tells a command from an empty Enter: this expansion sets
+# __nora_at_prompt (an arithmetic subscript side effect) and expands to
+# nothing.
+__nora_ps0='${__nora_ps0_flag[__nora_at_prompt=1]-}'
+(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404 )) || __nora_ps0=
 
 # Runs before each prompt is drawn (via PROMPT_COMMAND).
-# Closes the previous command's output (D) and opens the new prompt (A).
-# Until the DEBUG trap is installed, `$1` is the `trap -p DEBUG` output
-# taken by the PROMPT_COMMAND entry itself (a function cannot see it).
+# Closes the previous command's output (D with its status) when one ran
+# and opens the new prompt (A). Until the DEBUG trap is installed, `$1` is
+# the `trap -p DEBUG` output taken by the PROMPT_COMMAND entry itself (a
+# function cannot see it).
 __nora_prompt_start() {
     [[ -n ${__nora_debug_installed-} ]] || __nora_install_debug_trap "$1"
     __nora_open_fd
-    __nora_osc133 D
+    if [[ -n $__nora_running ]]; then
+        __nora_osc133 "D;$__nora_status"
+        __nora_running=
+    fi
     __nora_osc7
     __nora_osc133 A
-    __nora_at_prompt=1
+    __nora_at_prompt=
+    if [[ -n $__nora_ps0 ]] && shopt -q promptvars; then
+        # Re-add the PS0 hook when PS0 was replaced since.
+        [[ ${PS0-} == *"$__nora_ps0"* ]] || PS0+=$__nora_ps0
+    else
+        # No PS0: every prompt counts, so an empty Enter reads as a command.
+        __nora_at_prompt=1
+    fi
 }
 
 # Runs before each simple command (via the DEBUG trap); `$1` is the
@@ -84,14 +111,14 @@ __nora_prompt_start() {
 # it is what `$_` holds after the trap (`mkdir -p d && cd $_`).
 #
 # Marks the command start (B) and the output start (C) once per command
-# line: only the first command after a prompt counts, so loops and
+# line: only the first command after it was entered counts, so loops and
 # pipelines do not repeat the pair mid-output, and the PROMPT_COMMAND
-# entries that run before `__nora_prompt_start` (also traced) emit
-# nothing. Completion functions and `bind -x` widgets run while editing
-# and are skipped.
+# entries (also traced) emit nothing. Completion functions and `bind -x`
+# widgets run while editing and are skipped.
 __nora_command_start() {
     if [[ -n $__nora_at_prompt && -z ${COMP_LINE-} && -z ${READLINE_POINT+set} ]]; then
         __nora_at_prompt=
+        __nora_running=1
         __nora_osc133 B
         __nora_osc133 C
         __nora_close_fd
@@ -131,21 +158,23 @@ __nora_install_debug_trap() {
     unset __nora_prev_debug
 }
 
-# Append our hook to the existing PROMPT_COMMAND (preserving any the user
-# already set). The trap is read only while not yet installed (one
-# command substitution, at the first prompt). An array PROMPT_COMMAND
-# (bash 5.1+) gets a new last element; a string one gets a new line, which
-# is valid after any text (`history -a;` or `cmd &` would make a `; `
-# join a syntax error).
+# Wrap the existing PROMPT_COMMAND (preserving any the user already set):
+# first take the exit status (`$?` is the command line's only before the
+# other entries run), last our hook. The trap is read only while not yet
+# installed (one command substitution, at the first prompt). An array
+# PROMPT_COMMAND (bash 5.1+) gets new first and last elements; a string
+# one gets new lines, which are valid after any text (`history -a;` or
+# `cmd &` would make a `; ` join a syntax error).
+__nora_status_hook='__nora_status=$?'
 __nora_prompt_hook='__nora_prompt_start "${__nora_debug_installed:-$(trap -p DEBUG)}"'
 case "${PROMPT_COMMAND[*]-}" in
     *__nora_prompt_start*) ;;
     *)
         if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
-            PROMPT_COMMAND+=("$__nora_prompt_hook")
+            PROMPT_COMMAND=("$__nora_status_hook" "${PROMPT_COMMAND[@]}" "$__nora_prompt_hook")
         else
-            PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}$__nora_prompt_hook"
+            PROMPT_COMMAND="$__nora_status_hook"$'\n'"${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}$__nora_prompt_hook"
         fi
         ;;
 esac
-unset __nora_prompt_hook
+unset __nora_status_hook __nora_prompt_hook

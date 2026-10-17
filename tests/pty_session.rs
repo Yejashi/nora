@@ -1377,8 +1377,8 @@ fn pty_shell_events_reach_shared_state() {
 /// the script must skip those, otherwise the engine's C-to-D
 /// previous-command selection (N35c) would select the prompt line instead
 /// of the command. For the two commands sent here the full sequence is
-/// `D A` (first prompt) `B C` (first command) `D A` (second prompt)
-/// `B C` (second command).
+/// `A` (first prompt: no command ran before it, so no `D`) `B C` (first
+/// command) `D A` (second prompt) `B C` (second command).
 #[test]
 fn pty_bash_shell_integration_marker_order() {
     let script = std::env::current_dir()
@@ -1450,7 +1450,6 @@ fn pty_bash_shell_integration_marker_order() {
     assert_eq!(
         kinds,
         vec![
-            MarkerKind::D,
             MarkerKind::A,
             MarkerKind::B,
             MarkerKind::C,
@@ -1459,9 +1458,9 @@ fn pty_bash_shell_integration_marker_order() {
             MarkerKind::B,
             MarkerKind::C
         ],
-        "expected D A (first prompt), B C before the first command, D A \
-         (second prompt), B C before the second command — with no spurious \
-         B C pair between D and A; got {kinds:?}"
+        "expected A (first prompt, no command before it to end), B C before \
+         the first command, D A (second prompt), B C before the second \
+         command — with no spurious B C pair between D and A; got {kinds:?}"
     );
     assert_eq!(
         session.engine().cwd().as_deref(),
@@ -1561,7 +1560,7 @@ fn pty_bash_one_marker_pair_per_command_line() {
     use MarkerKind::{A, B, C, D};
     assert_eq!(
         kinds,
-        vec![D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C],
+        vec![A, B, C, D, A, B, C, D, A, B, C, D, A, B, C],
         "one D A per prompt and one B C per command line; got {kinds:?}"
     );
     session.close();
