@@ -58,6 +58,13 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         if from_history != lines_added {
             let delta = lines_added - from_history;
             self.scroll_up(&(Line(0)..Line(target as i32)), delta);
+
+            // nora: this scroll only undoes part of the shift that growing the
+            // visible area applied (the net shift is `from_history`, counted
+            // in `total_pulled` below); no line went into history, so it must
+            // not count as scrolled or every stable line reference would read
+            // `delta` lines too high.
+            self.total_scrolled -= delta as u64;
         }
 
         // Move cursor down for every line pulled from history.
