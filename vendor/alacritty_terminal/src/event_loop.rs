@@ -347,6 +347,12 @@ where
                     // filesystem stalls only this thread. The parser keeps
                     // its state; the rest of the bytes are parsed after.
                     if self.filter.as_ref().is_some_and(|filter| filter.needs_unlocked()) {
+                        // nora: the terminal may hold part of a pending
+                        // update's frame (an earlier marker parsed it):
+                        // say so before the owner can lock and draw it.
+                        if let Some(flag) = &self.sync_pending {
+                            flag.store(state.parser_deadline().is_some(), Ordering::Release);
+                        }
                         drop(terminal.take());
                         drop(_terminal_lease.take());
                         if let Some(filter) = self.filter.as_mut() {

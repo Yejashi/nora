@@ -1266,7 +1266,12 @@ fn tick_pane(
         return true;
     }
 
-    let forced = slot_free && std::mem::take(&mut pane_pump.force_snapshot);
+    // A forced view change (selection, scroll, search) waits for a pending
+    // synchronized update like damage does: the flag stays set, and the
+    // update's end wakes the pump to publish it.
+    let forced = slot_free
+        && !pane_pump.session.sync_pending()
+        && std::mem::take(&mut pane_pump.force_snapshot);
     let snapshot = match outcome.snapshot {
         Some(snapshot) => Some(snapshot),
         None if forced => Some(pane_pump.session.engine().snapshot()),

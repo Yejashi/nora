@@ -145,6 +145,21 @@ fn start() -> (
     alacritty_terminal::event_loop::EventLoopSender,
     LoopHandle,
 ) {
+    start_with(Box::new(ClearMarks))
+}
+
+/// [`start`] with another filter.
+#[allow(clippy::type_complexity)]
+fn start_with(
+    filter: Box<dyn Filter + Send>,
+) -> (
+    UnixStream,
+    Receiver<Event>,
+    Arc<FairMutex<Term<Proxy>>>,
+    Arc<AtomicBool>,
+    alacritty_terminal::event_loop::EventLoopSender,
+    LoopHandle,
+) {
     let (ours, theirs) = UnixStream::pair().expect("socket pair");
     theirs.set_nonblocking(true).expect("nonblocking");
     let writer = theirs.try_clone().expect("clone");
@@ -163,7 +178,7 @@ fn start() -> (
     let pending = Arc::new(AtomicBool::new(false));
     let event_loop = EventLoop::new(Arc::clone(&term), proxy, pty, false, false)
         .expect("event loop")
-        .with_filter(Box::new(ClearMarks))
+        .with_filter(filter)
         .with_sync_pending(pending.clone());
     let sender = event_loop.channel();
     let handle = event_loop.spawn();
@@ -247,6 +262,75 @@ fn endless_update_with_markers_redraws_while_output_continues() {
         "redrawn after {waited:?}, while output continued"
     );
     assert_eq!(row(&term.lock(), 0), "more      ");
+
+    let _ = sender.send(Msg::Shutdown);
+    let _ = handle.join().expect("event loop thread");
+}
+
+/// [`ClearMarks`] that, before its second marker, runs unlocked work (as
+/// a kitty graphics file read does) and waits there until released.
+struct UnlockedAtSecond {
+    markers: usize,
+    entered: Sender<()>,
+    release: Receiver<()>,
+    done: bool,
+}
+
+impl Filter for UnlockedAtSecond {
+    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        ClearMarks.process(bytes)
+    }
+
+    fn on_marker(
+        &mut self,
+        _: usize,
+        _: &alacritty_terminal::event_loop::MarkerContext,
+    ) -> Option<Vec<u8>> {
+        self.markers += 1;
+        None
+    }
+
+    fn needs_unlocked(&self) -> bool {
+        self.markers == 1 && !self.done
+    }
+
+    fn run_unlocked(&mut self) {
+        self.done = true;
+        let _ = self.entered.send(());
+        let _ = self.release.recv_timeout(Duration::from_secs(5));
+    }
+}
+
+/// While the loop runs unlocked work inside a pending update (the lock is
+/// free, and an earlier marker parsed part of the frame), the update is
+/// already reported pending, so the owner draws no half-applied frame.
+#[test]
+fn unlocked_work_inside_an_update_reports_it_pending() {
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let (ours, rx, term, pending, sender, handle) = start_with(Box::new(UnlockedAtSecond {
+        markers: 0,
+        entered: entered_tx,
+        release: release_rx,
+        done: false,
+    }));
+
+    let mut bytes = BSU.to_vec();
+    bytes.extend_from_slice(b"\x1b[2J\x1b[Hhalf\x1b[2J\x1b[Hdone");
+    (&ours).write_all(&bytes).expect("write");
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the loop ran the unlocked work");
+    assert!(
+        pending.load(Ordering::Acquire),
+        "pending while the lock is free inside the update"
+    );
+    drop(term.lock());
+    release.send(()).expect("release");
+    (&ours).write_all(ESU).expect("write");
+    assert!(wait_for_wakeup(&rx), "the end of the update redraws");
+    wait_until(&pending, false);
+    assert_eq!(row(&term.lock(), 0), "done      ");
 
     let _ = sender.send(Msg::Shutdown);
     let _ = handle.join().expect("event loop thread");
