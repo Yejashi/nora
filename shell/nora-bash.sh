@@ -59,7 +59,8 @@ __nora_prompt_start() {
 
 # Runs before each simple command (via the DEBUG trap); `$1` is the
 # status to return (the chained DEBUG trap's, so `extdebug` users keep
-# its verdict).
+# its verdict) and `$2` the command's `$_`: as the call's last argument
+# it is what `$_` holds after the trap (`mkdir -p d && cd $_`).
 #
 # Marks the command start (B) and the output start (C) once per command
 # line: only the first command after a prompt counts, so loops and
@@ -85,6 +86,14 @@ __nora_trap_text() {
     __nora_prev_debug=${3-}
 }
 
+# Keep the command's `$_` in __nora_underscore for after a chained trap
+# (which may change it), returning `$1` so that trap still sees the
+# command's `$?`; as the call's last argument, `$_` is unchanged for it.
+__nora_save_underscore() {
+    __nora_underscore=$2
+    return "$1"
+}
+
 # Chain onto the DEBUG trap `$1` (`trap -p DEBUG` output) instead of
 # replacing it: it runs first (it sees the command's `$_` and `$?`), then
 # ours. Done at the first prompt with the trap read at the top level:
@@ -94,8 +103,8 @@ __nora_install_debug_trap() {
     __nora_trap_text "$1"
     case "$__nora_prev_debug" in
         *__nora_command_start*) ;;
-        '') trap '__nora_command_start' DEBUG ;;
-        *) trap "$__nora_prev_debug"$'\n''__nora_command_start "$?"' DEBUG ;;
+        '') trap '__nora_command_start 0 "$_"' DEBUG ;;
+        *) trap '__nora_save_underscore "$?" "$_"'$'\n'"$__nora_prev_debug"$'\n''__nora_command_start "$?" "$__nora_underscore"' DEBUG ;;
     esac
     unset __nora_prev_debug
 }

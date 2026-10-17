@@ -276,3 +276,35 @@ fn bash_array_prompt_command_keeps_hook_last() {
         out.markers
     );
 }
+
+/// The DEBUG trap leaves `$_` alone, with and without a DEBUG trap set
+/// before the script (chained): `mkdir -p d && cd $_` used to `cd` into
+/// `__nora_command_start`.
+#[test]
+fn bash_debug_trap_keeps_last_argument() {
+    let Some(bash) = bash() else {
+        eprintln!("bash not found; skipping");
+        return;
+    };
+    let prior = "trap 'prev=$((prev + 1))' DEBUG\n";
+    for (name, prior_trap) in [("plain", ""), ("chained", prior)] {
+        let dir = Scratch::new(&format!("bash-underscore-{name}"));
+        let rc = format!(
+            "PS1='$ '\n{prior_trap}source {}\n",
+            script("nora-bash.sh").display()
+        );
+        let mut shell = Shell::bash(bash.clone(), &dir, &rc);
+        shell.wait("first prompt", |grid, _| grid.contains('$'));
+        shell.run("mkdir -p d1 && cd $_ && echo \"IN=${PWD##*/}\"", "IN=d1");
+        shell.run("cd ..; echo one two; echo \"U=$_\"", "U=two");
+        // `$_` also survives the prompt between two command lines.
+        shell.run("mkdir -p d2; echo made-$((1 + 1))", "made-2");
+        shell.run("mkdir -p d3", "$ mkdir -p d3");
+        shell.run("cd $_ && echo \"IN3=${PWD##*/}\"", "IN3=d3");
+        if !prior_trap.is_empty() {
+            shell.run("[ \"$prev\" -gt 0 ] && echo prev-$((1 + 1))", "prev-2");
+        }
+        let out = shell.exit();
+        assert!(!out.grid.contains("No such file"), "{name}:\n{}", out.grid);
+    }
+}
