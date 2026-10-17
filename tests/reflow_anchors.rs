@@ -189,6 +189,19 @@ fn map_is_bounded_by_the_rows_reflow_changed() {
     assert!(resize_and_check(&mut term, 10, 40) <= 8);
 }
 
+/// Shrinking to one column with wide characters ends (the vendored loop
+/// used to move a wide char to the next row forever) and the map still
+/// follows every cell; a wide char then keeps its column with its spacer
+/// on the row below.
+#[test]
+fn one_column_with_wide_characters() {
+    let mut term = term(3, 4, 50);
+    feed_text(&mut term, 9, 6, 6, 2);
+    for cols in [1, 5, 1, 2, 1, 4] {
+        resize_and_check(&mut term, 3, cols);
+    }
+}
+
 /// The alternate screen does not reflow: no map, nothing moves.
 #[test]
 fn alt_screen_records_no_map() {

@@ -489,7 +489,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
                 let mut kept = columns;
 
                 // Insert spacer if a wide char would be wrapped into the last column.
-                if row.len() >= columns
+                //
+                // nora: not in a single column, where the wide char would wrap
+                // to the next row forever (the row would keep only the spacer
+                // and the loop would split the same cells again).
+                if columns > 1
+                    && row.len() >= columns
                     && row[Column(columns - 1)].flags().contains(Flags::WIDE_CHAR)
                 {
                     let mut spacer = T::default();

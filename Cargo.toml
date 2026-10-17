@@ -96,7 +96,8 @@ codegen-units = 1
 # the lock released), `send` accepting a queued message whatever the waker
 # reports, the DA1 reply (`?62;22c`), `grow_lines` not counting its
 # history scroll as a shift, and the reflow map of a width change
-# (`ReflowMap`, `Grid`/`Term::take_reflow_map`) that line anchors follow.
+# (`ReflowMap`, `Grid`/`Term::take_reflow_map`) that line anchors follow,
+# with no endless wide-char wrap when shrinking to one column.
 # See docs/adr/ADR-011-graphics-apc-hook.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
