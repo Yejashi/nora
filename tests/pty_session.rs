@@ -228,6 +228,45 @@ fn fast_exit_output_survives_repeatedly() {
     }
 }
 
+/// The first `Terminated` a poll reports already carries the clean exit
+/// status: loop end is sampled before the drain, so a `ChildExit` recorded
+/// just before the loop returns is never missed (a `None` there made
+/// `nora -- sh -c 'exit 0'` sometimes exit 1).
+#[test]
+fn first_terminated_carries_the_exit_status() {
+    for round in 0..30 {
+        let mut session = PtySession::spawn(
+            LaunchSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                cwd: None,
+                env: Vec::new(),
+            },
+            24,
+            80,
+            cap(),
+        )
+        .expect("sh spawns over a real PTY");
+        let deadline = Instant::now() + DEADLINE;
+        let first = loop {
+            if let Some(event) = session
+                .poll_events()
+                .into_iter()
+                .find(|event| matches!(event, SessionEvent::Terminated { .. }))
+            {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "round {round}: no Terminated");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            exited_with(std::slice::from_ref(&first), 0),
+            "round {round}: first Terminated lacks the status: {first:?}"
+        );
+        session.close();
+    }
+}
+
 #[test]
 fn cwd_is_honored() {
     // Canonical: macOS's temp dir is behind a symlink (/var -> /private/var)

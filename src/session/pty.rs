@@ -544,9 +544,15 @@ impl PtySession {
     /// precedes loop end for a clean exit), else `None` (the loop died from
     /// an I/O or registration error).
     pub fn poll_events(&mut self) -> Vec<SessionEvent> {
+        // Sample loop end *before* draining: the loop thread records
+        // `ChildExit` before it returns, so a drain that follows an
+        // observed end always sees that record. Sampling after the drain
+        // races a loop that records and ends in between (a clean exit
+        // would then be reported with `status: None`).
+        let finished = self.terminated();
         self.process_events();
         let mut events = Vec::new();
-        if self.terminated() {
+        if finished {
             self.observe_loop_end();
             events.push(SessionEvent::Terminated {
                 session: self.id,
@@ -784,6 +790,10 @@ impl PtySession {
     fn observe_loop_end(&mut self) {
         if self.terminated() && !self.loop_end_reported {
             self.loop_end_reported = true;
+            // Drain once more now that the end is observed: the caller's
+            // earlier drain may predate a `ChildExit` recorded just
+            // before the loop returned.
+            self.process_events();
             if self.child_status.is_none() {
                 eprintln!("nora: error: session loop exited without a child-exit event");
             }
