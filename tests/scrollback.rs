@@ -896,3 +896,37 @@ fn search_wrap_across_scan_chunks() {
         assert_eq!(engine.search_text("needle").len(), 1, "extra {extra}");
     }
 }
+
+/// A wrapped match shown on the row above the search bar ends below the
+/// view: its end is anchored to its own line, so the highlight and the
+/// copy cover the whole match once scrolled to (it used to stop at the
+/// view's last cell).
+#[test]
+fn search_hit_ending_below_the_view_is_selected_whole() {
+    let mut engine = Engine::with_history(5, 3, 50);
+    let mut stream = b"x\r\n".repeat(10);
+    stream.extend_from_slice(b"xxneedle\r\n");
+    stream.extend_from_slice(&b"x\r\n".repeat(10));
+    engine.feed(&stream);
+    let hit = engine.search_text("needle")[0];
+    assert_eq!(hit.end_line_id, hit.line_id + 2);
+    // Shown on the row above the bar; it ends two rows below that.
+    engine.show_search_hit(hit);
+    let sel = engine.selection().expect("on screen");
+    assert_eq!(
+        (sel.start, sel.end),
+        ((3, 2), (4, 2)),
+        "clipped to the view"
+    );
+    assert_eq!(engine.copy_selection().as_deref(), Some("needle"));
+    engine.scroll(Scroll::Delta(-2));
+    let snap = engine.snapshot();
+    let selected: String = snap
+        .cells
+        .iter()
+        .zip(&snap.selected)
+        .filter(|(_, s)| **s)
+        .map(|(c, _)| c.ch)
+        .collect();
+    assert_eq!(selected, "needle");
+}

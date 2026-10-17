@@ -1295,25 +1295,24 @@ impl Engine {
             let row = line + offset as i32;
             (0..limit).contains(&row).then_some(row as usize)
         };
-        let row = match visible(self.display_offset(), usable) {
-            Some(row) => row,
-            None => {
-                self.scroll_to_line(line + (rows - usable));
-                match visible(self.display_offset(), rows) {
-                    Some(row) => row,
-                    None => return,
-                }
+        if visible(self.display_offset(), usable).is_none() {
+            self.scroll_to_line(line + (rows - usable));
+            if visible(self.display_offset(), rows).is_none() {
+                return;
             }
-        };
-        // A wrapped match ends on a later row; past the bottom of the view
-        // the highlight stops at the last cell.
-        let end_row = row + hit.end_line_id.saturating_sub(hit.line_id).max(0) as usize;
-        let end = if end_row < self.rows {
-            (end_row, hit.end)
-        } else {
-            (self.rows - 1, self.cols - 1)
-        };
-        self.select((row, hit.start), end);
+        }
+        // Anchored by line id, both ends: a wrapped match that ends below
+        // the view is highlighted (and copied) whole once scrolled to.
+        self.select_ids((hit.line_id, hit.start), (hit.end_line_id, hit.end));
+    }
+
+    /// [`Engine::select`] by `(line id, col)` bounds.
+    fn select_ids(&self, start: (i64, usize), end: (i64, usize)) {
+        let anchored = AnchoredSelection::new(&self.term.lock(), start, end);
+        *self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(anchored);
     }
 
     /// Set the selection to the range `start..=end` in viewport
