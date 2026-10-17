@@ -16,8 +16,13 @@ license = "MIT"
 default = ["x11", "wayland"]
 x11 = ["winit/x11"]
 # Mirrors winit's default Wayland stack (client + dlopen backend +
-# client-side decorations).
-wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+# client-side decorations), plus the native Wayland clipboard (ADR-016).
+wayland = [
+    "winit/wayland",
+    "winit/wayland-dlopen",
+    "winit/wayland-csd-adwaita",
+    "dep:smithay-clipboard",
+]
 # Measurement builds only: count heap allocations per thread and report
 # them per frame in `NORA_TRACE_FRAMES` output (audit R12).
 alloc-count = []
@@ -56,6 +61,12 @@ winit = "0.30.13"
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 accesskit = "0.25.1"
 accesskit_unix = "0.24.0"
+# Native Wayland clipboard (ADR-016): its own wl_data_device on winit's
+# wl_display, so a Wayland window never goes through XWayland. 0.7.2 is
+# the last release on smithay-client-toolkit 0.19 (winit's); 0.7.3 moved
+# to 0.20 and would add a second sctk/calloop stack. Built only with the
+# `wayland` feature.
+smithay-clipboard = { version = "=0.7.2", optional = true }
 
 [dev-dependencies]
 # Tests drive the vendored `EventLoop` with a fake PTY, whose
