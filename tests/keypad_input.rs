@@ -483,6 +483,27 @@ fn numpad_special_keys_plain_vs_ss3() {
     numpad_row(Key::Character("=".into()), KeyCode::NumpadEqual, 0x3d, b'X');
 }
 
+/// Normal keypad mode sends the layout's text for a keypad character key
+/// (German NumLock: the decimal key gives `,`); application keypad keeps
+/// the layout-independent `SS3 n`.
+#[test]
+fn numpad_decimal_follows_the_layout_in_normal_mode() {
+    let physical = PhysicalKey::Code(KeyCode::NumpadDecimal);
+    let comma = Key::Character(",".into());
+    assert_eq!(
+        enc(&comma, &physical, ModifiersState::empty(), NORMAL),
+        Some(send(b",".to_vec()))
+    );
+    assert_eq!(
+        enc(&comma, &physical, ModifiersState::empty(), APP),
+        Some(send(b"\x1bOn".to_vec()))
+    );
+    assert_eq!(
+        enc(&comma, &physical, ModifiersState::ALT, NORMAL),
+        Some(send(b"\x1b,".to_vec()))
+    );
+}
+
 /// Numpad Home/End (physicals `Numpad7`/`Numpad1`, winit-folds to
 /// `Home`/`End`) have no mode-invariant form: `None` in normal mode, the
 /// SS3 `H`/`F` in app mode.

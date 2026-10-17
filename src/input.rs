@@ -63,7 +63,7 @@ pub fn encode(
         Key::Character(text) => {
             // Numpad digits/operators: the physical scancode is
             // authoritative (winit folds them to characters).
-            if let Some(key) = keypad_key(physical, mods, modes) {
+            if let Some(key) = keypad_key(physical, mods, modes, Some(text)) {
                 return Some(key);
             }
             let mut chars = text.chars();
@@ -80,7 +80,7 @@ pub fn encode(
         }
         Key::Named(name) => match name {
             NamedKey::Enter if *physical == PhysicalKey::Code(KeyCode::NumpadEnter) => {
-                keypad_key(physical, mods, modes)
+                keypad_key(physical, mods, modes, None)
             }
             NamedKey::Enter => send(alt_prefixed(vec![0x0d], mods)),
             NamedKey::Tab if mods.shift_key() => send(alt_prefixed(b"\x1b[Z".to_vec(), mods)),
@@ -120,7 +120,7 @@ pub fn encode(
         Key::Dead(_) => None,
         // A numpad operator may arrive `Unidentified` when xkbcommon has
         // no character for the keysym; the scancode is still authoritative.
-        Key::Unidentified(_) => keypad_key(physical, mods, modes),
+        Key::Unidentified(_) => keypad_key(physical, mods, modes, None),
     }
 }
 
@@ -179,12 +179,15 @@ fn ss3_function_key(final_byte: u8, mods: &ModifiersState) -> Vec<u8> {
 }
 
 /// A numpad key: application keypad (DECKPAM) sends `SS3 p..y` and the
-/// operator finals; normal mode sends the plain character. Only DECKPAM
-/// selects the application form (DECCKM is about cursor keys).
+/// operator finals; normal mode sends the layout's `text` for the key
+/// (a German keypad decimal gives `,`), or the US character when the
+/// layout reports none. Only DECKPAM selects the application form
+/// (DECCKM is about cursor keys).
 fn keypad_key(
     physical: &PhysicalKey,
     mods: &ModifiersState,
     modes: TermMode,
+    text: Option<&str>,
 ) -> Option<InputAction> {
     let (plain, ss3): (u8, u8) = match physical {
         PhysicalKey::Code(KeyCode::Numpad0) => (b'0', b'p'),
@@ -209,6 +212,8 @@ fn keypad_key(
     };
     let bytes = if modes.contains(TermMode::APP_KEYPAD) {
         vec![0x1b, b'O', ss3]
+    } else if let Some(text) = text.filter(|text| !text.is_empty()) {
+        text.as_bytes().to_vec()
     } else {
         vec![plain]
     };
