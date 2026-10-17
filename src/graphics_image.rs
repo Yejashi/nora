@@ -10,9 +10,13 @@
 //! grid's scroll counters, as prompt markers are, so they scroll with the
 //! text; [`GraphicsState::visible`] lists the ones in a viewport.
 //!
-//! Not implemented (answered with an error where a reply is due): shared
-//! memory (`t=s`), animation (`a=f`, `a=a`, `a=c`), relative placements and
-//! Unicode placeholders.
+//! Media: direct data (`t=d`), files (`t=f`), temporary files (`t=t`) and
+//! POSIX shared memory (`t=s`, `/dev/shm/<name>`). Virtual placements
+//! (`U=1`) are shown through Unicode placeholder cells.
+//!
+//! Not implemented (answered with an error where a reply is due):
+//! animation (`a=f`, `a=a`, `a=c`) and relative placements (`P`, `Q`,
+//! `H`, `V`).
 
 use std::collections::BTreeMap;
 use std::io::Read;
