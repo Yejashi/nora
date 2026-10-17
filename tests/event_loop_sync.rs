@@ -210,3 +210,44 @@ fn unfinished_update_redraws_when_it_times_out() {
     let _ = sender.send(Msg::Shutdown);
     let _ = handle.join().expect("event loop thread");
 }
+
+/// An update that never ends, followed by continuous output with markers:
+/// each marker resumes the update, which used to push its deadline back,
+/// and the loop's timeout branch runs only when a poll finds nothing. The
+/// update must still end at its own deadline while the output goes on.
+#[test]
+fn endless_update_with_markers_redraws_while_output_continues() {
+    let (ours, rx, term, pending, sender, handle) = start();
+
+    let mut first = BSU.to_vec();
+    first.extend_from_slice(b"\x1b[2J\x1b[Hdead");
+    (&ours).write_all(&first).expect("write");
+    wait_until(&pending, true);
+    let began = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let ours = ours.try_clone().expect("clone");
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if (&ours).write_all(b"\x1b[2J\x1b[Hmore").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let redrawn = wait_for_wakeup(&rx);
+    let waited = began.elapsed();
+    stop.store(true, Ordering::Release);
+    writer.join().expect("writer");
+    assert!(redrawn, "the update ended");
+    assert!(
+        waited < Duration::from_millis(400),
+        "redrawn after {waited:?}, while output continued"
+    );
+    assert_eq!(row(&term.lock(), 0), "more      ");
+
+    let _ = sender.send(Msg::Shutdown);
+    let _ = handle.join().expect("event loop thread");
+}

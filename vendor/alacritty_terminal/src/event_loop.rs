@@ -331,12 +331,16 @@ where
             // the marker's own line. Report it to the filter.
             if marker_positions.is_empty() {
                 let locked = terminal.as_mut().expect("terminal locked above");
+                let before = state.parser_deadline();
                 state.parser.advance(&mut **locked, &to_parse);
+                state.note_parsed(before);
             } else {
                 let mut pos = 0;
                 for &mpos in &marker_positions {
                     let locked = terminal.as_mut().expect("terminal locked");
+                    let before = state.parser_deadline();
                     state.parser.advance(&mut **locked, &to_parse[pos..mpos]);
+                    state.note_parsed(before);
                     // nora: work the filter must not do under the lock (a
                     // kitty graphics file read, ADR-014 "Media reads") runs
                     // with the lock and the lease released, so a slow
@@ -353,6 +357,7 @@ where
                     }
                     let locked = terminal.as_mut().expect("terminal locked");
                     let filter = &mut self.filter;
+                    let before = state.parser_deadline();
                     at_marker_position(&mut state.parser, &mut **locked, |parser, term| {
                         let context = MarkerContext::of(term);
                         if let Some(filter) = filter.as_mut()
@@ -361,11 +366,18 @@ where
                             parser.advance(term, &inject);
                         }
                     });
+                    state.note_marker(before);
                     pos = mpos;
                 }
                 let locked = terminal.as_mut().expect("terminal locked");
+                let before = state.parser_deadline();
                 state.parser.advance(&mut **locked, &to_parse[pos..]);
+                state.note_parsed(before);
             }
+            // nora: an update past its deadline ends here, so a stream
+            // that never pauses still redraws (see `sync_deadline`).
+            let locked = terminal.as_mut().expect("terminal locked");
+            state.end_overdue_sync(&mut **locked);
 
             processed += unprocessed;
             unprocessed = 0;
@@ -382,7 +394,7 @@ where
         // and resumes it, so the count no longer says whether the
         // terminal holds a half-applied frame. The update's end (ESU on a
         // later read) or its timeout sends the redraw instead.
-        let pending = state.parser.sync_timeout().sync_timeout().is_some();
+        let pending = state.parser_deadline().is_some();
         if let Some(flag) = &self.sync_pending {
             flag.store(pending, Ordering::Release);
         }
@@ -457,9 +469,10 @@ where
 
             'event_loop: loop {
                 // Wakeup the event loop when a synchronized update timeout was reached.
-                let handler = state.parser.sync_timeout();
-                let timeout =
-                    handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
+                // nora: at the update's own deadline, which markers do not
+                // push back (see `State::sync_deadline`).
+                let deadline = state.sync_deadline.or(state.parser_deadline());
+                let timeout = deadline.map(|st| st.saturating_duration_since(Instant::now()));
 
                 events.clear();
                 if let Err(err) = self.poll.wait(&mut events, timeout) {
@@ -475,6 +488,7 @@ where
                 // Handle synchronized update timeout.
                 if events.is_empty() && self.rx.peek().is_none() {
                     state.parser.stop_sync(&mut *self.terminal.lock());
+                    state.sync_deadline = None;
                     // nora: the update ended (see `sync_pending`).
                     if let Some(flag) = &self.sync_pending {
                         flag.store(false, Ordering::Release);
@@ -661,9 +675,50 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    /// nora: when the pending synchronized update times out. Follows the
+    /// parser's deadline (a BSU sets it, an ESU clears it) except across
+    /// [`at_marker_position`], whose resuming BSU would push the parser's
+    /// deadline back at every marker: an update that never ends, followed
+    /// by continuous output with markers, would then never time out.
+    sync_deadline: Option<Instant>,
 }
 
 impl State {
+    /// nora: the parser's synchronized-update deadline.
+    fn parser_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// nora: after the parser parsed stream bytes that began with the
+    /// parser deadline `before`: a change is the stream's own (BSU, ESU).
+    fn note_parsed(&mut self, before: Option<Instant>) {
+        let after = self.parser_deadline();
+        if after != before || after.is_none() || self.sync_deadline.is_none() {
+            self.sync_deadline = after;
+        }
+    }
+
+    /// nora: after [`at_marker_position`] that began with the parser
+    /// deadline `before`: an update that was pending keeps its deadline.
+    fn note_marker(&mut self, before: Option<Instant>) {
+        let after = self.parser_deadline();
+        if after.is_none() || before.is_none() || self.sync_deadline.is_none() {
+            self.sync_deadline = after;
+        }
+    }
+
+    /// nora: end a synchronized update whose deadline has passed, even
+    /// while bytes keep arriving (the loop's timeout branch runs only when
+    /// a poll finds nothing). Returns whether it ended one.
+    fn end_overdue_sync<U: EventListener>(&mut self, terminal: &mut Term<U>) -> bool {
+        let overdue = self.sync_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if overdue && self.parser_deadline().is_some() {
+            self.parser.stop_sync(terminal);
+            self.sync_deadline = None;
+            return true;
+        }
+        false
+    }
     #[inline]
     fn ensure_next(&mut self) {
         if self.writing.is_none() {
