@@ -153,6 +153,11 @@ pub struct Grid<T> {
     /// Runtime-only; not part of the serialized terminal state.
     #[cfg_attr(feature = "serde", serde(skip))]
     total_pulled: u64,
+
+    // nora: how the last resize's reflow moved the grid's points, until
+    // taken (see `resize::ReflowMap`). Runtime-only.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    reflow_map: Option<resize::ReflowMap>,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -167,7 +172,15 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             columns,
             total_scrolled: 0,
             total_pulled: 0,
+            reflow_map: None,
         }
+    }
+
+    // nora: see `resize::ReflowMap`.
+    /// Take how the last [`Grid::resize`] reflowed the grid's points:
+    /// `None` when it reflowed nothing (or the map was already taken).
+    pub fn take_reflow_map(&mut self) -> Option<resize::ReflowMap> {
+        self.reflow_map.take()
     }
 
     /// Update the size of the scrollback history.

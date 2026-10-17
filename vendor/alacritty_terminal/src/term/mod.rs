@@ -704,6 +704,17 @@ impl<T> Term<T> {
         self.damage.resize(num_cols, num_lines);
     }
 
+    // nora: see `grid::resize::ReflowMap`.
+    /// Take how the last [`Term::resize`] reflowed the primary screen
+    /// (the alternate screen does not reflow): `None` when nothing moved.
+    /// Its grid lines and counters are the primary screen's, also while
+    /// the alternate screen is shown.
+    pub fn take_reflow_map(&mut self) -> Option<crate::grid::resize::ReflowMap> {
+        let active = self.grid.take_reflow_map();
+        let inactive = self.inactive_grid.take_reflow_map();
+        active.or(inactive)
+    }
+
     /// Active terminal modes.
     #[inline]
     pub fn mode(&self) -> &TermMode {
