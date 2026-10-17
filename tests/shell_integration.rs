@@ -463,3 +463,33 @@ fn zsh_history_ignore_uses_the_users_extended_glob() {
         out.executed
     );
 }
+
+/// zsh with the user's KSH_ARRAYS still runs the line-init hook: every
+/// prompt gets its `B` (and the buffer reports keep working).
+#[test]
+fn zsh_ksh_arrays_keeps_the_line_hooks() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("zsh-ksh-arrays");
+    let rc = format!(
+        "PS1='$ '\nsetopt ksh_arrays\nsource {}\n",
+        script("nora-zsh.zsh").display()
+    );
+    let mut shell = Shell::zsh(zsh, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    shell.run("echo ran-$((1 + 1))", "ran-2");
+    let out = shell.exit();
+    assert_eq!(
+        out.kinds(),
+        vec![A, B, C, D, A, B, C],
+        "grid:\n{}",
+        out.grid
+    );
+    assert!(
+        out.executed.iter().any(|line| line.starts_with("echo ran")),
+        "got {:?}",
+        out.executed
+    );
+}

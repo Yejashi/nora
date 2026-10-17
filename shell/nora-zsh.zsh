@@ -123,6 +123,12 @@ add-zsh-hook preexec __nora_preexec
 zle -N __nora_line_init
 zle -N __nora_line_report
 zle -N __nora_line_finish
-add-zle-hook-widget line-init __nora_line_init
-add-zle-hook-widget line-pre-redraw __nora_line_report
-add-zle-hook-widget line-finish __nora_line_finish
+# add-zle-hook-widget runs under the caller's options; with the user's
+# KSH_ARRAYS the line-init hook (133;B) never ran, so attach the hooks
+# under zsh defaults.
+() {
+    emulate -L zsh
+    add-zle-hook-widget line-init __nora_line_init
+    add-zle-hook-widget line-pre-redraw __nora_line_report
+    add-zle-hook-widget line-finish __nora_line_finish
+}
