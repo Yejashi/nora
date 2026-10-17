@@ -197,14 +197,14 @@ fn events_and_replies_are_captured_in_order() {
     engine.feed(b"\x1b]2;world\x07"); // OSC 2: window title
 
     // N06b: titles coalesce to the latest before eviction, so the two
-    // title feeds collapse to `Title("world")` in the first title's
-    // position; the records keep their relative order.
+    // title feeds collapse to `Title("world")`, appended where the newest
+    // one arrived; the other records keep their relative order.
     assert_eq!(
         engine.events(),
         vec![
-            EventRecord::Title("world".to_string()),
             EventRecord::PtyWrite("\x1b[0n".to_string()),
             EventRecord::PtyWrite("\x1b[1;1R".to_string()),
+            EventRecord::Title("world".to_string()),
         ]
     );
     assert_eq!(
@@ -371,6 +371,30 @@ fn wakeups_coalesce_and_keep_pending_replies() {
     );
 }
 
+/// A title and a title reset share one replaceable slot: the newest one is
+/// the only one pending, after the records that came before it, so
+/// title A, reset, title B shows B.
+#[test]
+fn title_and_reset_coalesce_to_the_newest() {
+    use alacritty_terminal::event::{Event, EventListener};
+    let mut engine = Engine::new(4, 8);
+    let recorder = engine.recorder();
+    recorder.send_event(Event::Title("A".to_string()));
+    recorder.send_event(Event::ResetTitle);
+    engine.feed(b"\x1b[6n");
+    recorder.send_event(Event::Title("B".to_string()));
+    assert_eq!(
+        engine.drain_events(),
+        vec![
+            EventRecord::PtyWrite("\x1b[1;1R".to_string()),
+            EventRecord::Title("B".to_string()),
+        ]
+    );
+    recorder.send_event(Event::Title("C".to_string()));
+    recorder.send_event(Event::ResetTitle);
+    assert_eq!(engine.drain_events(), vec![EventRecord::ResetTitle]);
+}
+
 /// Presentation records over the cap are evicted before any pending reply.
 #[test]
 fn eviction_spares_pending_replies() {
@@ -379,7 +403,7 @@ fn eviction_spares_pending_replies() {
     engine.feed(b"\x1b[6n");
     let recorder = engine.recorder();
     for _ in 0..1000 {
-        recorder.send_event(Event::ResetTitle);
+        recorder.send_event(Event::CursorBlinkingChange);
     }
     engine.feed(b"\x1b[5n");
     assert_eq!(engine.events().len(), 256);

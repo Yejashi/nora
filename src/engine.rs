@@ -225,7 +225,8 @@ fn is_reply(record: &EventRecord) -> bool {
 /// Pending state is bounded: at most [`MAX_RECORDS`] records and
 /// [`MAX_RECORD_BYTES`] String-owned bytes (drop-oldest FIFO, replies to
 /// the application last). Replaceable presentation state coalesces before
-/// eviction: a new title replaces a pending undrained title (latest wins),
+/// eviction: a new title or title reset replaces the pending one (latest
+/// wins, appended),
 /// and a bell, wakeup or mouse-cursor update while one is pending is
 /// skipped.
 #[derive(Clone, Default)]
@@ -257,22 +258,20 @@ impl Recorder {
 
         // Coalesce replaceable presentation state before eviction.
         match &record {
-            EventRecord::Title(_) => {
-                // Latest title wins: replace the pending undrained
-                // title. The pending record's cost is part of
-                // `state.bytes` (the sum over all pending records), so
-                // the delta is exact.
-                let cost = event_record_cost(&record);
+            EventRecord::Title(_) | EventRecord::ResetTitle => {
+                // A title and a title reset share one slot, latest wins:
+                // drop the pending one and append the new one. (Replacing
+                // a pending title in place lost a later reset's order:
+                // [Title(A), ResetTitle] + Title(B) became
+                // [Title(B), ResetTitle], no title.) The pending record's
+                // cost is part of `state.bytes`, so the delta is exact.
                 if let Some(pos) = state
                     .events
                     .iter()
-                    .rev()
-                    .position(|r| matches!(r, EventRecord::Title(_)))
+                    .position(|r| matches!(r, EventRecord::Title(_) | EventRecord::ResetTitle))
                 {
-                    let pos = state.events.len() - 1 - pos;
-                    let pending = std::mem::replace(&mut state.events[pos], record);
-                    state.bytes = state.bytes - event_record_cost(&pending) + cost;
-                    return;
+                    let pending = state.events.remove(pos);
+                    state.bytes -= event_record_cost(&pending);
                 }
             }
             // A pending bell, redraw request or mouse-cursor update already
