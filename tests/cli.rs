@@ -154,6 +154,19 @@ fn help_and_version_exit_zero() {
         out.stderr
     );
     assert!(!out.stdout.trim().is_empty(), "--help must print usage");
+    // The option table keeps its indentation and alignment.
+    assert!(
+        out.stdout
+            .contains("\n  -h, --help                   Print this help message\n"),
+        "--help options are indented: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("\n      --hold                   Keep the window open"),
+        "--hold is aligned with the other options: {:?}",
+        out.stdout
+    );
 
     let mut cmd = Command::new(nora_bin());
     cmd.arg("--version");

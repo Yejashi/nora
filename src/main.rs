@@ -33,24 +33,28 @@ static ALLOC: nora::trace::alloc_count::CountingAlloc = nora::trace::alloc_count
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: nora [OPTIONS] [-- COMMAND ARG...]\n\n\
-A GPU-accelerated terminal for Linux, with inline command suggestions.\n\
-\n\
-Options:\n\
-  -h, --help                   Print this help message\n\
-  -V, --version                Print nora's name and version\n\
-      --smoke                  Run one automated window smoke cycle and exit\n\
-      --config PATH            Use an explicit config file\n\
-      --check-config           Validate the config and exit (no display\n\
-                               or GPU needed)\n\
-      --reload                 Re-read the config from disk before launch;\n\
-                               a failed reload keeps the last valid config\n\
-      --working-directory PATH Start the command in PATH\n\
-      --hold                  Keep the window open after the child\n\
-                             exits (windowed; headless ignores it)\n\
-      --                       Remainder is the command argv (no shell\n\
-                               interpolation)\n\n\
-With no command, the default shell ($SHELL, else /bin/sh; on Windows\nPowerShell, else %COMSPEC%) is launched.";
+// A raw string: a `\` line continuation would strip the indentation.
+const USAGE: &str = r#"usage: nora [OPTIONS] [-- COMMAND ARG...]
+
+A GPU-accelerated terminal for Linux, with inline command suggestions.
+
+Options:
+  -h, --help                   Print this help message
+  -V, --version                Print nora's name and version
+      --smoke                  Run one automated window smoke cycle and exit
+      --config PATH            Use an explicit config file
+      --check-config           Validate the config and exit (no display
+                               or GPU needed)
+      --reload                 Re-read the config from disk before launch;
+                               a failed reload keeps the last valid config
+      --working-directory PATH Start the command in PATH
+      --hold                   Keep the window open after the child
+                               exits (windowed; headless ignores it)
+      --                       Remainder is the command argv (no shell
+                               interpolation)
+
+With no command, the default shell ($SHELL, else /bin/sh; on Windows
+PowerShell, else %COMSPEC%) is launched."#;
 
 /// Variables that identify the terminal nora was started from. Children
 /// would otherwise inherit them and take nora for that terminal (or think
