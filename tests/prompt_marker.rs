@@ -100,16 +100,108 @@ fn filter_marker_no_spaces() {
     assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
-/// Feed a marker terminated by the single-byte ST (`0x9C`); assert it is
-/// detected and suppressed.
+/// `0x9C` inside a frame is data, as in vte's UTF-8 mode (it is a common
+/// UTF-8 continuation byte): the frame runs on to its real terminator.
 #[test]
-fn filter_marker_0x9c_terminator() {
+fn filter_0x9c_is_frame_data() {
     let mut filter = PromptMarkerFilter::new();
     let mut bytes = vec![0x1B, 0x5D]; // ESC ]
     bytes.extend_from_slice(b"133 ; A");
-    bytes.push(0x9C); // ST (single-byte form)
+    bytes.push(0x9C);
+    bytes.extend_from_slice(b"x\x07after");
     let (forward, events) = filter.process(&bytes);
+    // `133 ; A\x9Cx` is not a well-formed marker, so the whole frame is
+    // forwarded unchanged and nothing leaks out as text early.
+    assert!(events.is_empty());
+    assert_eq!(forward, bytes);
+}
+
+/// A command line with an emoji ending in 0x9C (😜 = F0 9F 98 9C) keeps
+/// the marker and its command line; nothing shows as text.
+#[test]
+fn filter_cmdline_with_emoji() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process("\x1b]133;C;cmdline=echo 😜 hi\x07".as_bytes());
+    assert!(forward.is_empty(), "forwarded {forward:?}");
+    assert_eq!(
+        events,
+        vec![
+            (0, ev(MarkerKind::C)),
+            (0, ShellEvent::CommandLine("echo 😜 hi".to_string())),
+        ]
+    );
+}
+
+/// vte ends an OSC at any ESC, which starts the next sequence: a title
+/// followed directly by `ESC [2J` is forwarded at once (with an explicit
+/// ST) and the CSI after it is not held back.
+#[test]
+fn filter_esc_ends_frame_and_starts_next_sequence() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process(b"\x1b]0;t\x1b[2Jtext");
+    assert!(events.is_empty());
+    assert_eq!(forward, b"\x1b]0;t\x1b\\\x1b[2Jtext");
+
+    // A marker ended by an ESC is detected and the next sequence flows.
+    let (forward, events) = filter.process(b"\x1b]133;A\x1b[1mbold");
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
+    assert_eq!(forward, b"\x1b[1mbold");
+
+    // An ESC that starts another OSC: both frames are seen.
+    let (forward, events) = filter.process(b"\x1b]0;t\x1b]133;B\x07x");
+    assert_eq!(events, vec![(7, ev(MarkerKind::B))]);
+    assert_eq!(forward, b"\x1b]0;t\x1b\\x");
+}
+
+/// The ESC-terminated case works when the chunk splits right after the
+/// ESC.
+#[test]
+fn filter_esc_terminator_across_chunks() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process(b"\x1b]133;A\x1b");
     assert!(forward.is_empty());
+    assert!(events.is_empty());
+    let (forward, events) = filter.process(b"[2J");
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
+    assert_eq!(forward, b"\x1b[2J");
+
+    let (forward, _) = filter.process(b"\x1b]0;t\x1b");
+    assert!(forward.is_empty());
+    let (forward, _) = filter.process(b"\x1b]133;D\x07");
+    assert_eq!(forward, b"\x1b]0;t\x1b\\");
+}
+
+/// CAN and SUB end the frame (vte dispatches it) and are then executed:
+/// a marker ended by CAN is detected and the CAN byte is forwarded.
+#[test]
+fn filter_can_sub_end_frame_and_are_forwarded() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process(b"\x1b]133;A\x18after");
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
+    assert_eq!(forward, b"\x18after");
+
+    let (forward, events) = filter.process(b"\x1b]0;t\x1aafter");
+    assert!(events.is_empty());
+    assert_eq!(forward, b"\x1b]0;t\x1aafter");
+}
+
+/// The C0 controls vte ignores inside an OSC are not frame data.
+#[test]
+fn filter_ignored_c0_inside_frame() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process(b"\x1b]133;\nA\x07");
+    assert!(forward.is_empty());
+    assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
+}
+
+/// A doubled ESC restarts the escape, as in vte: `ESC ESC ] 133;A BEL`
+/// detects the marker, and the first ESC (a no-op in vte) is not left
+/// to pair with the bytes after the suppressed frame.
+#[test]
+fn filter_double_esc_before_osc() {
+    let mut filter = PromptMarkerFilter::new();
+    let (forward, events) = filter.process(b"\x1b\x1b]133;A\x07t");
+    assert_eq!(forward, b"t");
     assert_eq!(events, vec![(0, ev(MarkerKind::A))]);
 }
 
@@ -664,4 +756,36 @@ fn store_iter_yields_all() {
     }
     seen.sort();
     assert_eq!(seen, vec![a, b]);
+}
+
+// ---------------------------------------------------------------------------
+// Filter terminators through the engine (vte parity)
+// ---------------------------------------------------------------------------
+
+/// The text of viewport row `row`, trailing blanks trimmed.
+fn engine_row(engine: &mut nora::engine::Engine, row: usize) -> String {
+    let snapshot = engine.snapshot();
+    let text: String = (0..snapshot.cols)
+        .map(|col| snapshot.cells[row * snapshot.cols + col].ch)
+        .collect();
+    text.trim_end().to_string()
+}
+
+/// A marker whose command line holds a 0x9C byte is consumed whole: no
+/// part of it shows, and the marker is queued.
+#[test]
+fn engine_cmdline_emoji_marker_is_not_shown() {
+    let mut engine = nora::engine::Engine::new(4, 40);
+    engine.feed("\x1b]133;C;cmdline=echo 😜 hi\x07ok".as_bytes());
+    assert_eq!(engine_row(&mut engine, 0), "ok");
+    assert_eq!(engine.drain_markers().len(), 1);
+}
+
+/// An OSC ended by the ESC of the next sequence does not hold back the
+/// output after it.
+#[test]
+fn engine_osc_ended_by_esc_does_not_hold_output() {
+    let mut engine = nora::engine::Engine::new(4, 40);
+    engine.feed(b"junk\x1b]0;t\x1b[2J\x1b[Hshown");
+    assert_eq!(engine_row(&mut engine, 0), "shown");
 }

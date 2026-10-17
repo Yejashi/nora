@@ -580,6 +580,11 @@ impl PromptMarkerFilter {
                         // data bytes (the `]` itself is not data).
                         self.buffer.clear();
                         self.state = FilterState::Osc;
+                    } else if byte == 0x1B {
+                        // vte restarts the escape at a second ESC, so the
+                        // first one has no effect: drop it, hold the new
+                        // one (forwarding it could pair it with bytes after
+                        // a suppressed frame).
                     } else {
                         // Not an OSC: forward the held ESC and this byte.
                         out.push(0x1B);
@@ -587,33 +592,38 @@ impl PromptMarkerFilter {
                         self.state = FilterState::Pass;
                     }
                 }
-                FilterState::Osc => {
-                    if byte == 0x1B {
-                        // Possible ST (`ESC \`).
-                        self.state = FilterState::OscEsc;
-                    } else if byte == 0x9C {
-                        // ST (single-byte form).
-                        self.complete_frame(&mut out, &mut events, &[0x9C]);
-                    } else if byte == 0x07 {
-                        // BEL terminator.
+                // The terminators match vte's `advance_osc_string` (UTF-8
+                // mode): BEL ends the frame; CAN/SUB end it and are then
+                // executed; any ESC ends it and starts the next sequence;
+                // C1 bytes such as 0x9C are data (UTF-8 continuation bytes);
+                // the C0 controls vte ignores are not data.
+                FilterState::Osc => match byte {
+                    0x1B => self.state = FilterState::OscEsc,
+                    0x07 => {
                         self.complete_frame(&mut out, &mut events, &[0x07]);
-                    } else if byte == 0x18 || byte == 0x1A {
-                        // CAN / ABORT: discard the in-progress frame.
-                        self.buffer.clear();
-                        self.overflow = false;
-                        self.state = FilterState::Pass;
-                    } else {
-                        self.hold(&[byte]);
                     }
-                }
+                    0x18 | 0x1A => {
+                        if !self.complete_frame(&mut out, &mut events, &[byte]) {
+                            out.push(byte);
+                        }
+                    }
+                    0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => {}
+                    _ => self.hold(&[byte]),
+                },
                 FilterState::OscEsc => {
                     if byte == 0x5C {
                         // `\`: ST (`ESC \`).
                         self.complete_frame(&mut out, &mut events, &[0x1B, 0x5C]);
                     } else {
-                        // Not ST: the ESC is part of the data.
-                        self.hold(&[0x1B, byte]);
-                        self.state = FilterState::Osc;
+                        // vte ends the frame at the ESC, which begins the
+                        // next sequence. A forwarded frame gets an explicit
+                        // ST (the parser dispatches it the same way, and a
+                        // suppressed frame after it cannot leave the parser
+                        // inside this one); the ESC is then held as in
+                        // ground and this byte reprocessed after it.
+                        self.complete_frame(&mut out, &mut events, &[0x1B, 0x5C]);
+                        self.state = FilterState::SawEsc;
+                        i -= 1;
                     }
                 }
             }
@@ -640,18 +650,19 @@ impl PromptMarkerFilter {
         }
     }
 
+    /// Returns whether the frame (with `terminator`) was forwarded.
     fn complete_frame(
         &mut self,
         out: &mut Vec<u8>,
         events: &mut Vec<(usize, ShellEvent)>,
         terminator: &[u8],
-    ) {
+    ) -> bool {
         let data = std::mem::take(&mut self.buffer);
         self.state = FilterState::Pass;
         if std::mem::take(&mut self.overflow) {
             // An overlong frame is dropped whole: neither this filter nor
             // the parser behind it ever buffers more than the cap.
-            return;
+            return false;
         }
         match classify_frame(&data) {
             FrameAction::Marker(kind, extra) => {
@@ -663,15 +674,18 @@ impl PromptMarkerFilter {
                 if let Some(extra) = extra {
                     events.push((out.len(), extra));
                 }
+                false
             }
             FrameAction::Shell(event) => {
                 // OSC 6973 buffer report: metadata, suppressed.
                 events.push((out.len(), event));
+                false
             }
             FrameAction::Cwd(path) => {
                 // OSC 7 cwd update: suppress the frame (metadata, no
                 // display effect) and record the position.
                 events.push((out.len(), ShellEvent::Cwd(path)));
+                false
             }
             FrameAction::Hyperlink(uri) => {
                 // OSC 8 hyperlink: forward the frame (it has a display
@@ -683,6 +697,7 @@ impl PromptMarkerFilter {
                 out.push(0x5D);
                 out.extend_from_slice(&data);
                 out.extend_from_slice(terminator);
+                true
             }
             FrameAction::Forward => {
                 // Not a recognized shell-integration frame (or
@@ -692,6 +707,7 @@ impl PromptMarkerFilter {
                 out.push(0x5D);
                 out.extend_from_slice(&data);
                 out.extend_from_slice(terminator);
+                true
             }
         }
     }
