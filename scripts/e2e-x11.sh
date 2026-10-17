@@ -187,6 +187,50 @@ scenario_keys() {
     pass keys
 }
 
+# A non-US keyboard (v0.1 acceptance 4): the German layout under Xvfb.
+# Layout letters, a dead key composed by Xlib's built-in input method,
+# AltGr and a moved letter arrive byte-exact.
+scenario_layout() {
+    have setxkbmap layout || return
+    have xmodmap layout || return
+    local dir="$OUT/layout"; mkdir -p "$dir"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+stty raw -echo
+echo 1 >"$dir/ready"
+timeout 10 head -c 9 >"$dir/bytes.raw"; od -An -tx1 "$dir/bytes.raw" >"$dir/bytes.txt"
+stty sane
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    setxkbmap -layout de || { fail layout "setxkbmap -layout de failed"; return; }
+    # Some Xvfb builds accept a keymap upload but never apply it (seen on
+    # Arch 21.1.25): skip there, but never in CI, where it must run.
+    if ! xmodmap -pke 2>/dev/null | grep -qE '^keycode +34 = udiaeresis'; then
+        setxkbmap -layout us
+        [ -n "${GITHUB_ACTIONS:-}" ] && { fail layout "the German keymap was not applied"; return; }
+        echo "SKIP layout: this X server did not apply the German keymap"
+        return
+    fi
+    launch layout "$dir/child.sh"
+    local launched=$?
+    if [ "$launched" -eq 0 ] && wait_file "$dir/ready"; then
+        sleep 0.3
+        # ü, ß, dead acute + e, AltGr+q (@), and z (the US y key).
+        xdotool key udiaeresis ssharp dead_acute e ISO_Level3_Shift+q z
+        wait_file "$dir/bytes.txt"
+    fi
+    finish
+    setxkbmap -layout us
+    [ "$launched" -eq 0 ] || { fail layout "no window"; return; }
+    local got
+    got=$(tr -s ' \n' ' ' <"$dir/bytes.txt" 2>/dev/null | sed 's/^ //; s/ $//')
+    echo "  bytes: $got"
+    [ "$got" = "c3 bc c3 9f c3 a9 40 7a" ] \
+        || { fail layout "expected ü ß é @ z (c3 bc c3 9f c3 a9 40 7a)"; return; }
+    pass layout
+}
+
 # Kitty keyboard protocol (M1.3): a raw-mode child pushes flags, and real
 # key events arrive in the protocol's encoding; popping restores legacy.
 scenario_kitty() {
@@ -1047,6 +1091,88 @@ scenario_nvim() {
     pass nvim
 }
 
+# An SSH session (v0.1 acceptance 1): an unprivileged sshd on a loopback
+# port with throwaway keys; an interactive remote shell (with an isolated
+# HOME) runs a typed command and exits.
+scenario_ssh() {
+    have sshd ssh || return
+    have ssh-keygen ssh || return
+    local dir="$OUT/ssh"; rm -rf "$dir"; mkdir -p "$dir/rhome"
+    ssh-keygen -q -t ed25519 -N '' -f "$dir/host_key"
+    ssh-keygen -q -t ed25519 -N '' -f "$dir/user_key"
+    cp "$dir/user_key.pub" "$dir/authorized_keys"; chmod 600 "$dir/authorized_keys"
+    local port=$((22000 + $$ % 1000))
+    cat >"$dir/sshd_config" <<CONF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $dir/host_key
+PidFile $dir/sshd.pid
+AuthorizedKeysFile $dir/authorized_keys
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+CONF
+    "$(command -v sshd)" -f "$dir/sshd_config" -D -e >"$dir/sshd.log" 2>&1 &
+    local sshd_pid=$!
+    for _ in $(seq 1 50); do grep -q 'Server listening' "$dir/sshd.log" && break; sleep 0.1; done
+    launch ssh ssh -tt -p "$port" -i "$dir/user_key" -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null 127.0.0.1 "HOME=$dir/rhome ENV= PS1='remote\$ ' sh -i" \
+        || { kill "$sshd_pid"; fail ssh "no window"; return; }
+    sleep 1
+    xdotool type --delay 20 "echo ssh-ok \$SSH_CONNECTION > $dir/out.txt"
+    xdotool key Return
+    wait_file "$dir/out.txt"
+    xdotool type --delay 20 "exit"
+    xdotool key Return
+    local exited=no
+    for _ in $(seq 1 50); do kill -0 "$NORA_PID" 2>/dev/null || { exited=yes; break; }; sleep 0.1; done
+    finish
+    kill "$sshd_pid" 2>/dev/null
+    echo "  remote: $(cat "$dir/out.txt" 2>/dev/null)"
+    grep -q '^ssh-ok 127.0.0.1 ' "$dir/out.txt" 2>/dev/null \
+        || { fail ssh "the remote shell did not run the command: $(tail -2 "$dir/sshd.log")"; return; }
+    [ "$exited" = yes ] || { fail ssh "nora did not exit with the session"; return; }
+    pass ssh
+}
+
+# less (v0.1 acceptance 1): a search highlights the match on the
+# alternate screen, and quitting restores the shell's screen.
+scenario_less() {
+    have less less || return
+    local dir="$OUT/less"; mkdir -p "$dir"
+    seq -f 'line %g' 1 500 >"$dir/file.txt"
+    cat >"$dir/child.sh" <<CHILD
+#!/bin/sh
+printf 'BEFORE LESS\n'
+LESS= LESSHISTFILE=- less "$dir/file.txt"
+echo \$? >"$dir/status"
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    launch less "$dir/child.sh" || { fail less "no window"; return; }
+    sleep 0.5
+    xdotool type --delay 30 "/line 321"
+    xdotool key Return
+    sleep 0.5
+    shot "$dir/search.png"
+    xdotool key q
+    wait_file "$dir/status"
+    sleep 0.3
+    shot "$dir/after.png"
+    finish
+    local hits before
+    # The match is drawn in reverse video: light cells on the dark screen.
+    hits=$(count_color "$dir/search.png" '#E5E5E5')
+    hits=$((hits + $(count_color "$dir/search.png" '#FFFFFF')))
+    before=$(count_color "$dir/after.png" '#FFFFFF')
+    echo "  status: $(cat "$dir/status" 2>/dev/null); light px while searching: $hits; after quit: $before"
+    [ "$(cat "$dir/status" 2>/dev/null)" = 0 ] || { fail less "less did not exit 0"; return; }
+    [ "$hits" -gt 500 ] || { fail less "no highlighted match"; return; }
+    [ "$before" -gt 100 ] || { fail less "the shell screen was not restored after quitting"; return; }
+    pass less
+}
+
 # tmux: a full-screen multiplexer draws its status line (default green
 # background) and its pane content.
 scenario_tmux() {
@@ -1086,7 +1212,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim nvim tmux htop)
+ALL=(render tty resize keys layout kitty mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim nvim less ssh tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

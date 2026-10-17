@@ -29,8 +29,11 @@ with real key and mouse events, run in CI job `e2e-x11`), the test suite
 | M5 cross-platform | deferred (Linux only for now; partial) | Linux X11/Wayland verified; Windows: build + headless tests green in CI; macOS: build, unit, platform-neutral and PTY tests green in CI (first full green run `80047545`) | macOS PTY tests intermittently miss a fast-exiting child's output (`cwd_is_honored`, `fast_exit_output_survives_repeatedly`, `window_size_reaches_child`; cause not investigated); the macOS/Windows CI job is non-blocking since 2026-10-17; macOS/Windows interactive use untested; no macOS/Windows packaging |
 | M6 autocomplete | accepted | `tests/shell_input.rs`, `tests/suggest.rs`, PTY test; e2e `zshell` (buffer follows typing, completion, kill/yank, history recall), `suggest` (ghost text, Right runs exactly the suggestion, path completion, history saved on SIGTERM); `ime` (real ibus over XIM: preedit drawn, ghost text hidden while composing, commit reaches the shell once); password-input check (`password_input_follows_the_child_line_discipline`, `pty_zsh_editing_is_not_password_input`); docs/performance/2026-10-16-suggestions.md | zsh only, by design (ADR-013): fish and bash with ble.sh draw their own autosuggestions, plain bash cannot report its editor buffer |
 
-Real applications exercised end to end: vim (insert, Escape, `:wq`), tmux
-(status line and pane), htop (colors and meters).
+Real applications exercised end to end: vim (insert, Escape, `:wq`),
+Neovim (kitty keyboard protocol), tmux (status line and pane), htop
+(colors and meters), less (search highlight, quit restores the screen), an
+SSH session (unprivileged sshd on loopback, interactive remote shell), zsh
+with the integration.
 
 What "accepted" does not claim: hardware coverage beyond one AMD GPU
 (RADV) and Mesa lavapipe; compositors beyond GNOME and Weston; a manual
