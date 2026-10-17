@@ -1,6 +1,6 @@
 //! N17a: pure paste policy.
 //!
-//! Paste validation (size cap, bracketed paste markers, newline
+//! Paste validation (size cap, bracketed paste markers and sanitizing, newline
 //! normalization) and a bounded paste stream. No winit, no PTY, no
 //! terminal state — headlessly testable. The pump wiring (N17b) validates
 //! clipboard text with [`validate_paste`], then sends the bytes through
@@ -36,14 +36,20 @@ pub enum PasteValidation {
 
 /// Validate a paste and apply bracketed paste markers if needed.
 ///
-/// Newlines are normalized first (`\r\n` → `\n`, standalone `\r` → `\n`,
-/// `\n` unchanged), then — if `bracketed` — the normalized bytes are
-/// wrapped in `CSI 200 ~ ... CSI 201 ~`. The final size (including
-/// markers when bracketed) is compared against [`MAX_PASTE_SIZE`]:
-/// strictly larger is [`PasteValidation::TooLarge`], exactly equal is
-/// [`PasteValidation::Ok`].
+/// Unbracketed, newlines become what the Return key sends (`\r\n` → `\r`,
+/// `\n` → `\r`, `\r` unchanged), as in xterm and alacritty. Bracketed,
+/// newlines become `\n` (`\r\n` → `\n`, standalone `\r` → `\n`) and every
+/// ESC (and the C1 CSI, U+009B) is removed, so the text cannot carry its
+/// own `CSI 201 ~` and end the paste early; then the bytes are wrapped in
+/// `CSI 200 ~ ... CSI 201 ~`. The final size (including markers when
+/// bracketed) is compared against [`MAX_PASTE_SIZE`]: strictly larger is
+/// [`PasteValidation::TooLarge`], exactly equal is [`PasteValidation::Ok`].
 pub fn validate_paste(paste: &str, bracketed: bool) -> PasteValidation {
-    let normalized = normalize_newlines(paste);
+    let normalized = if bracketed {
+        sanitize_bracketed(paste)
+    } else {
+        normalize_newlines(paste)
+    };
     let total = if bracketed {
         BRACKET_START.len() + normalized.len() + BRACKET_END.len()
     } else {
@@ -122,9 +128,21 @@ impl PasteStream {
     }
 }
 
-/// Normalize paste newlines: `\r\n` → `\n`, standalone `\r` → `\n`.
+/// Normalize unbracketed paste newlines to Return: `\r\n` → `\r`,
+/// `\n` → `\r`. A raw-mode application then sees Enter, not Ctrl+J.
 fn normalize_newlines(paste: &str) -> String {
-    // First pass folds CRLF to LF; the second pass folds any standalone
-    // CR to LF. LF passes through unchanged.
-    paste.replace("\r\n", "\n").replace('\r', "\n")
+    // First pass folds CRLF to CR; the second pass folds any remaining
+    // LF to CR. CR passes through unchanged.
+    paste.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+/// The payload of a bracketed paste: newlines folded to `\n`, and ESC and
+/// the C1 CSI (U+009B) removed so no end marker can be smuggled in.
+fn sanitize_bracketed(paste: &str) -> String {
+    paste
+        .replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c != '\x1b' && c != '\u{9b}')
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .collect()
 }

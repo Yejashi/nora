@@ -153,7 +153,8 @@ Pure policy in `src/input/paste.rs` (`validate_paste`, `PasteStream`), headless 
 | --- | --- | --- |
 | Bracketed paste | Supported: when bracketed paste mode is active the payload is wrapped in `CSI 200 ~ ... CSI 201 ~` (6 bytes per marker); ordinary paste has no delimiters | pass — `tests/paste_input.rs` |
 | Maximum paste size | 1 MiB (`MAX_PASTE_SIZE`), checked against the final bytes including markers; strictly larger is rejected as `TooLarge`, exactly 1 MiB is accepted | pass — boundary rows in `tests/paste_input.rs` |
-| Newline normalization | `\r\n` and standalone `\r` → `\n`, before bracketing | pass — `tests/paste_input.rs` |
+| Newline normalization | Ordinary paste: `\r\n` and `\n` → `\r` (what Return sends, as in xterm/alacritty). Bracketed paste: `\r\n` and standalone `\r` → `\n` | pass — `tests/paste_input.rs` |
+| Bracket terminator injection | Inside a bracketed paste every ESC (0x1b) and C1 CSI (U+009B) is removed from the payload, so pasted text containing `CSI 201 ~` cannot end the paste early; ordinary paste is sent unchanged | pass — `bracketed_payload_cannot_end_the_paste` |
 | Bounded streaming | `PasteStream` delivers the validated bytes as ordered chunks of at most `max_size`; `cancel` drops the remainder, and the pump still sends the bracket terminator before normal input resumes (N17b) | pass — `tests/paste_input.rs` |
 
 ### Paste pump wiring (N17b)

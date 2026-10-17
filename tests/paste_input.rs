@@ -5,8 +5,10 @@
 //! Every test is headless: no winit, no PTY, no display, no clocks.
 //!
 //! Pinned policy (verified against `src/input/paste.rs`):
-//! - newlines are normalized before bracketing: `\r\n` → `\n`,
-//!   standalone `\r` → `\n`, `\n` unchanged;
+//! - unbracketed newlines become Return: `\r\n` → `\r`, `\n` → `\r`,
+//!   `\r` unchanged;
+//! - bracketed newlines become `\n` (`\r\n` and standalone `\r`), and
+//!   ESC / U+009B are removed so the payload cannot end the paste early;
 //! - bracketed paste wraps the normalized bytes in
 //!   `CSI 200 ~ ... CSI 201 ~` (6 bytes per marker);
 //! - the size check compares the final bytes (including markers when
@@ -62,15 +64,45 @@ fn bracketed_markers_are_exact_bytes() {
     );
 }
 
-/// Newline normalization: `\r\n` → `\n`, standalone `\r` → `\n`,
-/// `\n` unchanged (ordinary mode).
+/// Unbracketed newline normalization: `\r\n` → `\r`, `\n` → `\r`, `\r`
+/// unchanged — what the Return key sends, as in xterm and alacritty, so a
+/// raw-mode application sees Enter rather than Ctrl+J.
 #[test]
 fn newline_normalization_crlf_cr_lf() {
     let v = validate_paste("a\r\nb\rc\nd", false);
     assert_eq!(
         v,
         PasteValidation::Ok {
-            bytes: b"a\nb\nc\nd".to_vec(),
+            bytes: b"a\rb\rc\rd".to_vec(),
+            bracketed: false,
+        }
+    );
+}
+
+/// A bracketed payload cannot end the paste early: an embedded
+/// `CSI 201 ~` (7-bit ESC form or C1 U+009B form) loses its introducer, so
+/// the only end marker is the one `validate_paste` appends.
+#[test]
+fn bracketed_payload_cannot_end_the_paste() {
+    let v = validate_paste("ls\x1b[201~rm -rf ~\n\u{9b}201~x\x1b", true);
+    let bytes = match v {
+        PasteValidation::Ok { bytes, .. } => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert_eq!(
+        bytes,
+        [START, b"ls[201~rm -rf ~\n201~x".as_ref(), END].concat()
+    );
+    let ends = bytes.windows(END.len()).filter(|w| *w == END).count();
+    assert_eq!(ends, 1, "only the closing marker");
+    assert!(bytes.ends_with(END));
+    let escs = bytes.iter().filter(|&&b| b == 0x1b).count();
+    assert_eq!(escs, 2, "only the two markers' ESCs");
+    // Unbracketed text is sent as typed (there is no marker to protect).
+    assert_eq!(
+        validate_paste("a\x1bb", false),
+        PasteValidation::Ok {
+            bytes: b"a\x1bb".to_vec(),
             bracketed: false,
         }
     );
