@@ -595,10 +595,18 @@ impl PromptMarkerFilter {
                         // a suppressed frame).
                     } else if matches!(byte, 0x00..=0x17 | 0x19 | 0x1C..=0x1F) {
                         // vte executes a C0 control inside an escape and
-                        // stays in it (`ESC NUL ]` starts an OSC). Executed
-                        // before the ESC it has the same effect, so forward
-                        // it and keep holding the ESC.
+                        // stays in it. Forwarding the control before the
+                        // held ESC is not equivalent: this filter does not
+                        // track DCS/SOS/PM/APC strings, inside which vte
+                        // ignores the control, while after the ESC (which
+                        // ends such a string) it executes it. So the ESC
+                        // and the control go out in their order and the
+                        // filter returns to ground; the rare
+                        // `ESC <C0> ] 133 …` is then parsed by vte and not
+                        // recognised as a marker.
+                        out.push(0x1B);
                         out.push(byte);
+                        self.state = FilterState::Pass;
                     } else if byte >= 0x7F {
                         // vte ignores DEL and 8-bit bytes inside an escape
                         // and stays in it: drop the byte, keep the ESC.
