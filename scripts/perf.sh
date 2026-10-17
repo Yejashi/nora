@@ -5,8 +5,9 @@
 # Measures:
 #   startup     wall time of `nora -- true` (window, GPU init, fonts, first
 #               frame, child spawn and exit), median of 5
-#   throughput  `nora -- cat FILE` on a 32 MiB text corpus, minus startup
-#               and teardown (the `nora -- true` median)
+#   throughput  `nora -- cat FILE` on a 32 MiB text corpus, timed by the
+#               child around `cat` (the PTY buffer is small, so `cat` ends
+#               when nora has consumed the stream)
 #   frames      per-phase frame cost from NORA_TRACE_FRAMES during the
 #               throughput run (median / p95)
 #   memory      peak RSS (VmHWM) during the throughput run
@@ -82,21 +83,20 @@ for _ in 1 2 3 4 5; do
 done
 STARTUP=$(printf '%s\n' "${startups[@]}" | median)
 
-# The child sleeps first so the optional resize lands before the stream.
-NORA_TRACE_FRAMES=1 "$NORA_BIN" -- sh -c "sleep 1; cat '$CORPUS'" >"$OUT/run.log" 2>&1 &
+# The child sleeps first so the optional resize lands before the stream,
+# and times `cat` itself: wall-clock polling around nora (startup,
+# teardown, 100 ms samples) was a large error on a stream of ~300 ms.
+rm -f "$OUT/stream.ms"
+NORA_TRACE_FRAMES=1 "$NORA_BIN" -- sh -c "sleep 1; s=\$(date +%s%N); cat '$CORPUS'; e=\$(date +%s%N); echo \$(( (e - s) / 1000000 )) >'$OUT/stream.ms'" >"$OUT/run.log" 2>&1 &
 PID=$!
 resize_window
-t0=$(now_ms)
 PEAK=0
 while kill -0 $PID 2>/dev/null; do
     hwm=$(awk '/^VmHWM/{print $2}' /proc/$PID/status 2>/dev/null)
     [ -n "$hwm" ] && [ "$hwm" -gt "$PEAK" ] && PEAK=$hwm
     sleep 0.1
 done
-TOTAL=$(( $(now_ms) - t0 ))
-# Minus the child's 1 s sleep and nora's own start and teardown (the
-# `nora -- true` median), leaving the time to consume the stream.
-STREAM_MS=$(( TOTAL - 1000 - STARTUP ))
+STREAM_MS=$(cat "$OUT/stream.ms" 2>/dev/null || echo 0)
 MBPS=$(awk -v b="$BYTES" -v ms="$STREAM_MS" 'BEGIN{printf "%.1f", b / 1048576 / (ms / 1000)}')
 
 grep '^frame: ' "$OUT/run.log" > "$OUT/frames.txt"

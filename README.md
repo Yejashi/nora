@@ -264,7 +264,8 @@ GNOME Wayland) unless noted. They are evidence, not guarantees.
 | Start to first frame | about 180 ms (`nora -- true`: 204–214 ms wall time) |
 | Key press to frame presented | about 1 ms median (Xvfb, software GPU) |
 | Key press to suggestion on screen | 1.4 ms median, 3.5 ms max (Xvfb, software GPU) |
-| Output throughput, 32 MiB with colors | about 56 MiB/s in the window |
+| Output throughput, 32 MiB with colors | 70–80 MiB/s in the window at 80x24 with 10 000 lines of scrollback (Xvfb, software GPU); with equal scrollback the same as without a window |
+| Allocations per frame | about 180 for a full 120x35 screen, 170 for a typed character |
 | Idle | no frames drawn; the I/O thread wakes twice a second |
 
 Method and raw numbers are in [docs/performance/](docs/performance/).
