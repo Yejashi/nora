@@ -109,8 +109,7 @@ fn selection_wraps_at_row_boundary() {
     let text = engine
         .copy_selection()
         .expect("a selection copies its text");
-    // Rows are joined with `\n` (terminal copy convention); the body is
-    // the selected cells only.
+    // The rows are one soft-wrapped line: joined without a newline.
     let body: String = text.chars().filter(|c| *c != '\n').collect();
     assert!(
         body.chars().all(|c| c == 'a'),
@@ -123,8 +122,8 @@ fn selection_wraps_at_row_boundary() {
     );
     assert_eq!(
         text.matches('\n').count(),
-        1,
-        "exactly one row separator between the two rows; got {text:?}"
+        0,
+        "a soft wrap is not a line break; got {text:?}"
     );
 }
 
@@ -242,7 +241,7 @@ fn selection_follows_its_text_when_the_view_scrolls() {
     assert_eq!(selected_text(&mut engine), "L10L11");
     let sel = engine.selection().expect("still visible");
     assert_eq!((sel.start, sel.end), ((3, 0), (4, 2)));
-    let padded = format!("L10{}\nL11", " ".repeat(17));
+    let padded = "L10\nL11".to_string();
     assert_eq!(engine.copy_selection(), Some(padded.clone()));
     // A selection partly below the view is clipped at the bottom.
     engine.scroll(Scroll::Delta(1));
@@ -263,7 +262,7 @@ fn extending_a_selection_keeps_its_anchored_start() {
     // L10 is now row 3; the pointer at row 1 is over L08.
     engine.extend_selection((1, 0));
     // From the pointer to the anchored start (L10, column 0).
-    let padded = format!("L08{}\nL09{}\nL", " ".repeat(17), " ".repeat(17));
+    let padded = "L08\nL09\nL".to_string();
     assert_eq!(engine.copy_selection(), Some(padded));
     engine.extend_selection((3, 0));
     assert_eq!(
@@ -274,4 +273,22 @@ fn extending_a_selection_keeps_its_anchored_start() {
     engine.clear_selection();
     engine.extend_selection((0, 0));
     assert!(engine.copy_selection().is_none(), "nothing to extend");
+}
+
+/// Copy joins a soft-wrapped line without a newline, keeps combining
+/// marks with their base, and drops the blanks after a line's text.
+#[test]
+fn copy_joins_soft_wraps_keeps_marks_and_trims_line_ends() {
+    let mut engine = Engine::with_history(4, 10, 100);
+    // 14 characters wrap into a second row; then a line with a mark.
+    engine.feed("abcdefghijklmn\r\ne\u{301}x  \r\n".as_bytes());
+    engine.select((0, 0), (2, 9));
+    assert_eq!(
+        engine.copy_selection().as_deref(),
+        Some("abcdefghijklmn\ne\u{301}x"),
+        "one line for the wrapped text, the mark kept, no trailing blanks"
+    );
+    // A selection ending inside a line keeps what it covers.
+    engine.select((2, 0), (2, 3));
+    assert_eq!(engine.copy_selection().as_deref(), Some("e\u{301}x  "));
 }

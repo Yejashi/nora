@@ -1391,7 +1391,9 @@ impl Engine {
         let topmost = grid.topmost_line().0 as i64;
         let bottommost = grid.bottommost_line().0 as i64;
         let mut out = String::new();
-        let mut prev_row: Option<i64> = None;
+        // A newline is due before the next copied row: the previous one
+        // ended a line (not soft-wrapped into the next row).
+        let mut newline = false;
         for line_id in sel.lo.0..=sel.hi.0 {
             // Lines that left the history (or a grid that a resize shrank
             // below the range) have nothing to copy.
@@ -1406,6 +1408,10 @@ impl Engine {
                 cols - 1
             };
             let row = &grid[Line(line as i32)];
+            if newline {
+                out.push('\n');
+            }
+            let start = out.len();
             for col in first..=last {
                 let cell = &row[Column(col)];
                 // Skip wide-char spacers: a wide char occupies two cells;
@@ -1417,12 +1423,22 @@ impl Engine {
                 {
                     continue;
                 }
-                if prev_row.is_some() && prev_row != Some(line_id) {
-                    out.push('\n');
-                }
-                prev_row = Some(line_id);
                 out.push(cell.c);
+                // Combining marks belong to their base character.
+                if let Some(marks) = cell.zerowidth() {
+                    out.extend(marks.iter());
+                }
             }
+            // A row that soft-wraps continues in the next one: no newline
+            // and its trailing cells are text. A row that ends a line drops
+            // the blanks after its text, as other terminals copy.
+            let to_end = last == cols - 1;
+            let wrapped = to_end && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            if to_end && !wrapped {
+                let text_end = start + out[start..].trim_end_matches(' ').len();
+                out.truncate(text_end);
+            }
+            newline = !wrapped;
         }
         Some(out)
     }
