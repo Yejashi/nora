@@ -299,8 +299,12 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
   Wayland text-input path and the drawing of a candidate window have not
   been checked by a test (the spot nora reports to the input method is).
-- **Wayland clipboard.** The clipboard goes through XWayland, so it
-  needs XWayland running.
+- **Wayland clipboard.** On native Wayland nora uses the Wayland
+  clipboard directly (no XWayland needed); text only, no PRIMARY
+  selection. Pasting another program's selection is checked on a
+  headless compositor; copying from nora and pasting that elsewhere has
+  not been checked by a test on Wayland yet, since it needs a real key
+  press.
 - **Suggestions** need zsh with the integration script.
 
 ## Contributing

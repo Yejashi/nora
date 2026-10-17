@@ -27,7 +27,7 @@ the clipboard on that platform. Treat those builds as previews.
 | Default shell | `$SHELL`, else `/bin/sh` | same | `pwsh.exe`, else `powershell.exe`, else `%COMSPEC%` | `default_shell` in `src/main.rs` |
 | Font lookup | fontconfig (`fc-match`, `fc-list`), full scan as fallback | full scan (fontdb) | full scan (fontdb) | `src/app/glyphs.rs` |
 | Default font chain | Noto Sans Mono, DejaVu Sans Mono, monospace | + SF Mono, Menlo | + Cascadia Mono, Consolas | `Fonts::load` |
-| Clipboard | arboard (X11; Wayland via XWayland) | arboard | arboard | `src/clipboard.rs` |
+| Clipboard | smithay-clipboard on native Wayland, arboard on X11 (ADR-016) | arboard | arboard | `src/clipboard.rs` |
 | Terminal identity | `TERM=nora` (terminfo) | same | not used (ConPTY) | `src/main.rs` |
 | Install | `scripts/install.sh` (incl. NixOS wrapper) | none yet | none yet | `scripts/` |
 | Shell integration | `shell/nora-bash.sh` | same (bash) | none | `shell/` |

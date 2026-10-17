@@ -17,7 +17,7 @@ Create `docs/status/COMPATIBILITY.md` during N04. For every row record: status (
 | Paste | Bracketed and ordinary paste | Exact payload tests, slow child |
 | Mouse/focus | Selected modes, coordinates and focus reports | Input fixtures and real TUI |
 | Synchronized output | Verified engine behavior, finite recovery timeout | Start/end/missing-end tests |
-| Clipboard | User copy/paste; OSC policy disabled by default | Native Wayland/X11 tests |
+| Clipboard | User copy/paste; native Wayland through `smithay-clipboard`, X11 through `arboard` (ADR-016); OSC policy disabled by default | Backend choice and stuck-read unit tests (`src/clipboard.rs`); headless native-Wayland paste check (`scripts/wayland-clipboard-check.sh`); Wayland copy checks unverified (need a key press) |
 | Hyperlinks | Preserve metadata; explicit user activation | URL validation + selection tests |
 | IME | Preedit UI and one commit; proper candidate area | Native tests and event replay |
 | Shell integration | OSC 133 A/B/C/D markers, OSC 7 cwd, OSC 8 hyperlinks; opt-in shell script, engine-level features (jump-to-prompt, previous-command selection, hyperlink activation). Known limit: a marker with a C0 control between its ESC and `]` (`ESC NUL ] 133 …`) is left to the parser and not recognised; the filter forwards the ESC and the control in order, since it does not track DCS/SOS/PM/APC strings, where the order decides whether vte executes the control (`tests/escape_c0.rs`) | Filter tests (`prompt_marker`), PTY shared-state tests (`pty_session`), navigation tests (`scrollback`) |
@@ -255,6 +255,15 @@ The engine's scrollback search (`Engine::search_text`, used by the pump) scans t
 ## Native clipboard and IME
 
 Wayland clipboard ownership is a platform integration issue. Prefer a winit-compatible native Wayland helper such as `smithay-clipboard` after verifying the pinned handle/API; use a tested X11 backend for X11 [S25, S26]. Do not quietly start an X11 clipboard path in a native Wayland session. Test ownership lifetime, delayed requests and selection transfer after focus changes. PRIMARY selection is optional and documented independently from ordinary copy/paste.
+
+Implemented (ADR-016): the window's display handle picks the backend (`clipboard_kind`). A native Wayland window uses `smithay-clipboard` 0.7.2 (sctk 0.19, the same as winit) on the window's own `wl_display`, with one instance for copies and one for pastes; a paste behind a read still waiting on its selection owner fails at once instead of queueing. An X11 window uses `arboard`. A Wayland window never falls back to X11. The `wl_display` stays connected for as long as a clipboard thread may use it: the event loop is not dropped while a Wayland clipboard exists. Text only (`text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain`); PRIMARY is not used.
+
+| Wayland clipboard behavior | Status | Evidence |
+| --- | --- | --- |
+| Paste another client's selection, no XWayland | pass (headless `kwin_wayland --virtual`, no X11 display) | `scripts/wayland-clipboard-check.sh` |
+| Paste nora's own copy; another client reads nora's copy | unverified: a copy needs the serial of a real key or button event, which the headless compositor cannot inject | `NORA_WAYLAND_COPY_CHECK=1` run of `tests/wayland_clipboard.rs` in a desktop session |
+| A read stuck on its owner does not pile up threads | pass (fake reader) | `a_read_behind_a_stuck_read_fails_at_once_and_replies_stay_matched` |
+| Selection after focus changes, delayed requests | unverified | — |
 
 Keep clipboard work asynchronous and bounded. OSC 52 reads and writes are disabled by default; opt-in policies must be separate, with payload limits and tests. A shell output string cannot open a URL, read files, or spawn a program without a defined user action.
 

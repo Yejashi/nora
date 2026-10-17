@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use nora::clipboard::{ClipboardBackend, ClipboardError, create_clipboard};
+use winit::raw_window_handle::{RawDisplayHandle, XlibDisplayHandle};
 
 /// N15 (1): `create_clipboard` returns an `Option` — `Some` when a display
 /// server is available, `None` when headless — and never panics. In the
@@ -17,7 +18,10 @@ use nora::clipboard::{ClipboardBackend, ClipboardError, create_clipboard};
 fn create_clipboard_returns_option_without_panicking() {
     // Assert only that it returned (an `Option`, no panic). The
     // environment decides `Some` vs `None`; both are valid.
-    let _ = create_clipboard();
+    let x11 = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
+    // SAFETY: an X11 handle carries no lifetime requirement (arboard opens
+    // its own connection); only a Wayland handle does.
+    let _ = unsafe { create_clipboard(x11) };
 }
 
 /// A mock [`ClipboardBackend`] that records `set_text` calls and returns the

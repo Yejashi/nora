@@ -32,7 +32,7 @@ use self::graphics::Graphics;
 use self::scene::Scene;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
-use nora::clipboard::{ClipboardBackend, create_clipboard};
+use nora::clipboard::{ClipboardBackend, ClipboardKind, clipboard_kind, create_clipboard};
 use nora::engine::Snapshot;
 use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
@@ -754,6 +754,27 @@ pub fn run_windowed(
     let mut pane_last_visible = std::collections::HashMap::new();
     pane_last_visible.insert(first_pane, Vec::new());
 
+    // ADR-016: the event loop owns winit's Wayland connection, which
+    // disconnects the `wl_display` when its last clone is dropped (the event
+    // loop and each window hold one). A Wayland clipboard's threads use that
+    // display for as long as the backend lives, and a paste thread stuck on
+    // a selection owner keeps the backend alive past the window. So the
+    // event loop is never dropped while a Wayland clipboard exists, not even
+    // during an unwind: it is `ManuallyDrop` from here on and is leaked
+    // below, which leaves the display connected until the process exits.
+    let mut event_loop = std::mem::ManuallyDrop::new(event_loop);
+    let display = winit::raw_window_handle::HasDisplayHandle::display_handle(&*window)
+        .map(|handle| handle.as_raw())
+        .ok();
+    let keeps_display = display
+        .as_ref()
+        .is_some_and(|display| clipboard_kind(display) == ClipboardKind::Wayland);
+    // SAFETY: a Wayland `display` is the `wl_display` of `event_loop`'s
+    // connection; `event_loop` is never dropped when `keeps_display` (see
+    // above), so that display stays connected for the rest of the process,
+    // which outlives the backend and every clone of it.
+    let clipboard = display.and_then(|display| unsafe { create_clipboard(display) });
+
     let mut app = WinApp {
         slot,
         pump_commands,
@@ -774,7 +795,7 @@ pub fn run_windowed(
         pressed_buttons: Vec::new(),
         mouse_grab: None,
         frame_skipped: false,
-        clipboard: create_clipboard(),
+        clipboard,
         paste_gate: PasteGate::new(),
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_config(config),
@@ -818,7 +839,12 @@ pub fn run_windowed(
         pane_selection,
         pane_last_visible,
     };
-    match event_loop.run_app(&mut app) {
+    // `run_app_on_demand` borrows the loop (`run_app` would drop it on
+    // return); on Linux `run_app` is exactly this call.
+    let code = match winit::platform::run_on_demand::EventLoopExtRunOnDemand::run_app_on_demand(
+        &mut *event_loop,
+        &mut app,
+    ) {
         Ok(()) => {
             if debug_enabled() {
                 eprintln!(
@@ -844,7 +870,12 @@ pub fn run_windowed(
             eprintln!("nora: event loop failed: {err}");
             std::process::ExitCode::FAILURE
         }
+    };
+    drop(app);
+    if !keeps_display {
+        drop(std::mem::ManuallyDrop::into_inner(event_loop));
     }
+    code
 }
 
 impl WinApp {
