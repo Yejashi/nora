@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use super::glyphs;
 use glyphon::{
-    Buffer, Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
-    TextRenderer, Viewport,
+    Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
+    Viewport,
 };
 use wgpu::{
     Adapter, BlendState, BufferDescriptor, BufferUsages, ColorTargetState, CommandEncoder,
@@ -46,12 +46,84 @@ pub struct DrawCell {
     /// Viewport column (0 = left).
     pub col: u32,
     /// The full cluster: the cell character followed by its zerowidth marks.
-    pub text: String,
+    pub text: CellText,
     /// Resolved visual style (fg/bg/bold/italic/faint/conceal/underline/
     /// strikethrough).
     pub style: CellStyle,
     /// Advance width in cells (1 or 2).
     pub width: u16,
+}
+
+/// A cell's cluster text, kept inline when it fits (a character and a few
+/// combining marks), so building a frame does not allocate per cell (audit
+/// R12). Longer clusters use the heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellText {
+    Inline { len: u8, bytes: [u8; 15] },
+    Heap(String),
+}
+
+impl CellText {
+    /// The cluster of `ch` followed by its combining `marks`.
+    pub fn cluster(ch: char, marks: &[char]) -> Self {
+        let len = ch.len_utf8() + marks.iter().map(|m| m.len_utf8()).sum::<usize>();
+        if len > 15 {
+            let mut text = String::with_capacity(len);
+            text.push(ch);
+            text.extend(marks);
+            return Self::Heap(text);
+        }
+        let mut bytes = [0u8; 15];
+        let mut at = ch.encode_utf8(&mut bytes).len();
+        for mark in marks {
+            at += mark.encode_utf8(&mut bytes[at..]).len();
+        }
+        Self::Inline {
+            len: at as u8,
+            bytes,
+        }
+    }
+
+    /// The cluster as a string slice.
+    pub fn as_str(&self) -> &str {
+        match self {
+            // Built only from whole UTF-8 encodings in `cluster`.
+            Self::Inline { len, bytes } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
+            }
+            Self::Heap(text) => text,
+        }
+    }
+}
+
+impl std::ops::Deref for CellText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<char> for CellText {
+    fn from(ch: char) -> Self {
+        Self::cluster(ch, &[])
+    }
+}
+
+impl From<&str> for CellText {
+    fn from(text: &str) -> Self {
+        let mut chars = text.chars();
+        match chars.next() {
+            Some(ch) => {
+                let marks: Vec<char> = chars.collect();
+                Self::cluster(ch, &marks)
+            }
+            None => Self::Inline {
+                len: 0,
+                bytes: [0; 15],
+            },
+        }
+    }
 }
 
 /// One solid rectangle under the text: a cell background or the block
@@ -589,27 +661,34 @@ impl Graphics {
         let metrics = Metrics::new(fonts.metrics.font_px, cell_h);
 
         // Shape every cell first (N27b): glyphon's `TextArea` borrows its
-        // `Buffer`, so all buffers must be pushed before any area borrows the
-        // vector. Each cell is shaped through the retained glyph cache, which
-        // reuses an already-shaped buffer for an unchanged cell (same text,
-        // bold/italic/underline/strike and zoom-scaled size) instead of
-        // re-running cosmic-text's shaping.
-        let mut buffers: Vec<Buffer> = Vec::with_capacity(cells.len());
-        for cell in cells {
-            buffers.push(self.glyph_cache.shape(
-                &mut fonts.fs,
-                metrics,
-                &cell.text,
-                cell.style.bold,
-                cell.style.italic,
-                cell.style.underline,
-                cell.style.strikethrough,
-                metrics.font_size,
-            ));
-        }
+        // `Buffer`, so every cell is prepared before any area borrows the
+        // cache. The retained glyph cache reuses an already-shaped buffer for
+        // an unchanged cell (same text, bold/italic/underline/strike and
+        // zoom-scaled size) instead of re-running cosmic-text's shaping, and
+        // the areas borrow its buffers rather than cloning them (audit R12).
+        self.glyph_cache.begin_frame(cells.len());
+        let slots: Vec<usize> = cells
+            .iter()
+            .map(|cell| {
+                self.glyph_cache.prepare(
+                    &mut fonts.fs,
+                    metrics,
+                    &cell.text,
+                    cell.style.bold,
+                    cell.style.italic,
+                    cell.style.underline,
+                    cell.style.strikethrough,
+                    metrics.font_size,
+                )
+            })
+            .collect();
+        let glyph_cache = &self.glyph_cache;
 
         let mut areas: Vec<TextArea> = Vec::with_capacity(cells.len());
-        for (cell, buffer) in cells.iter().zip(buffers.iter()) {
+        for (cell, buffer) in cells
+            .iter()
+            .zip(slots.iter().map(|&s| glyph_cache.buffer(s)))
+        {
             // Advance by the cell's width: a wide char spans 2 cells,
             // everything else 1 (spacers never reach here).
             let span = cell.width.max(1) as i32;
@@ -798,8 +877,8 @@ impl Graphics {
             let size = texture.texture.size();
             let frame_w = size.width as f32;
             let frame_h = size.height as f32;
-            for (cell, buffer) in cells.iter().zip(buffers.iter()) {
-                let Some(run) = buffer.layout_runs().next() else {
+            for (cell, &slot) in cells.iter().zip(slots.iter()) {
+                let Some(run) = glyph_cache.buffer(slot).layout_runs().next() else {
                     continue;
                 };
                 for span in run.decorations {
@@ -921,6 +1000,25 @@ impl Graphics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clusters up to 15 bytes stay inline; longer ones use the heap; both
+    /// read back exactly.
+    #[test]
+    fn cell_text_keeps_clusters_exact() {
+        let plain = CellText::from('a');
+        assert!(matches!(plain, CellText::Inline { .. }));
+        assert_eq!(plain.as_str(), "a");
+        let marked = CellText::cluster('e', &['\u{301}', '\u{323}']);
+        assert!(matches!(marked, CellText::Inline { .. }));
+        assert_eq!(&*marked, "e\u{301}\u{323}");
+        let wide = CellText::from("日");
+        assert_eq!(wide.as_str(), "日");
+        let marks = ['\u{301}'; 8];
+        let long = CellText::cluster('x', &marks);
+        assert!(matches!(long, CellText::Heap(_)));
+        assert_eq!(long.as_str().chars().count(), 9);
+        assert_eq!(CellText::from("").as_str(), "");
+    }
 
     /// One case per pinned wgpu 30 acquire outcome, headless: no surface, no
     /// adapter. (The texture-carrying `Success`/`Suboptimal` wgpu variants

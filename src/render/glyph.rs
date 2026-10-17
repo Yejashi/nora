@@ -99,11 +99,17 @@ struct GlyphKey {
 /// traits and the (zoom-scaled) font size, so an unchanged cell shapes to an
 /// identical buffer. This cache retains the shaped [`Buffer`] and reuses it on
 /// a hit, skipping the per-cell cosmic-text shaping (Unicode segmentation,
-/// font lookup and layout). It is bounded: when the number of distinct styled
-/// cells exceeds [`MAX_GLYPH_CACHE_ENTRIES`], the cache clears (a one-time
-/// re-shape), keeping memory bounded by the cap.
+/// font lookup and layout); the renderer borrows the retained buffer rather
+/// than cloning it. It is bounded: a frame that could exceed
+/// [`MAX_GLYPH_CACHE_ENTRIES`] distinct styled cells clears it first (a
+/// one-time re-shape), keeping memory bounded by the cap (or by one
+/// frame's cells, if larger).
 pub struct GlyphCache {
-    entries: HashMap<GlyphKey, ShapedCell>,
+    /// Key → index into `buffers`.
+    entries: HashMap<GlyphKey, usize>,
+    buffers: Vec<ShapedCell>,
+    /// A reused key for lookups, so a hit allocates nothing (audit R12).
+    scratch: GlyphKey,
 }
 
 impl GlyphCache {
@@ -111,15 +117,73 @@ impl GlyphCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            buffers: Vec::new(),
+            scratch: GlyphKey {
+                text: String::new(),
+                bold: false,
+                italic: false,
+                underline: UnderlineStyle::None,
+                strikethrough: false,
+                size: 0,
+            },
         }
     }
 
-    /// Shape `text` with the given style, reusing a retained buffer when the
-    /// cell's full shaping identity was already shaped (N27b).
+    /// Start a frame that will [`prepare`](Self::prepare) up to `cells`
+    /// cells: clears the cache first if they might not fit under the cap,
+    /// so no slot handed out during the frame is invalidated. A frame with
+    /// more cells than the cap holds them all until the next frame.
+    pub fn begin_frame(&mut self, cells: usize) {
+        if self.entries.len() + cells > MAX_GLYPH_CACHE_ENTRIES {
+            self.entries.clear();
+            self.buffers.clear();
+        }
+    }
+
+    /// Shape `text` with the given style, or find it already shaped, and
+    /// return its slot for [`buffer`](Self::buffer) (N27b). A hit neither
+    /// clones the buffer nor allocates (audit R12).
     ///
     /// `size` is the zoom-scaled font size in logical pixels; it is folded
     /// into the key so a zoom change re-shapes (the metrics differ) rather
     /// than reusing a buffer shaped at the old size.
+    #[allow(clippy::too_many_arguments)] // fixed render wiring: fs + metrics + text + style + size
+    pub fn prepare(
+        &mut self,
+        fs: &mut FontSystem,
+        metrics: Metrics,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        underline: UnderlineStyle,
+        strikethrough: bool,
+        size: f32,
+    ) -> usize {
+        self.scratch.text.clear();
+        self.scratch.text.push_str(text);
+        self.scratch.bold = bold;
+        self.scratch.italic = italic;
+        self.scratch.underline = underline;
+        self.scratch.strikethrough = strikethrough;
+        self.scratch.size = size.to_bits();
+        if let Some(&slot) = self.entries.get(&self.scratch) {
+            return slot;
+        }
+        let buffer = shape_cell(fs, text, metrics, bold, italic, underline, strikethrough);
+        let slot = self.buffers.len();
+        self.buffers.push(ShapedCell { buffer });
+        self.entries.insert(self.scratch.clone(), slot);
+        slot
+    }
+
+    /// The shaped buffer in `slot`, from [`prepare`](Self::prepare) in the
+    /// current frame.
+    pub fn buffer(&self, slot: usize) -> &Buffer {
+        &self.buffers[slot].buffer
+    }
+
+    /// [`prepare`](Self::prepare) one cell outside a frame and return a
+    /// copy of its buffer (tests and one-off shaping).
     #[allow(clippy::too_many_arguments)] // fixed render wiring: fs + metrics + text + style + size
     pub fn shape(
         &mut self,
@@ -132,28 +196,18 @@ impl GlyphCache {
         strikethrough: bool,
         size: f32,
     ) -> Buffer {
-        let key = GlyphKey {
-            text: text.to_owned(),
+        self.begin_frame(1);
+        let slot = self.prepare(
+            fs,
+            metrics,
+            text,
             bold,
             italic,
             underline,
             strikethrough,
-            size: size.to_bits(),
-        };
-        if let Some(entry) = self.entries.get(&key) {
-            return entry.buffer.clone();
-        }
-        let buffer = shape_cell(fs, text, metrics, bold, italic, underline, strikethrough);
-        if self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES {
-            self.entries.clear();
-        }
-        self.entries.insert(
-            key,
-            ShapedCell {
-                buffer: buffer.clone(),
-            },
+            size,
         );
-        buffer
+        self.buffer(slot).clone()
     }
 
     /// The number of distinct styled cells currently retained (N27b).
@@ -248,5 +302,42 @@ mod tests {
         }
         assert!(cache.len() <= MAX_GLYPH_CACHE_ENTRIES);
         assert!(!cache.is_empty());
+    }
+
+    /// Slots stay valid for the whole frame: a hit returns the same slot
+    /// (borrowed, not cloned), and the cap is applied only at frame start.
+    #[test]
+    fn slots_are_stable_within_a_frame() {
+        let mut fs = FontSystem::new();
+        let metrics = Metrics::new(20.0, 24.0);
+        let mut cache = GlyphCache::new();
+        let size = metrics.font_size;
+        let mut prepare = |cache: &mut GlyphCache, text: &str| {
+            cache.prepare(
+                &mut fs,
+                metrics,
+                text,
+                false,
+                false,
+                UnderlineStyle::None,
+                false,
+                size,
+            )
+        };
+
+        cache.begin_frame(2);
+        let a = prepare(&mut cache, "a");
+        let b = prepare(&mut cache, "b");
+        assert_ne!(a, b);
+        assert_eq!(prepare(&mut cache, "a"), a, "a hit returns the same slot");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.buffer(a).layout_runs().next().is_some());
+
+        // A frame that fits keeps the entries; one that might not clears
+        // them before handing out slots.
+        cache.begin_frame(MAX_GLYPH_CACHE_ENTRIES - 2);
+        assert_eq!(cache.len(), 2);
+        cache.begin_frame(MAX_GLYPH_CACHE_ENTRIES - 1);
+        assert!(cache.is_empty());
     }
 }

@@ -11,7 +11,7 @@ use nora::engine::Snapshot;
 use nora::render::style::{CellStyle, cell_style};
 use nora::render::term::{TermLayout, cursor_fill, default_bg};
 
-use super::graphics::{CellFill, DrawCell};
+use super::graphics::{CellFill, CellText, DrawCell};
 
 /// A solid rectangle in physical pixels (pane separators).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,9 +87,7 @@ impl Scene {
                     continue;
                 }
                 // The cluster: the character plus its combining marks.
-                let mut text = String::with_capacity(4);
-                text.push(cell.ch);
-                text.extend(cell.zerowidth.iter());
+                let text = CellText::cluster(cell.ch, &cell.zerowidth);
                 self.cells.push(DrawCell {
                     row: row0 + row as u32,
                     col: col0 + col as u32,
@@ -173,7 +171,7 @@ impl Scene {
                     self.cells.push(DrawCell {
                         row: 0,
                         col: col + i as u32,
-                        text: ch.to_string(),
+                        text: (*ch).into(),
                         style: tab_style(fg, bg, index == active),
                         width: 1,
                     });
@@ -233,7 +231,7 @@ impl Scene {
                 self.cells.push(DrawCell {
                     row,
                     col: col as u32,
-                    text: ch.to_string(),
+                    text: ch.into(),
                     style: tab_style(TAB_ACTIVE_FG, SEARCH_BAR_BG, false),
                     width: 1,
                 });
@@ -315,7 +313,7 @@ impl Scene {
             self.cells.push(DrawCell {
                 row,
                 col: at,
-                text: ch.to_string(),
+                text: ch.into(),
                 style,
                 width: width as u16,
             });
@@ -391,7 +389,7 @@ mod tests {
             scene.cells.push(DrawCell {
                 row: 0,
                 col,
-                text: text.to_string(),
+                text: text.into(),
                 style: tab_style(fg, bg, false),
                 width: 2,
             });
