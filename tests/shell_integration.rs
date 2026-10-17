@@ -628,3 +628,237 @@ fn zsh_commands_do_not_inherit_the_marker_fd() {
         out.executed
     );
 }
+
+/// What a zsh session with a user's `zshaddhistory` hooks reported, the
+/// lines each hook saw, and the hook state a later command observed.
+struct HookRun {
+    out: Transcript,
+    /// One line per hook call: `<hook name>:<command line>`.
+    calls: Vec<String>,
+    /// `<has zshaddhistory>:<zshaddhistory_functions>:<has nora's copy>`
+    /// as a command printed it.
+    state: String,
+}
+
+/// The command that records the hook state in `state.txt`.
+const STATE_LINE: &str = "print -r -- \"${+functions[zshaddhistory]}:${zshaddhistory_functions[*]-}:${+functions[__nora_hist_fn]}\" > state.txt; echo state-$((1 + 1))";
+
+/// Interactive zsh with `setup` before the script and `hooks` after it,
+/// running each `(line, marker)` in order, then `STATE_LINE`.
+fn zsh_hook_run(
+    zsh: String,
+    test: &str,
+    setup: &str,
+    hooks: &str,
+    lines: &[(&str, &str)],
+) -> HookRun {
+    let dir = Scratch::new(test);
+    let rc = format!(
+        "PS1='$ '\n{setup}\nsource {}\n{hooks}\n",
+        script("nora-zsh.zsh").display()
+    );
+    let mut shell = Shell::zsh(zsh, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    for (line, marker) in lines {
+        if *line == "\x03" {
+            // Interrupt the line being edited; wait for the fresh prompt.
+            shell.send(line.as_bytes());
+            shell.wait(marker, |grid, _| {
+                grid.lines().rev().find(|row| !row.is_empty()) == Some("$")
+            });
+        } else {
+            shell.run(line, marker);
+        }
+    }
+    shell.run(STATE_LINE, "state-2");
+    let out = shell.exit();
+    let calls = std::fs::read_to_string(dir.path("calls.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let state = std::fs::read_to_string(dir.path("state.txt"))
+        .expect("state.txt")
+        .trim_end()
+        .to_string();
+    HookRun { out, calls, state }
+}
+
+/// The `C` markers in a transcript: one per command, reported or not.
+fn command_starts(out: &Transcript) -> usize {
+    out.kinds().iter().filter(|kind| **kind == C).count()
+}
+
+/// zsh: a line the user's `zshaddhistory` function rejects (status 1, as
+/// a hook that keeps secrets out of $HISTFILE does) is not reported, so
+/// nora does not record it either, a multi-line one included; the hook
+/// runs once per line, an interrupted continuation line included, and is
+/// back in place while commands run.
+#[test]
+fn zsh_zshaddhistory_function_rejection_is_not_reported() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let hooks = "zshaddhistory() {\n  print -r -- \"$0:${1%$'\\n'}\" >> calls.txt\n  [[ $1 != *secret* ]]\n}";
+    let run = zsh_hook_run(
+        zsh,
+        "zsh-addhistory-fn",
+        "",
+        hooks,
+        &[
+            ("echo my-secret-$((1 + 1))", "my-secret-2"),
+            ("for x in a; do", "for>"),
+            ("echo $x-secret-$((1 + 1)); done", "a-secret-2"),
+            ("echo kept-$((1 + 1))", "kept-2"),
+            ("while false; do", "while>"),
+            ("\x03", "the prompt after the interrupt"),
+        ],
+    );
+    let executed = &run.out.executed;
+    assert!(
+        executed.iter().any(|line| line == "echo kept-$((1 + 1))"),
+        "a saved command is reported; got {executed:?}"
+    );
+    assert!(
+        !executed.iter().any(|line| line.contains("secret")),
+        "a rejected command is not reported; got {executed:?}"
+    );
+    let state_call = format!("zshaddhistory:{STATE_LINE}");
+    assert_eq!(
+        run.calls,
+        vec![
+            "zshaddhistory:echo my-secret-$((1 + 1))",
+            "zshaddhistory:for x in a; do",
+            "echo $x-secret-$((1 + 1)); done",
+            "zshaddhistory:echo kept-$((1 + 1))",
+            // zsh hands the hooks an interrupted continuation line too.
+            "zshaddhistory:while false; do",
+            state_call.as_str(),
+            "zshaddhistory:exit",
+        ],
+        "the hook runs exactly once per line"
+    );
+    assert_eq!(run.state, "1::0", "the user's hook is back in place");
+    // Every command still starts with a `C`, `exit` included.
+    assert_eq!(command_starts(&run.out), 5, "grid:\n{}", run.out.grid);
+}
+
+/// zsh: a `zshaddhistory_functions` entry that rejects a line keeps it
+/// unreported even after an entry that accepts it, under KSH_ARRAYS,
+/// NO_UNSET and ERR_RETURN; status 2 (kept in the session, not written
+/// to the file) is not reported either. Every entry runs once, in order.
+#[test]
+fn zsh_zshaddhistory_functions_rejection_is_not_reported() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let hooks = "autoload -Uz add-zsh-hook\n\
+        log_hook() { print -r -- \"$0:${1%$'\\n'}\" >> calls.txt }\n\
+        secret_hook() {\n  print -r -- \"$0\" >> calls.txt\n  [[ $1 == *secret* ]] && return 1\n  [[ $1 == *session-only* ]] && return 2\n  return 0\n}\n\
+        add-zsh-hook zshaddhistory log_hook\n\
+        add-zsh-hook zshaddhistory secret_hook";
+    let run = zsh_hook_run(
+        zsh,
+        "zsh-addhistory-fns",
+        "setopt ksh_arrays no_unset err_return",
+        hooks,
+        &[
+            ("echo my-secret-$((1 + 1))", "my-secret-2"),
+            ("echo session-only-$((1 + 1))", "session-only-2"),
+            ("echo kept-$((1 + 1))", "kept-2"),
+        ],
+    );
+    let executed = &run.out.executed;
+    assert!(
+        executed.iter().any(|line| line == "echo kept-$((1 + 1))"),
+        "a saved command is reported; got {executed:?}"
+    );
+    assert!(
+        !executed
+            .iter()
+            .any(|line| line.contains("secret") || line.contains("session-only")),
+        "rejected commands are not reported; got {executed:?}"
+    );
+    let state_call = format!("log_hook:{STATE_LINE}");
+    assert_eq!(
+        run.calls,
+        vec![
+            "log_hook:echo my-secret-$((1 + 1))",
+            "secret_hook",
+            "log_hook:echo session-only-$((1 + 1))",
+            "secret_hook",
+            "log_hook:echo kept-$((1 + 1))",
+            "secret_hook",
+            state_call.as_str(),
+            "secret_hook",
+            "log_hook:exit",
+            "secret_hook",
+        ],
+        "each entry runs once per line, in order"
+    );
+    assert_eq!(run.state, "0:log_hook secret_hook:0", "hooks back in place");
+    assert_eq!(command_starts(&run.out), 5, "grid:\n{}", run.out.grid);
+}
+
+/// zsh: with HIST_IGNORE_SPACE, a line that starts with a space is not
+/// saved, so it is not reported.
+#[test]
+fn zsh_hist_ignore_space_line_is_not_reported() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let run = zsh_hook_run(
+        zsh,
+        "zsh-ignore-space",
+        "setopt hist_ignore_space",
+        "",
+        &[
+            (" echo spaced-$((1 + 1))", "spaced-2"),
+            ("echo kept-$((1 + 1))", "kept-2"),
+        ],
+    );
+    let executed = &run.out.executed;
+    assert!(
+        executed.iter().any(|line| line == "echo kept-$((1 + 1))"),
+        "got {executed:?}"
+    );
+    assert!(
+        !executed.iter().any(|line| line.contains("spaced")),
+        "a leading-space line is not reported; got {executed:?}"
+    );
+    assert_eq!(command_starts(&run.out), 4, "grid:\n{}", run.out.grid);
+}
+
+/// zsh: with HIST_IGNORE_DUPS a repeated command is still saved (it stays
+/// the newest entry), so it is reported both times.
+#[test]
+fn zsh_hist_ignore_dups_repeat_is_reported() {
+    let Some(zsh) = zsh() else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let dir = Scratch::new("zsh-ignore-dups");
+    let rc = format!(
+        "PS1='$ '\nsetopt hist_ignore_dups\nsource {}\nzshaddhistory() {{ return 0 }}\n",
+        script("nora-zsh.zsh").display()
+    );
+    let mut shell = Shell::zsh(zsh, &dir, &rc);
+    shell.wait("first prompt", |grid, _| grid.contains('$'));
+    let line = "echo dup-$((1 + 1))";
+    for round in 1..=2 {
+        shell.send(format!("{line}\n").as_bytes());
+        shell.wait("the repeated command's output", |grid, _| {
+            grid.lines().filter(|row| *row == "dup-2").count() == round
+        });
+    }
+    let out = shell.exit();
+    assert_eq!(
+        out.executed.iter().filter(|cmd| *cmd == line).count(),
+        2,
+        "got {:?}",
+        out.executed
+    );
+}

@@ -90,7 +90,19 @@ Option 4, with these parts:
   token. Stored in `$XDG_STATE_HOME/nora/history` with a size cap; disabled
   entirely with `[autocomplete] enabled = false`. Only command lines the
   shell reports executing are stored, so text typed at a password prompt
-  (which the shell never reports) is not.
+  (which the shell never reports) is not. The zsh script sends a bare
+  `133;C` (no command line) for a line zsh keeps out of `$HISTFILE`:
+  `HISTORY_IGNORE`, `HIST_IGNORE_SPACE`, or a non-zero `zshaddhistory`
+  verdict (2 included, since nora's history is persistent). zsh shows no
+  hook its siblings' statuses and keeps a rejected line in `$history`
+  until the next one, so at line-finish the script moves the user's hooks
+  aside behind one dispatcher, which restores them, runs each once in
+  zsh's order and records the first non-zero status (decided
+  2026-10-17). Not mirrored: `HIST_NO_STORE`, `HIST_NO_FUNCTIONS`, an
+  alias whose expansion starts with a space, and a `zshaddhistory`
+  function under zsh before 5.8 (no `functions -c`), where no hook
+  verdict is seen. Proof: the `zsh_zshaddhistory_*` and `zsh_hist_*`
+  tests in `tests/shell_integration.rs`.
 - **Rendering.** Ghost text after the cursor in a dim color, through the
   same scene path as the IME preedit; never written into the grid.
 - **Acceptance.** Right arrow or End with the cursor at the end of the

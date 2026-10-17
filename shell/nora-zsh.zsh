@@ -68,8 +68,79 @@ __nora_base64() {
     done
 }
 
+# The zshaddhistory verdict. zsh runs the `zshaddhistory` function and
+# every `zshaddhistory_functions` entry and keeps the first non-zero
+# status to itself: a hook cannot see the others' statuses, and a
+# rejected line still sits in $history until the next line. So when
+# editing ends (line-finish, after which no user code runs before the
+# hooks), the user's hooks are moved aside and nora's dispatcher is the
+# only one; it puts them back first, runs each once in zsh's order with
+# zsh's rule, and records the status for preexec. precmd and preexec
+# put them back too, should a line not reach the hooks. vared and select
+# lines are left alone.
+# Moving the function needs `functions -c` (zsh 5.8): an older zsh with
+# a `zshaddhistory` function keeps its hooks in place, unseen.
+typeset -gi __nora_hist_verdict=0
+typeset -g __nora_hist_hidden=
+
+__nora_hist_hide() {
+    emulate -L zsh
+    [[ -z $__nora_hist_hidden && -n $BUFFER && $CONTEXT == (start|cont) ]] || return 0
+    local -i has_fn=${+functions[zshaddhistory]}
+    (( has_fn || ${#zshaddhistory_functions[@]} )) || return 0
+    if (( has_fn )); then
+        functions -c zshaddhistory __nora_hist_fn 2>/dev/null || return 0
+        unfunction zshaddhistory
+    fi
+    if (( ${+zshaddhistory_functions} )); then
+        typeset -ga __nora_hist_fns=("${zshaddhistory_functions[@]}")
+        __nora_hist_hidden=set$has_fn
+    else
+        __nora_hist_hidden=unset$has_fn
+    fi
+    typeset -ga zshaddhistory_functions=(__nora_addhistory)
+}
+
+__nora_hist_restore() {
+    emulate -L zsh
+    [[ -n $__nora_hist_hidden ]] || return 0
+    if [[ $__nora_hist_hidden == set* ]]; then
+        zshaddhistory_functions=("${__nora_hist_fns[@]}")
+    else
+        unset zshaddhistory_functions
+    fi
+    unset __nora_hist_fns
+    if [[ $__nora_hist_hidden == *1 ]]; then
+        functions -c __nora_hist_fn zshaddhistory
+        unfunction __nora_hist_fn
+    fi
+    __nora_hist_hidden=
+}
+
+# Runs under the user's options, as zsh runs the hooks: only quoted
+# expansions, and `||` so ERR_EXIT/ERR_RETURN cannot stop it midway.
+__nora_addhistory() {
+    __nora_hist_restore
+    local -i __nora_ret=0 __nora_r=0
+    local __nora_f
+    if (( ${+functions[zshaddhistory]} )); then
+        zshaddhistory "$@" || __nora_ret=$?
+    fi
+    if (( ${+zshaddhistory_functions} )); then
+        for __nora_f in "${zshaddhistory_functions[@]}"; do
+            (( ${+functions[$__nora_f]} )) || continue
+            __nora_r=0
+            "$__nora_f" "$@" || __nora_r=$?
+            (( __nora_ret )) || __nora_ret=$__nora_r
+        done
+    fi
+    __nora_hist_verdict=$__nora_ret
+    return $__nora_ret
+}
+
 __nora_precmd() {
     local -i status_=$?
+    __nora_hist_restore
     if (( ${+__nora_running} )); then
         __nora_osc "133;D;$status_"
         unset __nora_running
@@ -82,14 +153,20 @@ __nora_precmd() {
 }
 
 __nora_preexec() {
-    # A command HISTORY_IGNORE keeps out of the history file is not
-    # reported either, so nora does not record it. The match runs before
-    # `emulate`, under the user's options, as zsh's own match does when it
-    # writes the history file (`(#i)*secret*` needs the user's
-    # EXTENDED_GLOB).
+    # A command the user keeps out of the history file is not reported
+    # either, so nora does not record it: one HISTORY_IGNORE matches, one
+    # HIST_IGNORE_SPACE drops (a leading space), or one a zshaddhistory
+    # hook rejected (any non-zero status, 2 included: nora's history is
+    # persistent). The HISTORY_IGNORE match runs before `emulate`, under
+    # the user's options, as zsh's own match does when it writes the
+    # history file (`(#i)*secret*` needs the user's EXTENDED_GLOB).
     local -i __nora_ignored=0
     [[ -n ${HISTORY_IGNORE-} && $1 == ${~HISTORY_IGNORE} ]] && __nora_ignored=1
+    [[ -o histignorespace && $1 == ' '* ]] && __nora_ignored=1
     emulate -L zsh
+    __nora_hist_restore
+    (( ${__nora_hist_verdict:-0} )) && __nora_ignored=1
+    __nora_hist_verdict=0
     typeset -g __nora_running=1
     if (( __nora_ignored )); then
         __nora_osc "133;C"
@@ -121,6 +198,8 @@ __nora_line_report() {
 __nora_line_finish() {
     __nora_osc "6973;end"
     __nora_last_report=
+    __nora_hist_verdict=0
+    __nora_hist_hide
     if [[ -n $__nora_fd ]]; then
         exec {__nora_fd}>&-
         __nora_fd=

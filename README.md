@@ -256,7 +256,13 @@ other terminals ignore the sequences.
 `~/.local/state/nora/history` (or `$XDG_STATE_HOME/nora/history`),
 readable only by you, capped at 5 000 commands. Commands that start with a
 space are never recorded, the same convention as `HIST_IGNORE_SPACE`.
-Neither are multi-line commands. Set `enabled = false` under
+Neither are multi-line commands. The zsh script does not report a
+command that zsh keeps out of your history file: one that matches
+`HISTORY_IGNORE`, or one that your `zshaddhistory` hook (the function or
+a `zshaddhistory_functions` entry) rejects with any non-zero status,
+including 2 (zsh keeps it for the session only). Each hook still runs
+once, in zsh's order. With a `zshaddhistory` function, this needs zsh 5.8
+or later. Set `enabled = false` under
 `[autocomplete]` to turn it off; nora then neither reads nor writes the
 file.
 
