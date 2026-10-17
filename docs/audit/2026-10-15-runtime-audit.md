@@ -47,7 +47,7 @@ roadmap and by commits. "Fixed" entries cite the commit.
 | I-F17 (wheel) | No alternate scroll in the alternate screen | M1.4 |
 | I-F9 | No RedrawRequested handling: no frame on expose, zoom, search, tab/pane switch | M1.5 |
 | R7 | Surface recovery: Suboptimal loop, retry budget never reset, Lost not recreated, device loss only logged | M1.5 |
-| R8 | Glyph atlas never trimmed (unbounded growth) | M1.5 (trim per frame; soak test pending in M3) |
+| R8 | Glyph atlas never trimmed (unbounded growth) | M1.5 (trim per frame; soak test: e2e `atlas`, 2026-10-17) |
 | I-F16 (late) | Selection changes reached the screen only with the next output | M1.5 |
 | P13 | Poisoned-mutex unwraps on the snapshot slot | M1.5 |
 | R3, I-F13 | Scale factor applied to glyph size only; positions logical on a physical surface | M1.6 |

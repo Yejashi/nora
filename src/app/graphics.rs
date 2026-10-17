@@ -888,12 +888,6 @@ impl Graphics {
         Ok(())
     }
 
-    /// Finish, submit and present an acquired [`Frame`] (pinned wgpu 30
-    /// order: the command buffer is submitted before `queue.present`).
-    ///
-    /// On a frame without a texture the (possibly empty) encoder is still
-    /// finished and submitted, and dropping the frame releases the failed
-    /// acquire before the caller reconfigures the surface.
     /// Set the selection highlight color.
     pub fn set_selection_color(&mut self, color: [u8; 4]) {
         self.selection_bg = color;
@@ -905,6 +899,12 @@ impl Graphics {
         self.glyph_cache = GlyphCache::new();
     }
 
+    /// Finish, submit and present an acquired [`Frame`] (pinned wgpu 30
+    /// order: the command buffer is submitted before `queue.present`).
+    ///
+    /// On a frame without a texture the (possibly empty) encoder is still
+    /// finished and submitted, and dropping the frame releases the failed
+    /// acquire before the caller reconfigures the surface.
     pub fn present(&mut self, frame: Frame) {
         let cmd = frame.encoder.finish();
         self.queue.submit([cmd]);

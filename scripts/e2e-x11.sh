@@ -734,6 +734,160 @@ RC
     pass suggest
 }
 
+# Fractional and integer scale (M1.6), forced with WINIT_X11_SCALE_FACTOR:
+# the grid is the configured 80x24 at every factor, the window grows by
+# about the factor (cell sizes are rounded at each size, so within 10%),
+# and the same text covers about factor^2 the pixels.
+scenario_scale() {
+    local dir="$OUT/scale"; mkdir -p "$dir"
+    cat >"$dir/child.sh" <<'CHILD'
+#!/bin/sh
+# The window settles on its grid after startup (a resize request).
+sleep 1
+stty size >"$1"
+printf 'SCALE TEST\r\n'
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    local f w h rows cols text base_w base_h base_rows base_cols base_text
+    for f in 1 1.25 2; do
+        WINIT_X11_SCALE_FACTOR=$f launch scale "$dir/child.sh" "$dir/size-$f.txt" \
+            || { fail scale "no window at $f"; return; }
+        wait_file "$dir/size-$f.txt" || { finish; fail scale "no size at $f"; return; }
+        eval "$(xdotool getwindowgeometry --shell "$WIN" | grep -E '^(WIDTH|HEIGHT)=')"
+        w=$WIDTH h=$HEIGHT
+        shot "$dir/shot-$f.png"
+        finish
+        "${IM_CONVERT[@]}" "$dir/shot-$f.png" -crop 400x80+0+0 +repage "$dir/text-$f.png"
+        text=$(count_color "$dir/text-$f.png" '#FFFFFF')
+        read -r rows cols <"$dir/size-$f.txt"
+        echo "  scale $f: window ${w}x${h}, grid ${rows}x${cols}, text px $text"
+        if [ "$f" = 1 ]; then
+            base_w=$w base_h=$h base_rows=$rows base_cols=$cols base_text=$text
+            continue
+        fi
+        awk -v w="$w" -v h="$h" -v bw="$base_w" -v bh="$base_h" -v f="$f" \
+            'BEGIN { exit !(w >= bw*f*0.9 && w <= bw*f*1.1 && h >= bh*f*0.9 && h <= bh*f*1.1) }' \
+            || { fail scale "window ${w}x${h} at $f vs ${base_w}x${base_h} at 1"; return; }
+        [ "$rows $cols" = "$base_rows $base_cols" ] \
+            || { fail scale "grid ${rows}x${cols} at $f vs ${base_rows}x${base_cols} at 1"; return; }
+        awk -v t="$text" -v b="$base_text" -v f="$f" 'BEGIN { exit !(t >= b*f*f*0.7 && t <= b*f*f*1.3) }' \
+            || { fail scale "text px $text at $f vs $base_text at 1 (expected about x$f^2)"; return; }
+    done
+    pass scale
+}
+
+# Glyph atlas soak (audit R8): about 32 000 distinct CJK and Hangul
+# glyphs, one new screenful at a time, drawn in two passes at two zoom
+# levels. The atlas must trim glyphs a frame no longer uses: no frame may
+# fail to draw, the last screen's text must be visible, and the second
+# pass (new glyph sizes, while fonts and the shaping cache are already at
+# their bounds) must not grow memory much. Untrimmed, the second pass
+# grows the atlas texture, which lavapipe keeps in process memory.
+scenario_atlas() {
+    local dir="$OUT/atlas"; mkdir -p "$dir"
+    # 40 double-width glyphs per row, 24 rows per screen.
+    local cp line="" n=0
+    for cp in $(seq $((0x4E00)) $((0x9FFF))) $(seq $((0xAC00)) $((0xD7A3))); do
+        line+="\\U$(printf '%08x' "$cp")"
+        n=$((n + 1))
+        [ $((n % 40)) -eq 0 ] && { printf '%s\n' "$line"; line=""; }
+    done >"$dir/glyphs.esc"
+    cat >"$dir/child.sh" <<'CHILD'
+#!/bin/bash
+dir=$1
+for pass in 1 2; do
+    while [ ! -e "$dir/go$pass" ]; do sleep 0.1; done
+    n=0
+    while IFS= read -r line; do
+        printf '%b\r\n' "$line"
+        n=$((n + 1))
+        [ $((n % 24)) -eq 0 ] && sleep 0.05
+    done <"$dir/glyphs.esc"
+    printf 'ATLAS SOAK PASS %s DONE\r\n' "$pass"
+    : >"$dir/done$pass"
+done
+sleep 30
+CHILD
+    chmod +x "$dir/child.sh"
+    LC_ALL=C.UTF-8 launch atlas "$dir/child.sh" "$dir" || { fail atlas "no window"; return; }
+    rss_now() { awk '/^VmRSS/{print $2}' "/proc/$NORA_PID/status" 2>/dev/null; }
+    local pass rss peak start1 end1
+    for pass in 1 2; do
+        xdotool key ctrl+shift+equal ctrl+shift+equal
+        sleep 0.3
+        [ "$pass" = 2 ] && end1=$(rss_now)
+        [ "$pass" = 1 ] && start1=$(rss_now)
+        peak=$(rss_now)
+        : >"$dir/go$pass"
+        for _ in $(seq 1 600); do
+            rss=$(rss_now)
+            [ "${rss:-0}" -gt "$peak" ] && peak=$rss
+            [ -e "$dir/done$pass" ] && break
+            sleep 0.1
+        done
+        [ -e "$dir/done$pass" ] || { finish; fail atlas "pass $pass did not finish"; return; }
+    done
+    sleep 0.5
+    shot "$dir/shot.png"
+    finish
+    local white failures growth
+    white=$(count_color "$dir/shot.png" '#FFFFFF')
+    failures=$(grep -c 'frame draw failed' "$OUT/atlas/nora.log")
+    growth=$(( (peak - end1) / 1024 ))
+    echo "  rows: $(wc -l <"$dir/glyphs.esc"); rss ${start1} kB, after pass 1 ${end1} kB, pass 2 peak ${peak} kB (+${growth} MiB); text px $white; failed frames $failures"
+    [ "$failures" -eq 0 ] || { fail atlas "$failures frame(s) failed: $(grep -m1 'frame draw failed' "$OUT/atlas/nora.log")"; return; }
+    [ "$white" -gt 5000 ] || { fail atlas "text missing after the soak"; return; }
+    [ "$growth" -le 16 ] || { fail atlas "memory grew ${growth} MiB in the second pass"; return; }
+    pass atlas
+}
+
+# Prompt navigation (OSC 133 from the zsh integration): Ctrl+Shift+Z
+# brings the previous prompt to the top row (the current prompt is not a
+# target, and there is nothing before the first), and Ctrl+Shift+G
+# selects the previous command's output. The prompt has a red background
+# so its row can be found in a screenshot.
+scenario_prompts() {
+    have zsh prompts || return
+    local dir="$OUT/prompts"; rm -rf "$dir"; mkdir -p "$dir/zdot"
+    cat >"$dir/zdot/.zshrc" <<RC
+PROMPT='%K{red}PR%k %% '
+bindkey -e
+source "$ROOT/shell/nora-zsh.zsh"
+RC
+    ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch prompts zsh -d -i \
+        || { fail prompts "no window"; return; }
+    for _ in $(seq 1 100); do
+        grep -q '^shell: buffer "" cursor 0' "$OUT/prompts/nora.log" && break
+        sleep 0.1
+    done
+    xdotool type --delay 30 "seq 1 100"; xdotool key Return; sleep 1
+    shot "$dir/bottom.png"
+    xdotool key ctrl+shift+z; sleep 0.3
+    shot "$dir/jump.png"
+    xdotool key ctrl+shift+z; sleep 0.3
+    shot "$dir/again.png"
+    xdotool key shift+End ctrl+shift+g; sleep 0.3
+    shot "$dir/select.png"
+    finish
+    # Red pixels in the top cell row and in the whole window.
+    top_red() {
+        "${IM_CONVERT[@]}" "$1" -crop 1024x16+0+0 +repage "$1.top.png"
+        count_color "$1.top.png" '#CD0000'
+    }
+    local bottom jump again sel
+    bottom=$(top_red "$dir/bottom.png")
+    jump=$(top_red "$dir/jump.png")
+    again=$(top_red "$dir/again.png")
+    sel=$(count_color "$dir/select.png" '#335577')
+    echo "  top-row prompt px: at bottom $bottom, after jump $jump, after second jump $again; selection px $sel"
+    [ "$bottom" -eq 0 ] || { fail prompts "prompt in the top row before the jump"; return; }
+    [ "$jump" -gt 20 ] || { fail prompts "previous prompt not at the top after Ctrl+Shift+Z"; return; }
+    [ "$again" -eq "$jump" ] || { fail prompts "second jump moved the view (no older prompt)"; return; }
+    [ "$sel" -gt 5000 ] || { fail prompts "Ctrl+Shift+G did not select the command output"; return; }
+    pass prompts
+}
+
 # IME with a real input method (ibus over XIM, the simple engine's
 # Ctrl+Shift+U hex entry): the preedit is drawn and hides the inline
 # suggestion while composing, and the commit reaches the shell once.
@@ -834,7 +988,7 @@ scenario_htop() {
     pass htop
 }
 
-ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle zshell suggest ime vim tmux htop)
+ALL=(render tty resize keys mouse redraw selection zoom flood latency viewlat title panes tinysplit paneexit search config reports hyperlink idle scale atlas zshell suggest prompts ime vim tmux htop)
 SELECTED=("$@")
 [ ${#SELECTED[@]} -gt 0 ] || SELECTED=("${ALL[@]}")
 for s in "${SELECTED[@]}"; do "scenario_$s"; done

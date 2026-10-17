@@ -7,7 +7,7 @@ This record re-establishes acceptance per roadmap milestone
 **accepted** (acceptance criteria met, evidence in CI or recorded),
 **partial** (some criteria open, listed), **open**.
 
-Evidence sources: `scripts/e2e-x11.sh` (26 scenarios in a real X11 window
+Evidence sources: `scripts/e2e-x11.sh` (29 scenarios in a real X11 window
 with real key and mouse events, run in CI job `e2e-x11`), the test suite
 (about 600 tests), `scripts/perf.sh`, and the audit table of fixes
 (docs/audit/2026-10-15-runtime-audit.md).
@@ -19,10 +19,10 @@ with real key and mouse events, run in CI job `e2e-x11`), the test suite
 | M1.2 PTY | accepted | e2e `tty`, `resize`; headless exit status; PTY tests | — |
 | M1.3 keyboard | accepted | e2e `keys` (byte-exact), encoder tests | kitty keyboard protocol unsupported (documented) |
 | M1.4 mouse | accepted | e2e `mouse` (byte-exact SGR), encoder tests | — |
-| M1.5 frames | accepted | e2e `redraw`, `selection`, `idle` (fully and partly scrolled back: 0 frames idle), `viewlat` (view change on an idle pane 7-9 ms) | atlas trim not soak-tested |
-| M1.6 fonts and metrics | accepted | e2e `zoom`, metric tests | fractional scale verified by unit geometry only |
+| M1.5 frames | accepted | e2e `redraw`, `selection`, `idle` (fully and partly scrolled back: 0 frames idle), `viewlat` (view change on an idle pane 7-9 ms), `atlas` (about 32 000 distinct CJK/Hangul glyphs in two passes at two zoom levels: no failed frame, text visible, second pass +5-6 MiB; +144 MiB with the trim removed) | — |
+| M1.6 fonts and metrics | accepted | e2e `zoom`, `scale` (forced X11 scale 1, 1.25, 2: grid 24x80 at each, window and text area scale with the factor; fixed 2026-10-17: at 1.25 the window was sized from scale-1 cells and lost a row), metric tests | — |
 | M1.7 bounds and latency | accepted | e2e `flood` (+5.5 MiB under a 200 MiB OSC flood), input-bound test, close escalation test; key-to-present ~1 ms | — |
-| M1.8 reports and environment | accepted | e2e `reports`, `hyperlink`; OSC 7 decoder byte-safe (RV-OSC7) | prompt navigation has unit tests only (needs the bash integration in e2e) |
+| M1.8 reports and environment | accepted | e2e `reports`, `hyperlink`, `prompts` (Ctrl+Shift+Z puts the previous prompt on the top row and stops at the first, Ctrl+Shift+G selects the last output; fixed 2026-10-17: markers never reached the store in the window, the jump targeted the current prompt, and a full store refused new markers); OSC 7 decoder byte-safe (RV-OSC7) | — |
 | M2 multi-pane UI | accepted | e2e `panes`, `tinysplit`, `paneexit`, `search` (scrollback, chords), `title`; review RV3, RV4, RV6, RV8-RV10 fixed | candidate-window placement not verified: nora reports the cursor area (`set_ime_cursor_area`), but the e2e engine (ibus simple) shows no candidates; preedit and commit are verified by e2e `ime` |
 | M3 performance | accepted (baseline recorded) | docs/performance/2026-10-15-baseline.md, input latency record | window-path throughput ~56 MiB/s vs ~110 MiB/s headless (snapshot under the terminal lock, audit P8); per-frame allocations not measured |
 | M4 customization | accepted | e2e `config` (startup, live reload incl. palette repaint of an idle pane, invalid edit), schema tests; RV5, RV7 fixed | — |
