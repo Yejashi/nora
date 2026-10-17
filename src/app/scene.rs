@@ -184,8 +184,7 @@ impl Scene {
             } else {
                 (TAB_FG, TAB_BAR_BG)
             };
-            let text: Vec<char> = format!(" {} ", label).chars().collect();
-            let width = (text.len() as u32).min(cols.saturating_sub(col));
+            let (glyphs, width) = layout_line(&format!(" {} ", label), cols.saturating_sub(col));
             if width == 0 {
                 break;
             }
@@ -195,16 +194,14 @@ impl Scene {
                 span: width as u16,
                 color: bg,
             });
-            for (i, ch) in text.iter().take(width as usize).enumerate() {
-                if *ch != ' ' {
-                    self.cells.push(DrawCell {
-                        row: 0,
-                        col: col + i as u32,
-                        text: (*ch).into(),
-                        style: tab_style(fg, bg, index == active),
-                        width: 1,
-                    });
-                }
+            for (at, ch, w) in glyphs {
+                self.cells.push(DrawCell {
+                    row: 0,
+                    col: col + at,
+                    text: ch.into(),
+                    style: tab_style(fg, bg, index == active),
+                    width: w,
+                });
             }
             col += width + 1;
         }
@@ -255,18 +252,40 @@ impl Scene {
             span: cols.min(u32::from(u16::MAX)) as u16,
             color: SEARCH_BAR_BG,
         });
-        for (col, ch) in text.chars().take(cols as usize).enumerate() {
-            if ch != ' ' {
-                self.cells.push(DrawCell {
-                    row,
-                    col: col as u32,
-                    text: ch.into(),
-                    style: tab_style(TAB_ACTIVE_FG, SEARCH_BAR_BG, false),
-                    width: 1,
-                });
-            }
+        for (col, ch, width) in layout_line(text, cols).0 {
+            self.cells.push(DrawCell {
+                row,
+                col,
+                text: ch.into(),
+                style: tab_style(TAB_ACTIVE_FG, SEARCH_BAR_BG, false),
+                width,
+            });
         }
     }
+}
+
+/// Lay `text` out on one row by display width, within `cols` columns: the
+/// visible characters with their column offset and width, and the columns
+/// used. A wide character that would cross the edge ends the line; spaces
+/// advance without a glyph and zero-width characters are dropped.
+fn layout_line(text: &str, cols: u32) -> (Vec<(u32, char, u16)>, u32) {
+    use unicode_width::UnicodeWidthChar;
+    let mut glyphs = Vec::new();
+    let mut at = 0u32;
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0) as u32;
+        if width == 0 {
+            continue;
+        }
+        if at + width > cols {
+            break;
+        }
+        if ch != ' ' {
+            glyphs.push((at, ch, width as u16));
+        }
+        at += width;
+    }
+    (glyphs, at)
 }
 
 const SEARCH_BAR_BG: [u8; 4] = [0x3a, 0x2e, 0x10, 255];
@@ -377,6 +396,30 @@ mod tests {
         assert_eq!(text, "12vim");
         let active_fill = scene.fills.iter().find(|f| f.color == TAB_ACTIVE_BG);
         assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((4, 7)));
+    }
+
+    /// Wide characters take two columns in tab labels and the search bar,
+    /// and one that would cross the edge is left out.
+    #[test]
+    fn bars_lay_out_by_display_width() {
+        let mut scene = Scene::default();
+        scene.add_tab_bar(&["1 日本".to_string(), "2".to_string()], 0, 40);
+        let placed: Vec<(u32, &str, u16)> = scene
+            .cells
+            .iter()
+            .map(|c| (c.col, c.text.as_str(), c.width))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(1, "1", 1), (3, "日", 2), (5, "本", 2), (10, "2", 1)]
+        );
+        let active_fill = scene.fills.iter().find(|f| f.color == TAB_ACTIVE_BG);
+        assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((0, 8)));
+
+        let mut bar = Scene::default();
+        bar.add_search_bar("a日本", 5, 4);
+        let placed: Vec<(u32, u16)> = bar.cells.iter().map(|c| (c.col, c.width)).collect();
+        assert_eq!(placed, vec![(0, 1), (1, 2)]);
     }
 
     #[test]
