@@ -2762,8 +2762,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                 self.sent_keys.insert(event.physical_key, (pane, types));
                                 // The buffer is about to change: a stale
                                 // suggestion must not be accepted before
-                                // the shell reports the new one.
-                                self.suggestions.remove(&pane);
+                                // the shell reports the new one. A key
+                                // that cannot edit the line keeps it: the
+                                // shell reports no new buffer for it, so
+                                // the pump would send no replacement.
+                                if key_may_edit_line(&event.logical_key) {
+                                    self.suggestions.remove(&pane);
+                                }
                                 self.send_input(pane, bytes);
                             }
                         }
@@ -3051,6 +3056,60 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 }
 
+/// Whether sending `key` may change the shell's line buffer. Escape,
+/// function keys and modifier or lock keys (reported alone under the kitty
+/// protocol) do not edit it, so the shell sends no new buffer and the
+/// shown suggestion stays valid; every other key may. A key bound in the
+/// shell to an edit still gets a fresh suggestion once the shell reports
+/// its buffer.
+fn key_may_edit_line(key: &Key) -> bool {
+    use NamedKey::*;
+    !matches!(
+        key,
+        Key::Named(
+            Escape
+                | F1
+                | F2
+                | F3
+                | F4
+                | F5
+                | F6
+                | F7
+                | F8
+                | F9
+                | F10
+                | F11
+                | F12
+                | F13
+                | F14
+                | F15
+                | F16
+                | F17
+                | F18
+                | F19
+                | F20
+                | F21
+                | F22
+                | F23
+                | F24
+                | Shift
+                | Control
+                | Alt
+                | AltGraph
+                | Super
+                | Meta
+                | Hyper
+                | Fn
+                | FnLock
+                | CapsLock
+                | NumLock
+                | ScrollLock
+                | Symbol
+                | SymbolLock
+        )
+    )
+}
+
 /// The focus reports for moving the active pane from `prev` to `next`
 /// (each with its modes): `CSI O` to the old pane, then `CSI I` to the new
 /// one, each only when its application enabled `FOCUS_IN_OUT`. Nothing
@@ -3265,6 +3324,28 @@ mod focus_report_tests {
             vec![(a, b"\x1b[O".to_vec())],
             "a switch to an empty layout still reports focus out"
         );
+    }
+
+    #[test]
+    fn only_keys_that_may_edit_drop_the_suggestion() {
+        use super::{Key, NamedKey, key_may_edit_line};
+        for key in [
+            NamedKey::Escape,
+            NamedKey::F2,
+            NamedKey::Shift,
+            NamedKey::Control,
+        ] {
+            assert!(!key_may_edit_line(&Key::Named(key)), "{key:?}");
+        }
+        for key in [
+            Key::Character("a".into()),
+            Key::Named(NamedKey::Backspace),
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::Space),
+        ] {
+            assert!(key_may_edit_line(&key), "{key:?}");
+        }
     }
 
     #[test]
