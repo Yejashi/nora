@@ -132,6 +132,10 @@ enum FilterState {
 /// the buffer never grows past the cap (audit P3).
 pub const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
 
+/// CSI parameter and intermediate bytes kept (enough to tell `2J`/`3J`
+/// from every other sequence; a longer one is never one of them).
+const MAX_CSI_BYTES: usize = 8;
+
 /// What the filter found in the stream, for the graphics state (ADR-014).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphicsSignal {
@@ -239,12 +243,19 @@ impl GraphicsFilter {
                     _ => self.state = FilterState::Pass,
                 },
                 FilterState::Csi => match byte {
+                    // Parameters and intermediates alike stop at the cap:
+                    // only `2J`/`3J` matter, and an endless sequence must
+                    // not grow the buffer.
                     0x30..=0x3F => {
-                        if self.csi.len() < 8 {
+                        if self.csi.len() < MAX_CSI_BYTES {
                             self.csi.push(byte);
                         }
                     }
-                    0x20..=0x2F => self.csi.push(b' '),
+                    0x20..=0x2F => {
+                        if self.csi.len() < MAX_CSI_BYTES {
+                            self.csi.push(b' ');
+                        }
+                    }
                     0x40..=0x7E => {
                         if byte == b'J' {
                             match self.csi.as_slice() {
@@ -403,5 +414,22 @@ mod apc_cap_tests {
         assert!(events.is_empty(), "an overlong APC is ignored");
         let (_, events) = filter.process(b"\x1b_Ga=q,i=1;AAAA\x1b\\");
         assert_eq!(events.len(), 1, "the next APC is parsed again");
+    }
+
+    /// An endless run of CSI intermediates (`printf '\e['; tr '\0' ' '
+    /// </dev/zero`) keeps the CSI buffer at its cap.
+    #[test]
+    fn endless_csi_intermediates_are_bounded() {
+        let mut filter = GraphicsFilter::new();
+        let _ = filter.process(b"\x1b[");
+        let chunk = vec![b' '; 1 << 20];
+        for _ in 0..16 {
+            let (_, events) = filter.process(&chunk);
+            assert!(events.is_empty());
+            assert!(filter.csi.len() <= MAX_CSI_BYTES);
+        }
+        let (_, events) = filter.process(b"J\x1b[2J");
+        assert_eq!(events.len(), 1, "only the second sequence is a clear");
+        assert_eq!(events[0].1, GraphicsSignal::ClearScreen);
     }
 }
