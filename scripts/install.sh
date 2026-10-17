@@ -23,9 +23,19 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nora"
 # and `git pull && ./scripts/install.sh` must not install a stale binary.
 echo "==> building nora (release)"
 cargo build --release
-# Where cargo put it: CARGO_TARGET_DIR (absolute, or relative to the repo
-# root, which is the current directory) or the default `target`.
-BUILT="${CARGO_TARGET_DIR:-target}/release/nora"
+# Where cargo put it: ask cargo, which also honors CARGO_BUILD_TARGET_DIR
+# and `build.target-dir` in a cargo config. Its JSON is one line; the key
+# appears unescaped only as a key. A path JSON had to escape beyond `\\`
+# and `\"` (control characters) is not decoded: fall back to
+# CARGO_TARGET_DIR (absolute, or relative to the repo root, which is the
+# current directory) or the default `target`.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | sed -nE 's/.*"target_directory":"(([^"\\]|\\.)*)".*/\1/p') || TARGET_DIR=
+case $TARGET_DIR in
+    *\\u*) TARGET_DIR= ;;
+    *\\*) TARGET_DIR=$(printf '%s\n' "$TARGET_DIR" | sed -E 's/\\(.)/\1/g') ;;
+esac
+BUILT="${TARGET_DIR:-${CARGO_TARGET_DIR:-target}}/release/nora"
 
 echo "==> installing binary to $BIN_DIR"
 mkdir -p "$BIN_DIR"

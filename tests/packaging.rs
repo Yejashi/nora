@@ -56,10 +56,23 @@ fn temp_dir() -> TempDir {
 /// Run one of the repository's shell scripts with a controlled
 /// environment, capturing its output for failure reports.
 fn run_script(script: &str, env: &[(String, String)]) -> std::process::Output {
+    run_script_without(script, env, &[])
+}
+
+/// [`run_script`] with the variables `remove` taken out of the inherited
+/// environment.
+fn run_script_without(
+    script: &str,
+    env: &[(String, String)],
+    remove: &[&str],
+) -> std::process::Output {
     let mut cmd = Command::new("bash");
     cmd.arg(format!("./scripts/{script}"))
         .current_dir(repo_root())
         .stdin(std::process::Stdio::null());
+    for key in remove {
+        cmd.env_remove(key);
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -188,47 +201,90 @@ fn install_script_runs() {
     );
 }
 
-/// install.sh installs the binary cargo built under `CARGO_TARGET_DIR`,
-/// not `target/release/nora`. A stub `cargo` first on PATH "builds" a
-/// marker script there, so the test needs no release build and fails if
+/// install.sh installs the binary from the target directory cargo used,
+/// not `target/release/nora`, however it was chosen: `CARGO_TARGET_DIR`,
+/// `CARGO_BUILD_TARGET_DIR` or `build.target-dir` in a cargo config (the
+/// script asks `cargo metadata`), and `CARGO_TARGET_DIR` when cargo
+/// cannot say. A stub `cargo` first on PATH "builds" a marker script into
+/// the directory the case configured and passes `metadata` to the real
+/// cargo (or fails it), so the test needs no release build and fails if
 /// the script installs from anywhere else.
 #[test]
 fn install_script_honors_cargo_target_dir() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = temp_dir();
-    let (home, stub_bin, target) = (root.join("home"), root.join("bin"), root.join("tgt"));
-    for dir in [&home, &stub_bin, &target] {
-        std::fs::create_dir_all(dir).expect("create test dir");
+    let real_cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    // (case, the variable that names the directory, whether `cargo
+    // metadata` works)
+    let cases = [
+        ("env", Some("CARGO_TARGET_DIR"), true),
+        ("build-env", Some("CARGO_BUILD_TARGET_DIR"), true),
+        ("config", None, true),
+        ("no-metadata", Some("CARGO_TARGET_DIR"), false),
+    ];
+    for (name, variable, metadata) in cases {
+        let root = temp_dir();
+        let (home, stub_bin, target) = (root.join("home"), root.join("bin"), root.join("tgt"));
+        for dir in [&home, &stub_bin, &target] {
+            std::fs::create_dir_all(dir).expect("create test dir");
+        }
+        let cargo = stub_bin.join("cargo");
+        let metadata_arm = if metadata {
+            format!("exec '{real_cargo}' \"$@\"")
+        } else {
+            "exit 101".to_string()
+        };
+        std::fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = metadata ]; then {metadata_arm}; fi\n\
+                 mkdir -p \"$NORA_TEST_TARGET/release\"\n\
+                 printf '#!/bin/sh\\necho nora from-{name}\\n' > \"$NORA_TEST_TARGET/release/nora\"\n\
+                 chmod 0755 \"$NORA_TEST_TARGET/release/nora\"\n"
+            ),
+        )
+        .expect("write stub cargo");
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub cargo");
+
+        let mut env = home_env(&home);
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH".into(), format!("{}:{path}", stub_bin.display())));
+        env.push(("NORA_TEST_TARGET".into(), target.display().to_string()));
+        match variable {
+            Some(variable) => env.push((variable.into(), target.display().to_string())),
+            None => {
+                // A cargo home of the test's own, whose config names the
+                // directory (`metadata --no-deps` needs no registry).
+                let cargo_home = root.join("cargo-home");
+                std::fs::create_dir_all(&cargo_home).expect("create cargo home");
+                std::fs::write(
+                    cargo_home.join("config.toml"),
+                    format!("[build]\ntarget-dir = \"{}\"\n", target.display()),
+                )
+                .expect("write cargo config");
+                env.retain(|(key, _)| key != "CARGO_HOME");
+                env.push(("CARGO_HOME".into(), cargo_home.display().to_string()));
+            }
+        }
+        let out = run_script_without(
+            "install.sh",
+            &env,
+            &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"],
+        );
+        assert_script_ok(&out, "install.sh");
+
+        let version = Command::new(home.join(".local/bin/nora"))
+            .arg("--version")
+            .output()
+            .expect("run the installed binary");
+        assert_eq!(
+            String::from_utf8_lossy(&version.stdout).trim(),
+            format!("nora from-{name}"),
+            "{name}: install.sh must install the binary from the target directory cargo used"
+        );
     }
-    let cargo = stub_bin.join("cargo");
-    std::fs::write(
-        &cargo,
-        "#!/bin/sh\n\
-         mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
-         printf '#!/bin/sh\\necho nora from-cargo-target-dir\\n' > \"$CARGO_TARGET_DIR/release/nora\"\n\
-         chmod 0755 \"$CARGO_TARGET_DIR/release/nora\"\n",
-    )
-    .expect("write stub cargo");
-    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod stub cargo");
-
-    let mut env = home_env(&home);
-    let path = std::env::var("PATH").unwrap_or_default();
-    env.push(("PATH".into(), format!("{}:{path}", stub_bin.display())));
-    env.push(("CARGO_TARGET_DIR".into(), target.display().to_string()));
-    let out = run_script("install.sh", &env);
-    assert_script_ok(&out, "install.sh");
-
-    let version = Command::new(home.join(".local/bin/nora"))
-        .arg("--version")
-        .output()
-        .expect("run the installed binary");
-    assert_eq!(
-        String::from_utf8_lossy(&version.stdout).trim(),
-        "nora from-cargo-target-dir",
-        "install.sh must install $CARGO_TARGET_DIR/release/nora"
-    );
 }
 
 /// Acceptance: the desktop entry carries the required keys and passes
