@@ -65,6 +65,7 @@ impl Scene {
                     col: col0,
                     span: snap.cols as u16,
                     color: [bg.r, bg.g, bg.b, 255],
+                    cursor: false,
                 });
             }
         }
@@ -102,6 +103,7 @@ impl Scene {
                         col: col0 + col as u32,
                         span: cell.width(),
                         color: style.bg,
+                        cursor: false,
                     });
                 }
                 // Unicode placeholders show image tiles (ADR-014), never a glyph.
@@ -154,14 +156,20 @@ impl Scene {
                         col,
                         span: block.span,
                         color,
+                        cursor: true,
                     });
-                    // The glyph under the block is drawn in the cell
-                    // background so it stays legible.
+                    // The glyph under the block is drawn in a color that
+                    // contrasts with the cursor, so it stays legible.
                     if let Some(cell) = self.cells[first_cell..]
                         .iter_mut()
                         .find(|cell| cell.row == row && cell.col == col)
                     {
-                        cell.style.fg = cell.style.bg;
+                        cell.style.fg = cursor_text_color(
+                            cell.style.fg,
+                            cell.style.bg,
+                            color,
+                            [bg.r, bg.g, bg.b, 255],
+                        );
                     }
                 }
             }
@@ -176,6 +184,7 @@ impl Scene {
             col: 0,
             span: cols.min(u32::from(u16::MAX)) as u16,
             color: TAB_BAR_BG,
+            cursor: false,
         });
         let mut col = 0u32;
         for (index, label) in labels.iter().enumerate() {
@@ -193,6 +202,7 @@ impl Scene {
                 col,
                 span: width as u16,
                 color: bg,
+                cursor: false,
             });
             for (at, ch, w) in glyphs {
                 self.cells.push(DrawCell {
@@ -251,6 +261,7 @@ impl Scene {
             col: 0,
             span: cols.min(u32::from(u16::MAX)) as u16,
             color: SEARCH_BAR_BG,
+            cursor: false,
         });
         for (col, ch, width) in layout_line(text, cols).0 {
             self.cells.push(DrawCell {
@@ -348,11 +359,20 @@ impl Scene {
             self.cells.retain(|c| {
                 !(c.row == row && c.col < at + width && c.col + u32::from(c.width.max(1)) > at)
             });
+            // The block cursor is drawn after the other fills; the overlay
+            // covers it, as it covers the glyphs.
+            self.fills.retain(|f| {
+                !(f.cursor
+                    && f.row == row
+                    && f.col < at + width
+                    && f.col + u32::from(f.span.max(1)) > at)
+            });
             self.fills.push(CellFill {
                 row,
                 col: at,
                 span: width as u16,
                 color: bg,
+                cursor: false,
             });
             let mut style = tab_style(fg, bg, false);
             if underline {
@@ -368,6 +388,31 @@ impl Scene {
             at += width;
         }
         at - col
+    }
+}
+
+/// The color of the glyph under a block cursor: the cell background, unless
+/// it is (nearly) the cursor color — e.g. a reverse-video cell under a
+/// default cursor — then the cell foreground, then the default background,
+/// and as a last resort black or white, whichever contrasts with the cursor.
+fn cursor_text_color(fg: [u8; 4], bg: [u8; 4], cursor: [u8; 4], default_bg: [u8; 4]) -> [u8; 4] {
+    // Close enough to read as one color: under 48 summed over R, G and B.
+    let near = |a: [u8; 4]| {
+        a.iter()
+            .zip(cursor.iter())
+            .take(3)
+            .map(|(x, y)| u32::from(x.abs_diff(*y)))
+            .sum::<u32>()
+            < 48
+    };
+    if let Some(color) = [bg, fg, default_bg].into_iter().find(|c| !near(*c)) {
+        return color;
+    }
+    let luma = 299 * u32::from(cursor[0]) + 587 * u32::from(cursor[1]) + 114 * u32::from(cursor[2]);
+    if luma > 128 * 1000 {
+        [0, 0, 0, 255]
+    } else {
+        [255, 255, 255, 255]
     }
 }
 
@@ -524,6 +569,56 @@ mod tests {
         scene.add_pane(&snap, 0, 0, frame_bg, None, &LAYOUT);
         let texts: Vec<&str> = scene.cells.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec![" \u{301}"]);
+    }
+
+    #[test]
+    fn cursor_text_contrasts_with_the_cursor() {
+        let (white, black) = ([0xee, 0xee, 0xee, 255], [0x10, 0x10, 0x10, 255]);
+        let red = [0xcc, 0x20, 0x20, 255];
+        // Normal cell: the background.
+        assert_eq!(cursor_text_color(white, black, white, black), black);
+        // Reverse video under a default (foreground-colored) cursor.
+        assert_eq!(cursor_text_color(black, white, white, black), black);
+        // Nearly equal counts as equal.
+        assert_eq!(
+            cursor_text_color(red, [0xe8, 0xf0, 0xe8, 255], white, black),
+            red
+        );
+        // Everything matches the cursor: the default background, else
+        // black or white.
+        assert_eq!(cursor_text_color(white, white, white, black), black);
+        assert_eq!(
+            cursor_text_color(white, white, white, white),
+            [0, 0, 0, 255]
+        );
+        assert_eq!(
+            cursor_text_color(black, black, black, black),
+            [255, 255, 255, 255]
+        );
+    }
+
+    /// A reverse-video cell under a block cursor in the foreground color
+    /// keeps a visible glyph, and the block is marked to draw over the
+    /// selection.
+    #[test]
+    fn block_cursor_on_reverse_video_keeps_its_glyph() {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        let (mut snap, frame_bg) = pane(b"\x1b[7mX\x1b[0m\x1b[H", 2, 10);
+        snap.colors[NamedColor::Cursor] = snap.colors[NamedColor::Foreground];
+        let fg = snap.colors[NamedColor::Foreground].unwrap();
+        let cursor = [fg.r, fg.g, fg.b, 255];
+        let mut scene = Scene::default();
+        scene.add_pane(&snap, 0, 0, frame_bg, Some(true), &LAYOUT);
+        let glyph = scene.cells.iter().find(|c| c.col == 0).unwrap();
+        assert_eq!(glyph.style.bg, cursor, "reverse video: bg is the fg");
+        assert_ne!(glyph.style.fg, cursor);
+        let block: Vec<&CellFill> = scene.fills.iter().filter(|f| f.cursor).collect();
+        assert_eq!(block.len(), 1);
+        assert_eq!((block[0].row, block[0].col, block[0].color), (0, 0, cursor));
+        // A preedit over the cursor covers the block, as it did before.
+        let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
+        scene.add_preedit("a", 0, 0, 10, cursor, bg);
+        assert!(!scene.fills.iter().any(|f| f.cursor));
     }
 
     #[test]

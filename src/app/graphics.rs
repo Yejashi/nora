@@ -128,14 +128,16 @@ impl From<&str> for CellText {
 }
 
 /// One solid rectangle under the text: a cell background or the block
-/// cursor, `span` cells wide at (`row`, `col`), drawn before the selection
-/// and search fills.
+/// cursor, `span` cells wide at (`row`, `col`). Backgrounds are drawn
+/// before the selection and search fills; the block cursor (`cursor`)
+/// after them, so a selected cursor cell still shows the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellFill {
     pub row: u32,
     pub col: u32,
     pub span: u16,
     pub color: [u8; 4],
+    pub cursor: bool,
 }
 
 /// The presentation format: Rgba8UnormSrgb (the N02 offscreen default),
@@ -783,14 +785,16 @@ impl Graphics {
             .draw(&mut pass, &images, Band::UnderBackgrounds, frame_size);
         // N14b: selection highlight — fill rectangles under the selected
         // cells, drawn before the glyphs so text composites on top.
-        // Cell backgrounds and the block cursor: solid rectangles drawn
-        // first, so selection, search and glyphs composite on top.
-        let mut fill_vertices: Vec<DecoVertex> = Vec::new();
-        if let Some(texture) = frame.texture.as_ref() {
+        // Cell backgrounds: solid rectangles drawn first, so selection,
+        // search and glyphs composite on top. The block cursor is drawn
+        // after the selection and search fills, below.
+        let fill_rects = |cursor: bool| {
+            let mut out: Vec<DecoVertex> = Vec::new();
+            let Some(texture) = frame.texture.as_ref() else {
+                return out;
+            };
             let size = texture.texture.size();
-            let frame_w = size.width as f32;
-            let frame_h = size.height as f32;
-            for fill in fills {
+            for fill in fills.iter().filter(|f| f.cursor == cursor) {
                 let x0 = fill.col as f32 * cw;
                 let y0 = fill.row as f32 * cell_h;
                 let line = DecoLine {
@@ -802,9 +806,12 @@ impl Graphics {
                     thickness: cell_h,
                     color: fill.color,
                 };
-                push_deco_rect(&mut fill_vertices, &line, frame_w, frame_h);
+                push_deco_rect(&mut out, &line, size.width as f32, size.height as f32);
             }
-        }
+            out
+        };
+        let fill_vertices = fill_rects(false);
+        let cursor_vertices = fill_rects(true);
         if !fill_vertices.is_empty() {
             let mut bytes = Vec::with_capacity(fill_vertices.len() * 32);
             for v in &fill_vertices {
@@ -903,6 +910,27 @@ impl Graphics {
             pass.set_pipeline(&self.deco_pipeline);
             pass.set_vertex_buffer(0, buffer.slice(0..));
             pass.draw(0..search.len() as u32, 0..1);
+        }
+        // The block cursor, over the selection and search fills so a
+        // selected cursor cell still shows it; the glyph is drawn on top.
+        if !cursor_vertices.is_empty() {
+            let mut bytes = Vec::with_capacity(cursor_vertices.len() * 32);
+            for v in &cursor_vertices {
+                for f in v.pos.iter().chain(v._pad.iter()).chain(v.color.iter()) {
+                    bytes.extend_from_slice(&f.to_bits().to_ne_bytes());
+                }
+            }
+            let buffer = self.device.create_buffer(&BufferDescriptor {
+                label: Some("nora cursor vertices"),
+                size: bytes.len() as u64,
+                // Written with `Queue::write_buffer`, which requires COPY_DST.
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &bytes);
+            pass.set_pipeline(&self.deco_pipeline);
+            pass.set_vertex_buffer(0, buffer.slice(0..));
+            pass.draw(0..cursor_vertices.len() as u32, 0..1);
         }
         self.image_renderer
             .draw(&mut pass, &images, Band::UnderText, frame_size);
