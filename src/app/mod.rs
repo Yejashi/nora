@@ -2153,34 +2153,6 @@ impl WinApp {
                         ),
                     );
                 }
-                if !self.search.visible
-                    && let Some(notice) = self.notice.as_deref()
-                {
-                    scene.add_search_bar(
-                        &format!(" {notice}"),
-                        u32::from(grid_rows.saturating_sub(1)),
-                        u32::from(grid_cols),
-                    );
-                }
-                if self.search.visible {
-                    let state = &self.search.state;
-                    let status = if state.query.is_empty() {
-                        String::new()
-                    } else if state.total == 0 {
-                        "  no matches".to_string()
-                    } else {
-                        format!("  {}/{}", state.current + 1, state.total)
-                    };
-                    let text = format!(
-                        " Find: {}{status}   (Enter next, Shift+Enter previous, Esc close)",
-                        state.query
-                    );
-                    scene.add_search_bar(
-                        &text,
-                        u32::from(grid_rows.saturating_sub(1)),
-                        u32::from(grid_cols),
-                    );
-                }
                 if panes.len() > 1 {
                     let tiles: Vec<(u32, u32, u32, u32)> = panes
                         .iter()
@@ -2194,6 +2166,29 @@ impl WinApp {
                         })
                         .collect();
                     scene.add_separators(&tiles, u32::from(bar), layout.cell_w, layout.cell_h);
+                }
+                // The search bar (or a notice) covers the window's bottom
+                // row: added last, so nothing drawn earlier shows over it.
+                let bar_text = if self.search.visible {
+                    let state = &self.search.state;
+                    let status = if state.query.is_empty() {
+                        String::new()
+                    } else if state.total == 0 {
+                        "  no matches".to_string()
+                    } else {
+                        format!("  {}/{}", state.current + 1, state.total)
+                    };
+                    Some(format!(
+                        " Find: {}{status}   (Enter next, Shift+Enter previous, Esc close)",
+                        state.query
+                    ))
+                } else {
+                    self.notice.as_deref().map(|notice| format!(" {notice}"))
+                };
+                if let Some(text) = bar_text {
+                    let row = u32::from(grid_rows.saturating_sub(1));
+                    scene.add_search_bar(&text, row, u32::from(grid_cols), layout.cell_h);
+                    selection_cells.retain(|&(cell_row, _)| cell_row != row);
                 }
                 let t_built = std::time::Instant::now();
                 let allocs_built = nora::trace::thread_allocations();

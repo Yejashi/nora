@@ -210,7 +210,7 @@ Pure encoding in `src/input/mouse.rs` (`encode_mouse_event`), headless fixtures 
 
 Selection uses engine-supported coordinates and wrapped-line information. Copy joins soft wraps without injecting newlines, preserves real newlines, and handles wide spacers/combining marks. During history trimming or reflow, use the engine's selection remapping or invalidate visibly; do not retain stale raw row indices.
 
-Implemented: the engine stores the selection (and with it the search-hit highlight) as `(line id, col)` bounds, where a line id is the grid line plus the lines scrolled into history, so output and viewport scrolling move the highlight with its text and copy takes that text even while it is off screen; lines trimmed from the history are skipped (`tests/selection.rs`). Not yet: a drag's start cell is re-anchored on each motion from viewport coordinates, so scrolling the view during a drag moves the start; copy still inserts a newline at soft wraps; whether reflow on resize keeps the anchor on its text is unverified.
+Implemented: the engine stores the selection (and with it the search-hit highlight) as `(line id, col)` bounds, where a line id is the grid line plus the lines scrolled into history, so output and viewport scrolling move the highlight with its text and copy takes that text even while it is off screen; lines trimmed from the history are skipped (`tests/selection.rs`). Not yet: a drag's start cell is re-anchored on each motion from viewport coordinates, so scrolling the view during a drag moves the start; copy still inserts a newline at soft wraps; a width change that reflows wrapped lines can shift it, as for the other line anchors above.
 
 ## Scrollback search (N20a)
 
@@ -237,6 +237,7 @@ The search bar is a local UI overlay: it never sends anything to the PTY, and th
 | Input | while visible, typed characters append to the query and re-search immediately (logical key, layout-dependent); Backspace removes the last character and re-searches | `tests/search.rs` (state machine) + wiring in `src/app/mod.rs` |
 | Next match | Enter moves to the next match, wrapping at the end; no-op when there are no matches | `tests/search.rs` + wiring in `src/app/mod.rs` |
 | Close | Escape hides the bar and clears the query and matches | `tests/search.rs` + wiring in `src/app/mod.rs` |
+| Bar row | the bar covers the window's bottom row: a match off screen or on that row is scrolled to the row above it (except on the live screen's bottom row, which cannot scroll higher); cells, fills, selection cells, cursor and separator rects and images are kept off the bar row (a notice uses the same row) | `tests/scrollback.rs` (`search_hit_is_not_left_under_the_search_bar`), `src/app/scene.rs` unit tests |
 | Highlight | the current match's span (query length in cells, clamped to the row) is drawn as a fill rectangle under the text | wiring in `src/app/mod.rs` + `src/app/graphics.rs` |
 | Search scope | bounded to the last presented visible area (a character snapshot refreshed on every presented frame); scrollback search is a later slice | wiring in `src/app/mod.rs` |
 | Re-search on content change | while a search is active, each presented frame re-runs the query against the refreshed visible-area snapshot, so matches track scrolling content | wiring in `src/app/mod.rs` |

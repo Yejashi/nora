@@ -736,6 +736,49 @@ fn search_hit_survives_new_output() {
     assert_eq!(selected, "NEEDLE");
 }
 
+/// The search bar covers the bottom row: a match off screen, or on the
+/// bottom row, is shown on the row above it.
+#[test]
+fn search_hit_is_not_left_under_the_search_bar() {
+    let mut engine = Engine::with_history(5, 30, 200);
+    let mut stream = Vec::new();
+    for i in 0..40 {
+        let line = if i == 10 {
+            "the NEEDLE".to_string()
+        } else {
+            format!("filler {i}")
+        };
+        stream.extend_from_slice(format!("{line}\r\n").as_bytes());
+    }
+    engine.feed(&stream);
+    let hit = engine.search_text("NEEDLE")[0];
+    let selected_row = |engine: &mut Engine| {
+        let snap = engine.snapshot();
+        snap.selected.iter().position(|s| *s).map(|i| i / snap.cols)
+    };
+    engine.show_search_hit(hit);
+    assert_eq!(
+        selected_row(&mut engine),
+        Some(3),
+        "off screen: row above the bar"
+    );
+    // Scrolled so the match sits on the bottom row: it moves up one.
+    engine.scroll(alacritty_terminal::grid::Scroll::Delta(1));
+    assert_eq!(selected_row(&mut engine), Some(4));
+    engine.show_search_hit(hit);
+    assert_eq!(
+        selected_row(&mut engine),
+        Some(3),
+        "moved out from under the bar"
+    );
+    // Already visible above the bar: the view does not move.
+    let offset = engine.display_offset();
+    engine.scroll(alacritty_terminal::grid::Scroll::Delta(-2));
+    engine.show_search_hit(hit);
+    assert_eq!(engine.display_offset(), offset - 2);
+    assert_eq!(selected_row(&mut engine), Some(1));
+}
+
 /// Regression: while the view is scrolled back, an idle terminal reports no
 /// damage (it used to count as damage on every probe, so the pump built a
 /// snapshot and the window drew a frame on every wake: a redraw loop).

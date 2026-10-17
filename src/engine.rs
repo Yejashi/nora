@@ -938,8 +938,8 @@ impl Engine {
 
     /// Scroll the viewport so that grid line `line` (a
     /// [`alacritty_terminal::index::Line`], where `screen_lines - 1` is
-    /// the bottom row and negative values are scrollback) is at the top
-    /// of the viewport (N35b). Lines at or below the bottom scroll to
+    /// the bottom row and negative values are scrollback) is on the bottom
+    /// row of the viewport (N35b). Lines at or below the bottom scroll to
     /// the bottom; lines above the scrollback are clamped to the top.
     pub fn scroll_to_line(&self, line: i32) {
         let target = {
@@ -1237,23 +1237,27 @@ impl Engine {
             .flatten()
     }
 
-    /// Scroll `hit` into view (to the bottom row when it is off screen) and
-    /// select it, so the selection highlight marks the match.
+    /// Scroll `hit` into view and select it, so the selection highlight
+    /// marks the match. The search bar covers the bottom row, so a match
+    /// there or off screen is scrolled to the row above it (the live
+    /// screen's bottom row cannot scroll higher).
     pub fn show_search_hit(&self, hit: SearchHit) {
         let Some(line) = self.search_hit_line(hit) else {
             self.clear_selection();
             return;
         };
         let rows = self.rows as i32;
-        let visible = |offset: usize| {
+        // Rows not under the search bar (all of them in a one-row view).
+        let usable = if rows > 1 { rows - 1 } else { rows };
+        let visible = |offset: usize, limit: i32| {
             let row = line + offset as i32;
-            (0..rows).contains(&row).then_some(row as usize)
+            (0..limit).contains(&row).then_some(row as usize)
         };
-        let row = match visible(self.display_offset()) {
+        let row = match visible(self.display_offset(), usable) {
             Some(row) => row,
             None => {
-                self.scroll_to_line(line);
-                match visible(self.display_offset()) {
+                self.scroll_to_line(line + (rows - usable));
+                match visible(self.display_offset(), rows) {
                     Some(row) => row,
                     None => return,
                 }

@@ -308,10 +308,28 @@ impl Scene {
 
 impl Scene {
     /// The search bar: `text` on grid row `row`, across `cols` columns, over
-    /// whatever the pane shows there.
-    pub fn add_search_bar(&mut self, text: &str, row: u32, cols: u32) {
+    /// whatever the pane shows there. Everything already in the scene is
+    /// kept off that row: its cells and fills are removed, and pixel rects
+    /// (cursor, separators) and images are cut at the row's top edge
+    /// (`cell_h` is the row height in pixels). Add it after the panes and
+    /// separators.
+    pub fn add_search_bar(&mut self, text: &str, row: u32, cols: u32, cell_h: f32) {
         self.cells.retain(|cell| cell.row != row);
         self.fills.retain(|fill| fill.row != row);
+        let (top, bottom) = (row as f32 * cell_h, (row + 1) as f32 * cell_h);
+        self.rects.retain_mut(|rect| {
+            if rect.y >= top && rect.y < bottom {
+                return false;
+            }
+            if rect.y < top && rect.y + rect.h > top {
+                rect.h = top - rect.y;
+            }
+            true
+        });
+        for image in &mut self.images {
+            let [_, y, _, h] = &mut image.clip;
+            *h = h.min((top - *y).max(0.0));
+        }
         self.fills.push(CellFill {
             row,
             col: 0,
@@ -544,7 +562,7 @@ mod tests {
         assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((0, 8)));
 
         let mut bar = Scene::default();
-        bar.add_search_bar("a日本", 5, 4);
+        bar.add_search_bar("a日本", 5, 4, 10.0);
         let placed: Vec<(u32, u16)> = bar.cells.iter().map(|c| (c.col, c.width)).collect();
         assert_eq!(placed, vec![(0, 1), (1, 2)]);
     }
@@ -559,10 +577,22 @@ mod tests {
             style: tab_style(TAB_FG, TAB_BAR_BG, false),
             width: 1,
         });
-        scene.add_search_bar("Find: ab", 3, 20);
+        let rect = |y, h| PixelRect {
+            x: 0.0,
+            y,
+            w: 1.0,
+            h,
+            color: SEPARATOR,
+        };
+        // A cursor rect on the bar row, a separator running into it and a
+        // rect above it (cell height 10: the bar spans y 30..40).
+        scene.rects = vec![rect(32.0, 2.0), rect(0.0, 40.0), rect(5.0, 10.0)];
+        scene.add_search_bar("Find: ab", 3, 20, 10.0);
         let text: String = scene.cells.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(text, "Find:ab");
         assert_eq!(scene.fills.len(), 1);
+        let rects: Vec<(f32, f32)> = scene.rects.iter().map(|r| (r.y, r.h)).collect();
+        assert_eq!(rects, vec![(0.0, 30.0), (5.0, 10.0)]);
     }
 
     #[test]
