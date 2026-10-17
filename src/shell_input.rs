@@ -147,20 +147,27 @@ impl ShellInput {
         self.generation
     }
 }
-
 /// Undo the shell quoting that `printf %q` (bash) and `${(q)...}` (zsh)
 /// produce: backslash escapes, `'...'`, `"..."` and ANSI-C `$'...'`.
 /// `None` when a quote is left open or an escape is cut off.
+///
+/// `\xHH` and octal escapes in `$'...'` are bytes, as in the shells (a
+/// non-ASCII character in a C locale is quoted as its UTF-8 bytes, e.g.
+/// `$'\303\251'`), so the result is decoded as UTF-8 at the end, with
+/// invalid sequences replaced.
 pub fn unquote_shell(s: &str) -> Option<String> {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
+    let push = |out: &mut Vec<u8>, c: char| {
+        out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    };
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => out.push(chars.next()?),
+            '\\' => push(&mut out, chars.next()?),
             '\'' => loop {
                 match chars.next()? {
                     '\'' => break,
-                    c => out.push(c),
+                    c => push(&mut out, c),
                 }
             },
             '"' => loop {
@@ -169,11 +176,11 @@ pub fn unquote_shell(s: &str) -> Option<String> {
                     '\\' => {
                         let next = chars.next()?;
                         if !matches!(next, '"' | '\\' | '$' | '`') {
-                            out.push('\\');
+                            out.push(b'\\');
                         }
-                        out.push(next);
+                        push(&mut out, next);
                     }
-                    c => out.push(c),
+                    c => push(&mut out, c),
                 }
             },
             '$' if chars.peek() == Some(&'\'') => {
@@ -181,21 +188,53 @@ pub fn unquote_shell(s: &str) -> Option<String> {
                 loop {
                     match chars.next()? {
                         '\'' => break,
-                        '\\' => out.push(ansi_c_escape(&mut chars)?),
-                        c => out.push(c),
+                        '\\' => match ansi_c_escape(&mut chars)? {
+                            Escape::Byte(b) => out.push(b),
+                            Escape::Char(c) => push(&mut out, c),
+                        },
+                        c => push(&mut out, c),
                     }
                 }
             }
-            c => out.push(c),
+            c => push(&mut out, c),
         }
     }
-    Some(out)
+    Some(match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    })
+}
+
+/// What one `$'...'` escape stands for.
+enum Escape {
+    /// A raw byte (`\xHH`, octal).
+    Byte(u8),
+    /// A character (named escapes, `\uHHHH`, `\UHHHHHHHH`, the rest).
+    Char(char),
+}
+
+/// Up to `max` digits of `radix` from `chars`, and how many there were.
+fn digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    radix: u32,
+    max: usize,
+    mut value: u32,
+) -> (u32, usize) {
+    let mut count = 0;
+    while count < max
+        && let Some(d) = chars.peek().and_then(|c| c.to_digit(radix))
+    {
+        value = value * radix + d;
+        chars.next();
+        count += 1;
+    }
+    (value, count)
 }
 
 /// One escape inside `$'...'`, after its backslash.
-fn ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+fn ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Escape> {
     let c = chars.next()?;
-    Some(match c {
+    Some(Escape::Char(match c {
         'n' => '\n',
         't' => '\t',
         'r' => '\r',
@@ -205,32 +244,24 @@ fn ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option
         'f' => '\x0c',
         'v' => '\x0b',
         'x' => {
-            let mut value = 0u32;
-            let mut digits = 0;
-            while digits < 2
-                && let Some(d) = chars.peek().and_then(|c| c.to_digit(16))
-            {
-                value = value * 16 + d;
-                chars.next();
-                digits += 1;
+            let (value, count) = digits(chars, 16, 2, 0);
+            if count == 0 {
+                return None;
             }
-            if digits == 0 {
+            return Some(Escape::Byte(value as u8));
+        }
+        '0'..='7' => {
+            let (value, _) = digits(chars, 8, 2, c.to_digit(8)?);
+            // Bash keeps the low byte of `\400`-`\777`.
+            return Some(Escape::Byte(value as u8));
+        }
+        'u' | 'U' => {
+            let (value, count) = digits(chars, 16, if c == 'u' { 4 } else { 8 }, 0);
+            if count == 0 {
                 return None;
             }
             char::from_u32(value)?
         }
-        '0'..='7' => {
-            let mut value = c.to_digit(8)?;
-            let mut digits = 1;
-            while digits < 3
-                && let Some(d) = chars.peek().and_then(|c| c.to_digit(8))
-            {
-                value = value * 8 + d;
-                chars.next();
-                digits += 1;
-            }
-            char::from_u32(value)?
-        }
         other => other,
-    })
+    }))
 }

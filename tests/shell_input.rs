@@ -178,6 +178,27 @@ fn unquote_shell_handles_bash_and_zsh_quoting() {
     assert_eq!(unquote_shell("trailing\\"), None);
 }
 
+/// `$'...'` byte escapes are UTF-8 bytes, not code points: bash in a C
+/// locale quotes `é` as `$'\303\251'`.
+#[test]
+fn unquote_shell_byte_escapes_decode_as_utf8() {
+    assert_eq!(
+        unquote_shell(r"echo caf$'\303\251'").as_deref(),
+        Some("echo café")
+    );
+    assert_eq!(
+        unquote_shell(r"echo $'\xC3\xA9\xf0\x9f\x98\x9c'").as_deref(),
+        Some("echo é😜")
+    );
+    // Code-point escapes stay code points; literal non-ASCII is kept.
+    assert_eq!(
+        unquote_shell(r"$'é\U0001F61C' 'ü'").as_deref(),
+        Some("é😜 ü")
+    );
+    // An invalid byte sequence is replaced, not dropped silently.
+    assert_eq!(unquote_shell(r"$'\xff'x").as_deref(), Some("\u{FFFD}x"));
+}
+
 /// An integration that sends a bare `D` (no status, like nora-bash.sh):
 /// the command is finished once the next prompt starts, without a status.
 #[test]
