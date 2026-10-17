@@ -38,9 +38,9 @@ use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
 use nora::input::kitty::{self, Kitty};
 use nora::input::mouse::{
-    MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, cell_in_pane,
-    encode_mouse_event, logical_to_cell, mouse_modifiers, should_report, track_button,
-    wheel_directions,
+    MouseEncoding, MouseEvent, MouseKind, MouseMode, ScrollAccumulator, button_number,
+    cell_in_pane, encode_mouse_event, logical_to_cell, mouse_modifiers, should_report,
+    track_button, wheel_steps,
 };
 use nora::input::{BindingTable, InputAction, encode};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
@@ -538,6 +538,8 @@ struct WinApp {
     bindings: Bindings,
     /// Lines per mouse-wheel step (`[scrolling] multiplier`).
     scroll_lines: i32,
+    /// Fractional scroll carried between wheel/touchpad events.
+    scroll_acc: ScrollAccumulator,
     /// Selection highlight color.
     selection_color: [u8; 4],
     /// A transient message on the bottom row (config reload result),
@@ -764,6 +766,7 @@ pub fn run_windowed(
         palette: Palette::from_config(config),
         bindings: Bindings::with_config(&config.binding_entries()),
         scroll_lines: i32::from(config.scroll_multiplier()),
+        scroll_acc: ScrollAccumulator::default(),
         selection_color: selection_color(config),
         notice: None,
         config_state: config_state.clone(),
@@ -2650,22 +2653,25 @@ impl ApplicationHandler<AppEvent> for WinApp {
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::MouseWheel { delta, .. } => {
-                let kinds = wheel_directions(delta);
-                if kinds.is_empty() {
+                // Touchpad pixel deltas and fractional line deltas add up
+                // to whole steps (lines / wheel reports) across events.
+                let Some(fonts) = self.fonts.as_ref() else {
+                    return;
+                };
+                let (cell_w, cell_h) = (fonts.cell_w, fonts.cell_h());
+                let steps = self.scroll_acc.add(delta, cell_w, cell_h);
+                if steps == (0, 0) {
                     return;
                 }
                 // N16b: when the terminal reports mouse (and Shift is
                 // not held), the application owns the scroll: report
-                // the wheel event(s) at the last tracked cursor
-                // position. Otherwise the wheel scrolls the local
+                // one wheel event per whole step at the last tracked
+                // cursor position. Otherwise the wheel scrolls the local
                 // scrollback (N14a).
                 if should_report(MouseMode::from_term_mode(self.modes), self.mods.shift_key()) {
                     let (x, y) = self.cursor;
-                    if let Some(fonts) = self.fonts.as_ref()
-                        && let Some((col, row)) =
-                            logical_to_cell(x, y, fonts.cell_w, fonts.cell_h())
-                    {
-                        for kind in kinds {
+                    if let Some((col, row)) = logical_to_cell(x, y, cell_w, cell_h) {
+                        for kind in wheel_steps(steps) {
                             self.send_mouse_event(
                                 &MouseEvent {
                                     kind,
@@ -2684,10 +2690,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // positive y as "content moves down" (scroll up) for
                 // both delta kinds, so positive lines = into history;
                 // the pump applies the delta to the engine on its next
-                // tick.
+                // tick. The configured multiplier scales wheel notches;
+                // touchpad pixels already move one line per cell height.
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, dy) => (dy as i32) * self.scroll_lines,
-                    MouseScrollDelta::PixelDelta(dy) => (dy.y / 3.0) as i32,
+                    MouseScrollDelta::LineDelta(..) => steps.1 * self.scroll_lines,
+                    MouseScrollDelta::PixelDelta(_) => steps.1,
                 };
                 // Alternate scroll (DECSET 1007): the alternate screen has
                 // no scrollback, so the wheel becomes cursor keys for the

@@ -23,9 +23,9 @@
 use alacritty_terminal::term::TermMode;
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
-    MouseEncoding, MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number, cell_in_pane,
-    encode_mouse_event, logical_to_cell, mouse_modifiers, physical_to_cell, should_report,
-    track_button, wheel_directions,
+    MAX_SCROLL_STEPS, MouseEncoding, MouseEvent, MouseKind, MouseMode, MouseModifiers,
+    ScrollAccumulator, button_number, cell_in_pane, encode_mouse_event, logical_to_cell,
+    mouse_modifiers, physical_to_cell, should_report, track_button, wheel_directions, wheel_steps,
 };
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
@@ -574,4 +574,84 @@ fn clamped_release_encodes_as_an_sgr_release() {
     };
     let bytes = encode_mouse_event(MouseMode::CellMotion, MouseEncoding::Sgr, &event, 20, 5);
     assert_eq!(bytes.as_deref(), Some(&b"\x1b[<0;20;1m"[..]));
+}
+
+fn pixels(x: f64, y: f64) -> MouseScrollDelta {
+    MouseScrollDelta::PixelDelta(PhysicalPosition::new(x, y))
+}
+
+#[test]
+fn scroll_accumulator_adds_small_pixel_deltas_to_whole_lines() {
+    // A 20 px cell: five 4 px touchpad events make one line, not five
+    // wheel reports and not zero lines.
+    let mut acc = ScrollAccumulator::default();
+    for _ in 0..4 {
+        assert_eq!(acc.add(pixels(0.0, 4.0), CELL_W, CELL_H), (0, 0));
+    }
+    assert_eq!(acc.add(pixels(0.0, 4.0), CELL_W, CELL_H), (0, 1));
+    // A large delta yields several lines and keeps the remainder.
+    assert_eq!(acc.add(pixels(0.0, 50.0), CELL_W, CELL_H), (0, 2));
+    assert_eq!(acc.add(pixels(0.0, 10.0), CELL_W, CELL_H), (0, 1));
+    // Horizontal pixels use the cell width.
+    assert_eq!(acc.add(pixels(-25.0, 0.0), CELL_W, CELL_H), (-2, 0));
+}
+
+#[test]
+fn scroll_accumulator_keeps_fractional_line_deltas() {
+    let mut acc = ScrollAccumulator::default();
+    assert_eq!(
+        acc.add(MouseScrollDelta::LineDelta(0.0, 0.4), CELL_W, CELL_H),
+        (0, 0)
+    );
+    assert_eq!(
+        acc.add(MouseScrollDelta::LineDelta(0.0, 0.4), CELL_W, CELL_H),
+        (0, 0)
+    );
+    assert_eq!(
+        acc.add(MouseScrollDelta::LineDelta(0.0, 0.4), CELL_W, CELL_H),
+        (0, 1)
+    );
+    // Whole notches pass straight through.
+    assert_eq!(
+        acc.add(MouseScrollDelta::LineDelta(0.0, -3.0), CELL_W, CELL_H),
+        (0, -3)
+    );
+}
+
+#[test]
+fn scroll_accumulator_resets_on_direction_change() {
+    let mut acc = ScrollAccumulator::default();
+    assert_eq!(acc.add(pixels(0.0, 15.0), CELL_W, CELL_H), (0, 0));
+    // Reversing drops the 15 px carried upwards: 15 px down is not a line.
+    assert_eq!(acc.add(pixels(0.0, -15.0), CELL_W, CELL_H), (0, 0));
+    assert_eq!(acc.add(pixels(0.0, -5.0), CELL_W, CELL_H), (0, -1));
+}
+
+#[test]
+fn scroll_accumulator_bounds_runaway_and_degenerate_deltas() {
+    let mut acc = ScrollAccumulator::default();
+    assert_eq!(
+        acc.add(pixels(0.0, 1e12), CELL_W, CELL_H),
+        (0, MAX_SCROLL_STEPS)
+    );
+    assert_eq!(
+        acc.add(pixels(f64::NAN, f64::INFINITY), CELL_W, CELL_H),
+        (0, 0)
+    );
+    // No cell metrics: pixels cannot be converted.
+    assert_eq!(acc.add(pixels(0.0, 100.0), 0, 0), (0, 0));
+}
+
+#[test]
+fn wheel_steps_emit_one_report_per_step_vertical_first() {
+    assert_eq!(wheel_steps((0, 0)), Vec::<MouseKind>::new());
+    assert_eq!(
+        wheel_steps((0, 2)),
+        vec![MouseKind::WheelUp, MouseKind::WheelUp]
+    );
+    assert_eq!(
+        wheel_steps((-1, -1)),
+        vec![MouseKind::WheelDown, MouseKind::WheelLeft]
+    );
+    assert_eq!(wheel_steps((1, 0)), vec![MouseKind::WheelRight]);
 }

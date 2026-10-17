@@ -12,8 +12,10 @@
 //! coordinate conversion ([`physical_to_cell`], [`logical_to_cell`]),
 //! button press tracking ([`track_button`]), the modifier mapping
 //! ([`mouse_modifiers`]), the report-vs-local routing decision
-//! ([`should_report`]) and the wheel direction mapping
-//! ([`wheel_directions`]).
+//! ([`should_report`]), the wheel direction mapping
+//! ([`wheel_directions`]) and the scroll accumulator that turns touchpad
+//! pixels and fractional lines into whole steps ([`ScrollAccumulator`],
+//! [`wheel_steps`]).
 
 use alacritty_terminal::term::TermMode;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
@@ -339,5 +341,69 @@ pub fn wheel_directions(delta: MouseScrollDelta) -> Vec<MouseKind> {
     } else if dx < 0.0 {
         kinds.push(MouseKind::WheelLeft);
     }
+    kinds
+}
+
+/// The most whole steps one scroll event yields per axis: a runaway delta
+/// (a flung touchpad, a bogus driver value) cannot queue an unbounded run
+/// of wheel reports or cursor keys.
+pub const MAX_SCROLL_STEPS: i32 = 200;
+
+/// Accumulates scroll deltas into whole steps per axis (one step = one
+/// line of scrollback or one wheel report), keeping the fraction for the
+/// next event. A touchpad sends many small pixel deltas and some mice
+/// fractional line deltas; without accumulation each is truncated to
+/// nothing, or (reported) inflated to a whole wheel event. Pixels are
+/// converted with the cell size. A direction change on an axis drops that
+/// axis' remainder, so a reversal responds at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScrollAccumulator {
+    x: f64,
+    y: f64,
+}
+
+impl ScrollAccumulator {
+    /// Add `delta` and return the whole steps `(x, y)` it completes, in
+    /// winit's signs (positive `y` = scroll up, positive `x` = right),
+    /// each clamped to [`MAX_SCROLL_STEPS`].
+    pub fn add(&mut self, delta: MouseScrollDelta, cell_w: u32, cell_h: u32) -> (i32, i32) {
+        let per = |px: f64, cell: u32| if cell > 0 { px / f64::from(cell) } else { 0.0 };
+        let (dx, dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+            MouseScrollDelta::PixelDelta(pos) => (per(pos.x, cell_w), per(pos.y, cell_h)),
+        };
+        (step(&mut self.x, dx), step(&mut self.y, dy))
+    }
+}
+
+fn step(acc: &mut f64, delta: f64) -> i32 {
+    if delta == 0.0 || !delta.is_finite() {
+        return 0;
+    }
+    if *acc != 0.0 && acc.signum() != delta.signum() {
+        *acc = 0.0;
+    }
+    *acc += delta;
+    let whole = acc.trunc();
+    *acc -= whole;
+    let limit = f64::from(MAX_SCROLL_STEPS);
+    whole.clamp(-limit, limit) as i32
+}
+
+/// The wheel reports for whole scroll steps `(x, y)` from
+/// [`ScrollAccumulator::add`]: one report per step, vertical first.
+pub fn wheel_steps((x, y): (i32, i32)) -> Vec<MouseKind> {
+    let vertical = if y > 0 {
+        MouseKind::WheelUp
+    } else {
+        MouseKind::WheelDown
+    };
+    let horizontal = if x > 0 {
+        MouseKind::WheelRight
+    } else {
+        MouseKind::WheelLeft
+    };
+    let mut kinds = vec![vertical; y.unsigned_abs() as usize];
+    kinds.extend(std::iter::repeat_n(horizontal, x.unsigned_abs() as usize));
     kinds
 }
