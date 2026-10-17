@@ -2825,7 +2825,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                 // that cannot edit the line keeps it: the
                                 // shell reports no new buffer for it, so
                                 // the pump would send no replacement.
-                                if key_may_edit_line(&event.logical_key) {
+                                if key_may_edit_line(&event.logical_key, &bytes) {
                                     self.suggestions.remove(&pane);
                                 }
                                 self.send_input(pane, bytes);
@@ -3126,58 +3126,59 @@ impl ApplicationHandler<AppEvent> for WinApp {
     }
 }
 
-/// Whether sending `key` may change the shell's line buffer. Escape,
-/// function keys and modifier or lock keys (reported alone under the kitty
+/// Whether sending `bytes` for `key` may change the shell's line buffer.
+/// Function keys and modifier or lock keys (reported alone under the kitty
 /// protocol) do not edit it, so the shell sends no new buffer and the
-/// shown suggestion stays valid; every other key may. A key bound in the
-/// shell to an edit still gets a fresh suggestion once the shell reports
-/// its buffer.
-fn key_may_edit_line(key: &Key) -> bool {
+/// shown suggestion stays valid; every other key may. Escape, and any key
+/// whose bytes end in a bare ESC, may too: readline and zle take a
+/// trailing ESC as a Meta prefix, so a suggestion accepted next would
+/// have its first byte read as Meta+char. A key bound in the shell to an
+/// edit still gets a fresh suggestion once the shell reports its buffer.
+fn key_may_edit_line(key: &Key, bytes: &[u8]) -> bool {
     use NamedKey::*;
-    !matches!(
-        key,
-        Key::Named(
-            Escape
-                | F1
-                | F2
-                | F3
-                | F4
-                | F5
-                | F6
-                | F7
-                | F8
-                | F9
-                | F10
-                | F11
-                | F12
-                | F13
-                | F14
-                | F15
-                | F16
-                | F17
-                | F18
-                | F19
-                | F20
-                | F21
-                | F22
-                | F23
-                | F24
-                | Shift
-                | Control
-                | Alt
-                | AltGraph
-                | Super
-                | Meta
-                | Hyper
-                | Fn
-                | FnLock
-                | CapsLock
-                | NumLock
-                | ScrollLock
-                | Symbol
-                | SymbolLock
+    bytes.last() == Some(&0x1b)
+        || !matches!(
+            key,
+            Key::Named(
+                F1 | F2
+                    | F3
+                    | F4
+                    | F5
+                    | F6
+                    | F7
+                    | F8
+                    | F9
+                    | F10
+                    | F11
+                    | F12
+                    | F13
+                    | F14
+                    | F15
+                    | F16
+                    | F17
+                    | F18
+                    | F19
+                    | F20
+                    | F21
+                    | F22
+                    | F23
+                    | F24
+                    | Shift
+                    | Control
+                    | Alt
+                    | AltGraph
+                    | Super
+                    | Meta
+                    | Hyper
+                    | Fn
+                    | FnLock
+                    | CapsLock
+                    | NumLock
+                    | ScrollLock
+                    | Symbol
+                    | SymbolLock
+            )
         )
-    )
 }
 
 /// The focus reports for moving the active pane from `prev` to `next`
@@ -3399,22 +3400,31 @@ mod focus_report_tests {
     #[test]
     fn only_keys_that_may_edit_drop_the_suggestion() {
         use super::{Key, NamedKey, key_may_edit_line};
-        for key in [
-            NamedKey::Escape,
-            NamedKey::F2,
-            NamedKey::Shift,
-            NamedKey::Control,
+        for (key, bytes) in [
+            (NamedKey::F2, &b"\x1bOQ"[..]),
+            (NamedKey::F5, b"\x1b[15~"),
+            (NamedKey::Shift, b"\x1b[57441u"),
+            (NamedKey::Control, b""),
         ] {
-            assert!(!key_may_edit_line(&Key::Named(key)), "{key:?}");
+            assert!(!key_may_edit_line(&Key::Named(key), bytes), "{key:?}");
         }
-        for key in [
-            Key::Character("a".into()),
-            Key::Named(NamedKey::Backspace),
-            Key::Named(NamedKey::Enter),
-            Key::Named(NamedKey::ArrowLeft),
-            Key::Named(NamedKey::Space),
+        for (key, bytes) in [
+            (Key::Character("a".into()), &b"a"[..]),
+            (Key::Named(NamedKey::Backspace), b"\x7f"),
+            (Key::Named(NamedKey::Enter), b"\r"),
+            (Key::Named(NamedKey::ArrowLeft), b"\x1b[D"),
+            (Key::Named(NamedKey::Space), b" "),
+            // The shell takes ESC as a Meta prefix: an accepted
+            // suggestion's first byte would become Meta+char.
+            (Key::Named(NamedKey::Escape), b"\x1b"),
+            (Key::Named(NamedKey::Escape), b"\x1b\x1b"),
         ] {
-            assert!(key_may_edit_line(&key), "{key:?}");
+            assert!(key_may_edit_line(&key, bytes), "{key:?}");
+        }
+        // Whatever the key, bytes ending in a bare ESC leave a pending
+        // Meta prefix in the shell.
+        for key in [NamedKey::Alt, NamedKey::F1] {
+            assert!(key_may_edit_line(&Key::Named(key), b"\x1b"), "{key:?}");
         }
     }
 
