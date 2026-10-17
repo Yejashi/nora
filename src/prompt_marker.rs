@@ -844,9 +844,10 @@ fn classify_frame(data: &[u8]) -> FrameAction {
 
 /// Parse an OSC 7 cwd frame's data (the bytes after `7;`).
 ///
-/// Accepts either a `file://` URI for a local path (host empty or
-/// `localhost`, path absolute, percent-decoded) or a bare absolute path.
-/// Returns the path, or `None` when the frame is not a valid local path.
+/// Accepts either a `file://` URI for a local path (host empty,
+/// `localhost` or this machine's hostname, path absolute, percent-decoded)
+/// or a bare absolute path. A path on another host (a shell over ssh) is
+/// not a local cwd: new tabs must not `chdir` to it. Returns the path, or `None` when the frame is not a valid local path.
 fn parse_cwd(data: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(data).ok()?;
     if let Some(rest) = s.strip_prefix("file://") {
@@ -854,8 +855,7 @@ fn parse_cwd(data: &[u8]) -> Option<String> {
         let slash = rest.find('/')?;
         let host = &rest[..slash];
         let path = &rest[slash..];
-        // The host must be empty or `localhost` (local path only).
-        if !host.is_empty() && host != "localhost" {
+        if !is_local_host(host) {
             return None;
         }
         // The path must be absolute.
@@ -870,6 +870,33 @@ fn parse_cwd(data: &[u8]) -> Option<String> {
         }
         Some(s.to_string())
     }
+}
+
+/// Whether an OSC 7 host names this machine: empty, `localhost`, or the
+/// hostname (case-insensitively; a short name matches the full name).
+fn is_local_host(host: &str) -> bool {
+    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    host_matches(host, HOSTNAME.get_or_init(local_hostname))
+}
+
+fn host_matches(host: &str, local: &str) -> bool {
+    let short = |name: &str| name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || (!local.is_empty() && short(host) == short(local))
+}
+
+/// This machine's hostname, or empty when it cannot be read.
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its whole length, which is the length
+    // passed; the name is cut at the first NUL (or the buffer end).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 /// Parse an OSC 8 hyperlink frame's data (the bytes after `8;`), which is
@@ -929,6 +956,22 @@ mod osc_cap_tests {
     /// Audit RV-OSC7: a `%` before a multi-byte character used to slice
     /// the `str` mid-character and panic the PTY reader; a trailing `%XX`
     /// was never decoded.
+    /// zsh reports `file://$HOST/path`: this machine's name is local (in
+    /// any case, short or full), another host is not.
+    #[test]
+    fn osc7_host_is_local_only_for_this_machine() {
+        assert!(host_matches("", "box"));
+        assert!(host_matches("LocalHost", "box"));
+        assert!(host_matches("Box", "box.example.org"));
+        assert!(host_matches("box.example.org", "box"));
+        assert!(!host_matches("server", "box"));
+        assert!(!host_matches("server", ""));
+        let local = local_hostname();
+        let uri = format!("file://{local}/tmp");
+        assert_eq!(parse_cwd(uri.as_bytes()).as_deref(), Some("/tmp"));
+        assert_eq!(parse_cwd(b"file://nora-remote-host.invalid/tmp"), None);
+    }
+
     #[test]
     fn percent_decode_is_byte_safe_and_decodes_the_last_escape() {
         assert_eq!(percent_decode("/%a\u{e9}"), "/%a\u{e9}");
