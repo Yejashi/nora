@@ -1,199 +1,284 @@
 //! N29: validated terminal identity and SSH fallback.
 //!
-//! These tests verify that the `nora` terminfo entry (in
-//! `terminfo/nora.terminfo`) compiles with `tic`, reads back with `infocmp`,
-//! advertises only tested capabilities, and that the SSH fallback is
-//! documented. They require `tic` and `infocmp` (ncurses) on the PATH.
+//! These tests compile the `nora` terminfo entry (`terminfo/nora.terminfo`)
+//! with `tic` into a temporary directory and read capabilities back through
+//! `tput -T nora` with `TERMINFO` pointing there, so they check the
+//! sequences curses programs actually get. They skip (pass with a note)
+//! when ncurses' `tic`, `tput` or `infocmp` is not on the PATH.
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// The terminfo source file, relative to the crate root.
 const TERMINFO_SRC: &str = "terminfo/nora.terminfo";
 
-/// Capability names that must be advertised by the compiled entry. The set
-/// is derived from nora's tested behavior (cursor addressing, key
-/// sequences, SGR styles, modes, colors, erase/clear) — see ADR-010.
-///
-/// These are capability *names* (not name=value pairs) so the check is
-/// robust to `infocmp`'s rendering of escape sequences (e.g. it prints
-/// `\177` as `^?` and `\E[H` as `\E[H`).
-const EXPECTED_CAPS: &[&str] = &[
-    // Boolean capabilities.
-    "am", "bce", "km", "mir", "msgr", "xenl", // Numeric capabilities.
-    "colors", "pairs", "cols", "lines", "it", // Cursor addressing.
-    "cup", "home", // Cursor movement (application → terminal).
-    "cub1", "cud1", "cuf1", "cuu1",
-    // Cursor keys (terminal → application, app mode).
-    "kcub1", "kcud1", "kcuf1", "kcuu1", // Keys.
-    "kbs", "kHOM", "kEND", "kIC", "kDC", "kLFT", "kRIT", "kf1", "kf2", "kf3", "kf4", "kf5", "kf6",
-    "kf7", "kf8", "kf9", "kf10", "kf11", "kf12", // Styles (SGR).
-    "bold", "dim", "blink", "invis", "smso", "smul", "rev", "rmso", "rmul", // Modes.
-    "smcup", "rmcup", "smam", "rmam", "smkx", "rmkx",  // Colors.
-    "initc", // Erase/clear.
-    "clear", "ed", "el", "el1", "dch1", "dl1", // Cursor visibility.
-    "civis", "cnorm", // Basic.
-    "cr", "ind", "bel", "ht",
+/// Capabilities whose `tput` output must match exactly, as
+/// `(tput arguments, expected bytes)`. Key capabilities are what nora's
+/// legacy encoder (`src/input.rs`) sends with `smkx` in effect.
+const EXPECTED_SEQUENCES: &[(&[&str], &[u8])] = &[
+    (&["setaf", "1"], b"\x1b[31m"),
+    (&["setaf", "12"], b"\x1b[94m"),
+    (&["setaf", "200"], b"\x1b[38;5;200m"),
+    (&["setab", "1"], b"\x1b[41m"),
+    (&["setab", "200"], b"\x1b[48;5;200m"),
+    (&["sgr0"], b"\x1b(B\x1b[m"),
+    (&["op"], b"\x1b[39;49m"),
+    (&["csr", "0", "9"], b"\x1b[1;10r"),
+    (&["sc"], b"\x1b7"),
+    (&["rc"], b"\x1b8"),
+    (&["ri"], b"\x1bM"),
+    (&["cup", "2", "3"], b"\x1b[3;4H"),
+    (&["smso"], b"\x1b[7m"),
+    (&["rmso"], b"\x1b[27m"),
+    (&["sitm"], b"\x1b[3m"),
+    (&["smkx"], b"\x1b[?1h\x1b="),
+    (&["kcuu1"], b"\x1bOA"),
+    (&["khome"], b"\x1bOH"),
+    (&["kend"], b"\x1bOF"),
+    (&["kich1"], b"\x1b[2~"),
+    (&["kdch1"], b"\x1b[3~"),
+    (&["kpp"], b"\x1b[5~"),
+    (&["knp"], b"\x1b[6~"),
+    (&["kbs"], b"\x7f"),
+    (&["kcbt"], b"\x1b[Z"),
+    (&["kf5"], b"\x1b[15~"),
+    // Shift+Left/Right, not PageUp/PageDown.
+    (&["kLFT"], b"\x1b[1;2D"),
+    (&["kRIT"], b"\x1b[1;2C"),
+    (&["kmous"], b"\x1b[<"),
 ];
 
-/// Capabilities that must NOT be advertised: nora does not implement kitty
-/// graphics, image protocols, or xterm-specific key encodings. Advertising
-/// them would mislead applications into emitting sequences nora does not
-/// understand.
-const UNSUPPORTED_CAPS: &[&str] = &[
-    "kitty",
-    "kitty-graphics",
-    "kitty_keyboard",
-    "kimg",
-    "xterm-kitty",
+/// Capabilities nora does not implement, removed from the alacritty entry
+/// it is derived from (see the header comment of the source file).
+const REMOVED_CAPS: &[&str] = &[
+    "blink", "flash", "mc0", "mc4", "mc5", "mc5i", "meml", "memu", "smm", "rmm", "kb2", "Ms",
 ];
 
-/// Shared lock so parallel tests don't race on the temp directory.
-static COMPILE_LOCK: Mutex<()> = Mutex::new(());
+/// Capabilities that must not be advertised: nora's kitty graphics and
+/// keyboard support is negotiated at runtime, never claimed by terminfo.
+const UNSUPPORTED_CAPS: &[&str] = &["kitty", "kitty-graphics", "kitty_keyboard", "kimg"];
 
-/// Compile the terminfo source into a fresh temp directory and return the
-/// directory path. Panics if `tic` is unavailable or the compile fails.
-fn compile_terminfo() -> PathBuf {
-    let _guard = COMPILE_LOCK.lock().expect("terminfo compile lock poisoned");
+/// Whether the ncurses tool `name` runs (`-V` prints its version).
+fn have(name: &str) -> bool {
+    Command::new(name)
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
-    let tmp = std::env::temp_dir().join(format!(
-        "nora-terminfo-{}-{}",
+/// A compiled terminfo database in a fresh temp directory, removed on drop.
+struct Compiled(PathBuf);
+
+impl Drop for Compiled {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Compile the terminfo source into a fresh temp directory, or `None`
+/// (with a note) when ncurses' tools are missing. Panics if the compile
+/// fails or reports warnings.
+fn compile_terminfo(test: &str) -> Option<Compiled> {
+    if !(have("tic") && have("tput") && have("infocmp")) {
+        eprintln!("skipping {test}: ncurses tic/tput/infocmp not on PATH");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "nora-terminfo-{test}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos()
     ));
-    std::fs::create_dir_all(&tmp).expect("creating temp terminfo dir");
+    std::fs::create_dir_all(&dir).expect("creating temp terminfo dir");
+    let compiled = Compiled(dir);
 
     let src = PathBuf::from(TERMINFO_SRC);
     assert!(
         src.is_file(),
         "terminfo source not found at {TERMINFO_SRC} (run from the crate root)"
     );
-
     let output = Command::new("tic")
         .args(["-x", "-o"])
-        .arg(&tmp)
+        .arg(&compiled.0)
         .arg(&src)
         .output()
-        .expect("running tic (is ncurses installed?)");
-
+        .expect("running tic");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "tic failed to compile {TERMINFO_SRC}:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "tic failed to compile {TERMINFO_SRC}:\n{stderr}"
     );
-
-    // The compiled entry lands at <tmp>/n/nora.
-    let compiled = tmp.join("n").join("nora");
-    assert!(compiled.is_file(), "tic did not produce {compiled:?}");
-
-    tmp
+    assert!(
+        stderr.trim().is_empty(),
+        "tic warned about {TERMINFO_SRC}:\n{stderr}"
+    );
+    assert!(
+        compiled.0.join("n").join("nora").is_file(),
+        "tic did not produce n/nora"
+    );
+    Some(compiled)
 }
 
-/// Run `infocmp -1 nora` against a compiled terminfo directory and return
-/// its stdout.
-fn infocmp_readback(terminfo_dir: &std::path::Path) -> String {
-    let output = Command::new("infocmp")
-        .args(["-1", "nora"])
-        .env("TERMINFO", terminfo_dir)
+/// `tput -T nora <args>` against `dir`: the output bytes, or `None` when
+/// the capability is absent (tput exits non-zero).
+fn tput(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("tput")
+        .arg("-T")
+        .arg("nora")
+        .args(args)
+        .env("TERMINFO", dir)
+        .env_remove("TERMINFO_DIRS")
         .output()
-        .expect("running infocmp (is ncurses installed?)");
-
-    assert!(
-        output.status.success(),
-        "infocmp failed to read back 'nora':\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    String::from_utf8_lossy(&output.stdout).into_owned()
+        .expect("running tput");
+    output.status.success().then_some(output.stdout)
 }
 
-/// Extract the capability names from an `infocmp -1` dump. Each capability
-/// line is `name`, `name#value`, or `name=value`; the name is the token
-/// before `=`, `#`, or the end of the line.
-fn capability_names(dump: &str) -> Vec<String> {
+/// The capability names of the compiled entry (`infocmp -x -1 nora`).
+fn capability_names(dir: &Path) -> Vec<String> {
+    let output = Command::new("infocmp")
+        .args(["-x", "-1", "nora"])
+        .env("TERMINFO", dir)
+        .env_remove("TERMINFO_DIRS")
+        .output()
+        .expect("running infocmp");
+    assert!(
+        output.status.success(),
+        "infocmp failed to read back 'nora': {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        dump.contains("nora|"),
+        "infocmp did not emit 'nora':\n{dump}"
+    );
     dump.lines()
+        .filter(|line| line.starts_with('\t'))
         .filter_map(|line| {
-            let line = line.trim().trim_end_matches(',').trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("nora|") {
-                return None;
-            }
-            let name = line.split(['=', '#', ' ']).next().unwrap_or("");
-            if name.is_empty() {
-                return None;
-            }
-            Some(name.to_string())
+            let line = line.trim().trim_end_matches(',');
+            let name = line.split(['=', '#']).next()?;
+            (!name.is_empty()).then(|| name.trim_end_matches('@').to_string())
         })
         .collect()
 }
 
-/// `terminfo_compiles`: the terminfo file compiles with `tic`.
-#[test]
-fn terminfo_compiles() {
-    let tmp = compile_terminfo();
-    let _ = std::fs::remove_dir_all(&tmp);
+fn escaped(bytes: &[u8]) -> String {
+    bytes.escape_ascii().to_string()
 }
 
-/// `terminfo_readback`: the compiled terminfo can be read back with
-/// `infocmp`.
+/// The entry compiles warning-free with `tic` and needs no other entry, so
+/// a remote host without an alacritty entry can compile it.
 #[test]
-fn terminfo_readback() {
-    let tmp = compile_terminfo();
-    let dump = infocmp_readback(&tmp);
+fn terminfo_compiles_standalone() {
+    let source = std::fs::read_to_string(TERMINFO_SRC).expect("reading terminfo source");
     assert!(
-        dump.contains("nora|"),
-        "infocmp did not emit the 'nora' entry:\n{dump}"
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("use=")),
+        "{TERMINFO_SRC} must not depend on another entry via use="
     );
-    let _ = std::fs::remove_dir_all(&tmp);
+    let Some(dir) = compile_terminfo("compiles") else {
+        return;
+    };
+    assert!(capability_names(&dir.0).iter().any(|name| name == "cup"));
 }
 
-/// `terminfo_capabilities_match`: the capabilities match the tested
-/// behavior. Every capability in `EXPECTED_CAPS` must be advertised by the
-/// compiled entry.
+/// The core output and key capabilities exist and give the sequences
+/// nora implements and sends.
 #[test]
-fn terminfo_capabilities_match() {
-    let tmp = compile_terminfo();
-    let dump = infocmp_readback(&tmp);
-    let names = capability_names(&dump);
-    let mut missing = Vec::new();
-    for cap in EXPECTED_CAPS {
-        if !names.iter().any(|name| name == cap) {
-            missing.push(cap.to_string());
+fn terminfo_core_sequences() {
+    let Some(dir) = compile_terminfo("sequences") else {
+        return;
+    };
+    let mut wrong = Vec::new();
+    for (args, expected) in EXPECTED_SEQUENCES {
+        match tput(&dir.0, args) {
+            Some(actual) if actual == *expected => {}
+            Some(actual) => wrong.push(format!(
+                "{}: got {} want {}",
+                args.join(" "),
+                escaped(&actual),
+                escaped(expected)
+            )),
+            None => wrong.push(format!("{}: missing", args.join(" "))),
         }
     }
     assert!(
-        missing.is_empty(),
-        "capabilities missing from the 'nora' terminfo entry:\n  {}",
-        missing.join("\n  ")
+        wrong.is_empty(),
+        "wrong capabilities:\n  {}",
+        wrong.join("\n  ")
     );
-    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(tput(&dir.0, &["colors"]).as_deref(), Some(&b"256\n"[..]));
 }
 
-/// `terminfo_no_unsupported_keys`: no unsupported keys are advertised. The
-/// entry must not claim kitty graphics, image protocols, or xterm-specific
-/// key encodings.
+/// `sgr` composes attributes into one well-formed SGR sequence (bold,
+/// underline and reverse; the alternate charset selects G0 line drawing).
 #[test]
-fn terminfo_no_unsupported_keys() {
-    let tmp = compile_terminfo();
-    let dump = infocmp_readback(&tmp);
-    let names = capability_names(&dump);
-    let mut unsupported = Vec::new();
-    for cap in UNSUPPORTED_CAPS {
-        if names.iter().any(|name| name == cap) {
-            unsupported.push(cap.to_string());
-        }
+fn terminfo_sgr_is_sane() {
+    let Some(dir) = compile_terminfo("sgr") else {
+        return;
+    };
+    // sgr parameters: standout underline reverse blink dim bold invis
+    // protect altcharset.
+    let cases: &[(&[&str], &[u8])] = &[
+        (
+            &["0", "0", "0", "0", "0", "0", "0", "0", "0"],
+            b"\x1b(B\x1b[0m",
+        ),
+        (
+            &["0", "1", "0", "0", "0", "1", "0", "0", "0"],
+            b"\x1b(B\x1b[0;1;4m",
+        ),
+        (
+            &["1", "0", "0", "0", "0", "0", "0", "0", "0"],
+            b"\x1b(B\x1b[0;7m",
+        ),
+        (
+            &["0", "0", "1", "0", "1", "0", "1", "0", "0"],
+            b"\x1b(B\x1b[0;2;7;8m",
+        ),
+        (
+            &["0", "0", "0", "1", "0", "0", "0", "0", "0"],
+            b"\x1b(B\x1b[0m",
+        ),
+        (
+            &["0", "0", "0", "0", "0", "0", "0", "0", "1"],
+            b"\x1b(0\x1b[0m",
+        ),
+    ];
+    for (params, expected) in cases {
+        let mut args = vec!["sgr"];
+        args.extend_from_slice(params);
+        let actual = tput(&dir.0, &args).expect("sgr is defined");
+        assert_eq!(
+            escaped(&actual),
+            escaped(expected),
+            "tput sgr {}",
+            params.join(" ")
+        );
     }
+}
+
+/// Capabilities nora does not implement are not advertised.
+#[test]
+fn terminfo_no_unsupported_caps() {
+    let Some(dir) = compile_terminfo("unsupported") else {
+        return;
+    };
+    let names = capability_names(&dir.0);
+    let advertised: Vec<&str> = REMOVED_CAPS
+        .iter()
+        .chain(UNSUPPORTED_CAPS)
+        .copied()
+        .filter(|cap| names.iter().any(|name| name == cap))
+        .collect();
     assert!(
-        unsupported.is_empty(),
-        "unsupported capabilities advertised by the 'nora' terminfo entry:\n  {}",
-        unsupported.join("\n  ")
+        advertised.is_empty(),
+        "unsupported capabilities advertised: {advertised:?}"
     );
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `terminfo_ssh_fallback`: the SSH fallback is documented. The ADR and the

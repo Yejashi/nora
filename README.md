@@ -58,7 +58,7 @@ kill/yank, which a terminal that guesses from the screen gets wrong.
 - **Compatible.** xterm key and mouse encodings, the kitty keyboard
   protocol (all five flags), bracketed paste, focus events, true color,
   wide characters with per-glyph font fallback, and a `nora` terminfo
-  entry that is a subset of `xterm-256color`. vim, Neovim, tmux and htop
+  entry derived from the `alacritty` one. vim, Neovim, tmux and htop
   are exercised in CI.
 - **Images.** The kitty graphics protocol: PNG and raw RGB(A) images,
   inline or from a file, drawn at the cursor under or over the text and

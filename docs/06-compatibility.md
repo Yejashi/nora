@@ -297,38 +297,29 @@ implement. `COLORTERM=truecolor` signals validated 24-bit (true) color
 support independent of the `TERM` value. nora never sets
 `TERM=xterm-kitty` for branding.
 
-The entry source is `terminfo/nora.terminfo`. It advertises a minimal,
-test-backed capability set (every capability is backed by a test in
-`tests/`; the mapping is in the ADR):
+The entry source is `terminfo/nora.terminfo`. nora's engine is
+`alacritty_terminal`, so the entry is the ncurses `alacritty` entry renamed
+and written out in full (no `use=`), minus what nora does not implement:
+`blink`, `flash`, `mc0`/`mc4`/`mc5`/`mc5i`, `meml`/`memu`, `smm`/`rmm`,
+`kb2` and `Ms` (OSC 52 is disabled); `is2`/`rs2` drop DECSTR. It includes
+256 colors (`setaf`/`setab`/`op`/`initc`), `sgr`/`sgr0`, the scroll region
+`csr`, `sc`/`rc`, the cursor, editing, function and modified keys
+(`khome`, `kend`, `kdch1`, `kpp`, `knp`, `kf1`–`kf63`, `kLFT`/`kRIT` as
+Shift+Left/Right), SGR mouse (`kmous`, `XM`), bracketed paste, focus
+events, cursor shape (`Ss`/`Se`), colored and styled underlines (`Smulx`)
+and the window title as the status line (`hs`/`tsl`/`fsl`). The header
+comment of the file lists the removals; ADR-010 records the change.
 
-- **Boolean**: `am`, `bce`, `km`, `mir`, `msgr`, `xenl`
-- **Numeric**: `colors#256`, `pairs#65536`, `cols#80`, `lines#24`, `it#8`
-- **Cursor addressing**: `cup`, `home`
-- **Cursor movement**: `cub1`, `cud1`, `cuf1`, `cuu1` (application →
-  terminal); `kcub1`, `kcud1`, `kcuf1`, `kcuu1` (terminal → application,
-  app mode)
-- **Keys**: `kbs`, `kHOM`, `kEND`, `kIC`, `kDC`, `kLFT`, `kRIT`,
-  `kf1`–`kf12`
-- **Styles (SGR)**: `bold`, `dim`, `blink`, `invis`, `smso`, `smul`, `rev`,
-  `rmso`, `rmul`, `sgr`
-- **Modes**: `smcup`, `rmcup`, `smam`, `rmam`, `smkx`, `rmkx`
-- **Colors**: `initc` (OSC 4)
-- **Erase/clear**: `clear`, `ed`, `el`, `el1`, `dch1`, `dl1`
-- **Cursor visibility**: `civis`, `cnorm`
-- **Basic**: `cr`, `ind`, `bel`, `ht`
-
-Capabilities not listed are not advertised; nora may still accept them, but
-it does not promise them. The entry does not claim kitty graphics, image
-protocols, or xterm-specific key encodings. It compiles with `tic`, reads
-back with `infocmp`, and works with curses applications; the regression
-tests are in `tests/terminfo.rs`.
+The entry does not claim kitty graphics, image protocols or the kitty
+keyboard protocol (that is negotiated at runtime). `tests/terminfo.rs`
+compiles it with `tic` into a temporary directory and checks the core
+sequences through `tput -T nora` (skipping when ncurses is absent).
 
 For SSH and remote use, install the entry on the remote host (compile with
 `tic`; see `07-build-release.md`). Where the `nora` entry is not installed,
 nora falls back to `TERM=xterm-256color`, which is present on every Linux
-distribution. The `nora` entry is a strict subset of xterm-256color's
-capabilities, so the fallback is always safe, and no child ever sees an
-unknown or missing `TERM`. Modern features (e.g. kitty keyboard
+distribution, and whose common capabilities the engine implements, so no
+child ever sees an unknown or missing `TERM`. Modern features (e.g. kitty keyboard
 negotiation, bracketed paste, mouse reporting) are negotiated at runtime
 rather than claimed from the `TERM` string.
 

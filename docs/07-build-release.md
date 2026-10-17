@@ -118,9 +118,9 @@ The `-x` flag preserves extended capabilities. Verify the installation:
 infocmp -1 nora
 ```
 
-The `nora` entry is a strict subset of `xterm-256color`'s capabilities, so
-any host that has `xterm-256color` (every Linux distribution) can run nora
-even without the `nora` entry installed.
+The entry is standalone (no `use=`), so it compiles on hosts without an
+`alacritty` entry. Any host that has `xterm-256color` (every Linux
+distribution) can run nora even without the `nora` entry installed.
 
 ### SSH remote use
 
@@ -133,8 +133,8 @@ advertises. The fallback strategy:
    `TERM=nora`, and applications use the `nora` entry.
 2. **Fallback**: the remote host does not have the `nora` entry. The remote
    terminal falls back to `TERM=xterm-256color`, which is present on every
-   Linux distribution. This is safe because the `nora` entry is a strict
-   subset of xterm-256color.
+   Linux distribution. This works because the engine implements the xterm
+   sequences that entry's common capabilities use.
 
 To install the `nora` entry on a remote host without a local checkout of
 the nora repository, copy the source file and compile it there:
