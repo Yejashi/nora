@@ -389,6 +389,8 @@ pub struct Selection {
 /// highlight and the copied text stay on the text that was selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AnchoredSelection {
+    /// Where the selection was started (a drag extends from here).
+    anchor: (i64, usize),
     lo: (i64, usize),
     hi: (i64, usize),
 }
@@ -1304,6 +1306,7 @@ impl Engine {
             let anchor = |(row, col): (usize, usize)| (row_line_id(grid, row), col);
             let (a, b) = (anchor(start), anchor(end));
             AnchoredSelection {
+                anchor: a,
                 lo: a.min(b),
                 hi: a.max(b),
             }
@@ -1312,6 +1315,22 @@ impl Engine {
             .selection
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(anchored);
+    }
+
+    /// Move the end of the current selection to viewport `end`, keeping
+    /// the start where [`Engine::select`] anchored it: a drag that scrolls
+    /// the view (or runs while output scrolls) keeps its start on the text
+    /// it began on. Does nothing without a selection.
+    pub fn extend_selection(&self, end: (usize, usize)) {
+        let b = (row_line_id(self.term.lock().grid(), end.0), end.1);
+        let mut selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(sel) = selection.as_mut() {
+            sel.lo = sel.anchor.min(b);
+            sel.hi = sel.anchor.max(b);
+        }
     }
 
     /// Clear the selection (N14b).

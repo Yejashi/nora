@@ -226,6 +226,14 @@ pub enum PumpMsg {
         end_row: usize,
         end_col: usize,
     },
+    /// Move the end of the pane's selection to viewport
+    /// `(end_row, end_col)`, keeping its anchored start (a drag after its
+    /// first [`PumpMsg::Select`]).
+    ExtendSelection {
+        pane: PaneKey,
+        end_row: usize,
+        end_col: usize,
+    },
     /// Clear the selection for the pane (N14b); applied on the next tick.
     ClearSelection { pane: PaneKey },
     /// Copy the selection for the pane and emit [`AppEvent::Copied`]
@@ -1394,6 +1402,19 @@ pub fn pump_thread(
                             .session
                             .engine()
                             .select((start_row, start_col), (end_row, end_col));
+                        pane_pump.force_snapshot = true;
+                    }
+                }
+                PumpMsg::ExtendSelection {
+                    pane,
+                    end_row,
+                    end_col,
+                } => {
+                    if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump
+                            .session
+                            .engine()
+                            .extend_selection((end_row, end_col));
                         pane_pump.force_snapshot = true;
                     }
                 }

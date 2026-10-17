@@ -618,6 +618,9 @@ struct WinApp {
     /// Selection drag start in grid `(row, col)` (N14b): `Some` while the
     /// primary button is held down dragging a selection; `None` otherwise.
     selection: Option<(usize, usize)>,
+    /// The drag's selection was sent: later motion only moves its end, so
+    /// the start stays on the text it was anchored to if the view scrolls.
+    selection_sent: bool,
     /// Last cursor position in logical pixels (N14b): `winit` reports
     /// `CursorMoved` in physical pixels and `MouseInput` carries no
     /// position, so the drag tracks the last moved cursor.
@@ -766,6 +769,7 @@ pub fn run_windowed(
         child_exit: None,
         hold,
         selection: None,
+        selection_sent: false,
         cursor: (0.0, 0.0),
         pressed_buttons: Vec::new(),
         mouse_grab: None,
@@ -938,6 +942,7 @@ impl WinApp {
             .remove(&pane)
             .unwrap_or(TermMode::SHOW_CURSOR);
         self.selection = self.pane_selection.remove(&pane).unwrap_or(None);
+        self.selection_sent = false;
         self.last_visible = self.pane_last_visible.remove(&pane).unwrap_or_default();
         self.show_title();
     }
@@ -2920,16 +2925,26 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 if let Some((start_row, start_col)) = self.selection
                     && self.pressed_buttons.contains(&0)
                     && let Some((end_row, end_col)) = self.grid_cell_at(&window, x, y)
-                    && (end_row, end_col) != (start_row, start_col)
+                    && (self.selection_sent || (end_row, end_col) != (start_row, start_col))
                     && let Some(pane) = self.active_pane_key()
                 {
-                    let _ = self.pump_commands.send(PumpMsg::Select {
-                        pane,
-                        start_row,
-                        start_col,
-                        end_row,
-                        end_col,
-                    });
+                    let msg = if self.selection_sent {
+                        PumpMsg::ExtendSelection {
+                            pane,
+                            end_row,
+                            end_col,
+                        }
+                    } else {
+                        PumpMsg::Select {
+                            pane,
+                            start_row,
+                            start_col,
+                            end_row,
+                            end_col,
+                        }
+                    };
+                    self.selection_sent = true;
+                    let _ = self.pump_commands.send(msg);
                 }
                 // N16b: report the motion to the terminal (gated by the
                 // engine's mouse mode inside `send_mouse_event`; `X10`
@@ -2996,6 +3011,7 @@ impl ApplicationHandler<AppEvent> for WinApp {
                                 let _ = self.pump_commands.send(PumpMsg::ClearSelection { pane });
                             }
                             self.selection = self.grid_cell_at(&window, x, y);
+                            self.selection_sent = false;
                         }
                         ElementState::Released => {
                             self.selection = None;

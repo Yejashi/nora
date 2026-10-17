@@ -250,3 +250,28 @@ fn selection_follows_its_text_when_the_view_scrolls() {
     assert_eq!((sel.start, sel.end), ((4, 0), (4, 19)));
     assert_eq!(engine.copy_selection(), Some(padded));
 }
+
+/// A drag extends from where it started: scrolling the view mid-drag
+/// keeps the start on its text, and dragging back over the start shrinks
+/// the selection to it.
+#[test]
+fn extending_a_selection_keeps_its_anchored_start() {
+    let engine = numbered(5, 12);
+    // Rows: L08 L09 L10 L11 (blank). Start the drag on L10.
+    engine.select((2, 0), (2, 2));
+    engine.scroll(Scroll::Delta(1));
+    // L10 is now row 3; the pointer at row 1 is over L08.
+    engine.extend_selection((1, 0));
+    // From the pointer to the anchored start (L10, column 0).
+    let padded = format!("L08{}\nL09{}\nL", " ".repeat(17), " ".repeat(17));
+    assert_eq!(engine.copy_selection(), Some(padded));
+    engine.extend_selection((3, 0));
+    assert_eq!(
+        engine.copy_selection().as_deref(),
+        Some("L"),
+        "back on the start"
+    );
+    engine.clear_selection();
+    engine.extend_selection((0, 0));
+    assert!(engine.copy_selection().is_none(), "nothing to extend");
+}
