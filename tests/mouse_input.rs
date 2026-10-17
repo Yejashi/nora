@@ -23,7 +23,7 @@
 use alacritty_terminal::term::TermMode;
 use nora::input::focus::encode_focus_event;
 use nora::input::mouse::{
-    MouseEncoding, MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number,
+    MouseEncoding, MouseEvent, MouseKind, MouseMode, MouseModifiers, button_number, cell_in_pane,
     encode_mouse_event, logical_to_cell, mouse_modifiers, physical_to_cell, should_report,
     track_button, wheel_directions,
 };
@@ -532,4 +532,46 @@ fn wheel_directions_zero_is_nothing() {
         ))),
         Vec::<MouseKind>::new()
     );
+}
+
+#[test]
+fn cell_in_pane_maps_inside_and_rejects_outside_without_clamp() {
+    // A pane at (10, 1) of 20 x 5 cells.
+    let rect = (10, 1, 20, 5);
+    assert_eq!(cell_in_pane(10, 1, rect, false), Some((0, 0)));
+    assert_eq!(cell_in_pane(29, 5, rect, false), Some((19, 4)));
+    assert_eq!(cell_in_pane(9, 3, rect, false), None);
+    assert_eq!(cell_in_pane(30, 3, rect, false), None);
+    assert_eq!(cell_in_pane(15, 0, rect, false), None);
+    assert_eq!(cell_in_pane(15, 6, rect, false), None);
+}
+
+#[test]
+fn cell_in_pane_clamps_a_grabbed_release_to_the_pane_edge() {
+    let rect = (10, 1, 20, 5);
+    // Left of / above the pane (another pane, the tab bar): first cell.
+    assert_eq!(cell_in_pane(0, 0, rect, true), Some((0, 0)));
+    // Right of / below the pane (another pane, the margin): last cell.
+    assert_eq!(cell_in_pane(200, 100, rect, true), Some((19, 4)));
+    // Mixed: one axis inside, the other clamped.
+    assert_eq!(cell_in_pane(12, 50, rect, true), Some((2, 4)));
+    // Inside is unchanged by clamping.
+    assert_eq!(cell_in_pane(12, 2, rect, true), Some((2, 1)));
+    // An empty pane reports nothing.
+    assert_eq!(cell_in_pane(0, 0, (0, 0, 0, 3), true), None);
+}
+
+#[test]
+fn clamped_release_encodes_as_an_sgr_release() {
+    let rect = (10, 1, 20, 5);
+    let (col, row) = cell_in_pane(300, 0, rect, true).expect("clamped");
+    let event = MouseEvent {
+        kind: MouseKind::Release,
+        button: Some(0),
+        col,
+        row,
+        modifiers: MouseModifiers::default(),
+    };
+    let bytes = encode_mouse_event(MouseMode::CellMotion, MouseEncoding::Sgr, &event, 20, 5);
+    assert_eq!(bytes.as_deref(), Some(&b"\x1b[<0;20;1m"[..]));
 }

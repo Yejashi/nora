@@ -237,6 +237,34 @@ pub fn should_report(mode: MouseMode, shift: bool) -> bool {
     !shift && mode != MouseMode::None
 }
 
+/// Map a window cell `(col, row)` to the pane at `(px, py)` of `w` x `h`
+/// cells, as the pane's own 0-based `(col, row)`. A position outside the
+/// pane is `None`, unless `clamp` is set (the release or drag of a button
+/// pressed inside the pane): it is then clamped to the pane's nearest edge
+/// cell, as xterm and alacritty do, so the application always sees the
+/// release that ends its drag. An empty pane is always `None`.
+pub fn cell_in_pane(
+    col: u16,
+    row: u16,
+    (px, py, w, h): (u16, u16, u16, u16),
+    clamp: bool,
+) -> Option<(u16, u16)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let inside =
+        (px..px.saturating_add(w)).contains(&col) && (py..py.saturating_add(h)).contains(&row);
+    if inside {
+        return Some((col - px, row - py));
+    }
+    clamp.then(|| {
+        (
+            col.saturating_sub(px).min(w - 1),
+            row.saturating_sub(py).min(h - 1),
+        )
+    })
+}
+
 /// Map a logical-pixel position to the grid `(col, row)` (N16b): the pinned
 /// mono cell metrics are logical pixels (N11a), so the position is divided
 /// by the cell size and truncated. `None` when a cell metric is not

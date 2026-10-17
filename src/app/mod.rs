@@ -38,8 +38,9 @@ use nora::input::bindings::{Action as UiAction, Bindings, Direction};
 use nora::input::focus::encode_focus_event;
 use nora::input::kitty::{self, Kitty};
 use nora::input::mouse::{
-    MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, encode_mouse_event,
-    logical_to_cell, mouse_modifiers, should_report, track_button, wheel_directions,
+    MouseEncoding, MouseEvent, MouseKind, MouseMode, button_number, cell_in_pane,
+    encode_mouse_event, logical_to_cell, mouse_modifiers, should_report, track_button,
+    wheel_directions,
 };
 use nora::input::{BindingTable, InputAction, encode};
 use nora::layout::{Layout, LayoutNode, PaneId, SplitDirection};
@@ -618,6 +619,10 @@ struct WinApp {
     /// events report the first held button; each release removes its
     /// button.
     pressed_buttons: Vec<u8>,
+    /// The pane a reported mouse press landed in, until every button is
+    /// released: its drag motion and releases are reported clamped into
+    /// it even when the pointer leaves it.
+    mouse_grab: Option<PaneKey>,
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
@@ -753,6 +758,7 @@ pub fn run_windowed(
         selection: None,
         cursor: (0.0, 0.0),
         pressed_buttons: Vec::new(),
+        mouse_grab: None,
         clipboard: create_clipboard(),
         zoom: nora::config::ZOOM_DEFAULT,
         palette: Palette::from_config(config),
@@ -1754,29 +1760,37 @@ impl WinApp {
     /// the current window grid, and send the bytes to the PTY (N16b).
     /// No-op when Shift is held (the event belongs to local selection),
     /// the terminal reports no mouse, or the fonts are not loaded yet.
-    fn send_mouse_event(&self, event: &MouseEvent, window: &Window) {
+    fn send_mouse_event(&mut self, event: &MouseEvent, window: &Window) {
+        let _ = window;
+        let pane = self.active_pane_key();
+        // The grab started by a press ends with the last release, whatever
+        // happens to this event.
+        let grabbed = pane.is_some() && self.mouse_grab == pane;
+        if event.kind == MouseKind::Release && self.pressed_buttons.is_empty() {
+            self.mouse_grab = None;
+        }
         let mode = MouseMode::from_term_mode(self.modes);
         if !should_report(mode, self.mods.shift_key()) {
             return;
         }
-        let _ = window;
-        // Window cells to the active pane's own grid; events outside the
-        // pane are not reported.
-        let Some((px, py, w, h)) = self.active_pane_rect() else {
+        let (Some(pane), Some(rect)) = (pane, self.active_pane_rect()) else {
             return;
         };
-        if event.col < px || event.row < py {
+        // Window cells to the active pane's own grid. Events outside the
+        // pane are not reported, except the drag motion and release of a
+        // press made inside it, which are clamped to its edge.
+        let clamp = grabbed
+            && (event.kind == MouseKind::Release
+                || (event.kind == MouseKind::Motion && event.button.is_some()));
+        let Some((col, row)) = cell_in_pane(event.col, event.row, rect, clamp) else {
             return;
+        };
+        if event.kind == MouseKind::Press {
+            self.mouse_grab = Some(pane);
         }
-        let event = MouseEvent {
-            col: event.col - px,
-            row: event.row - py,
-            ..*event
-        };
+        let event = MouseEvent { col, row, ..*event };
         let encoding = MouseEncoding::from_term_mode(self.modes);
-        if let Some(bytes) = encode_mouse_event(mode, encoding, &event, w, h)
-            && let Some(pane) = self.active_pane_key()
-        {
+        if let Some(bytes) = encode_mouse_event(mode, encoding, &event, rect.2, rect.3) {
             let _ = self.pump_commands.send(PumpMsg::Input { pane, bytes });
         }
     }
