@@ -283,8 +283,8 @@ Method and raw numbers are in [docs/performance/](docs/performance/).
   - font ligatures.
 - **Input methods.** Composition is checked end to end with ibus over
   X11 (preedit, commit, suggestions hidden while composing). fcitx5, the
-  Wayland text-input path and the placement of a candidate window have
-  not been checked by a test.
+  Wayland text-input path and the drawing of a candidate window have not
+  been checked by a test (the spot nora reports to the input method is).
 - **Wayland clipboard.** The clipboard goes through XWayland, so it
   needs XWayland running.
 - **Suggestions** need zsh with the integration script.

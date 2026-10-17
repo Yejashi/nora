@@ -137,10 +137,16 @@ fn platform_hint() -> String {
     }
 }
 
-/// The grid that fits the window's physical inner size: the cell metrics
-/// in [`glyphs::Fonts`] are physical pixels (they include the scale factor
-/// and zoom), so the grid, the renderer and the mouse mapping agree at
-/// every scale.
+/// Whether `window` is an X11 window (by its raw handle, not by guessing
+/// from the environment).
+fn is_x11(window: &Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    matches!(
+        window.window_handle().map(|handle| handle.as_raw()),
+        Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_))
+    )
+}
+
 /// Open a hyperlink with the platform opener on a short-lived thread (the
 /// spawn and wait stay off the window thread). Disallowed schemes are
 /// ignored.
@@ -223,6 +229,10 @@ fn watch_config(path: std::path::PathBuf, proxy: winit::event_loop::EventLoopPro
     }
 }
 
+/// The grid that fits the window's physical inner size: the cell metrics
+/// in [`glyphs::Fonts`] are physical pixels (they include the scale factor
+/// and zoom), so the grid, the renderer and the mouse mapping agree at
+/// every scale.
 pub(crate) fn window_grid(window: &Window, fonts: &glyphs::Fonts) -> (u16, u16) {
     let size = window.inner_size();
     glyphs::grid_size(size.width, size.height, fonts.cell_w, fonts.cell_h())
@@ -1911,10 +1921,16 @@ impl WinApp {
                         let fg = [mix(fg.r, bg[0]), mix(fg.g, bg[1]), mix(fg.b, bg[2]), 255];
                         scene.add_ghost_text(ghost, row, col, right, fg, bg);
                     }
+                    // X11's XIM takes only a point, the spot where text is
+                    // inserted, and input methods open their candidate
+                    // window below it (pinned winit drops the size there):
+                    // give the cell's bottom-left, or the candidates cover
+                    // the line being edited. Wayland takes the rectangle.
+                    let spot_row = if is_x11(window) { row + 1 } else { row };
                     window.set_ime_cursor_area(
                         winit::dpi::PhysicalPosition::new(
                             col as f32 * layout.cell_w,
-                            row as f32 * layout.cell_h,
+                            spot_row as f32 * layout.cell_h,
                         ),
                         winit::dpi::PhysicalSize::new(
                             covered as f32 * layout.cell_w,

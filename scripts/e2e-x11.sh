@@ -894,6 +894,7 @@ RC
 scenario_ime() {
     have ibus-daemon ime || return
     have dbus-daemon ime || return
+    have dbus-monitor ime || return
     have zsh ime || return
     local dir="$OUT/ime"; rm -rf "$dir"; mkdir -p "$dir/zdot" "$dir/ibus"
     cat >"$dir/zdot/.zshrc" <<RC
@@ -917,7 +918,10 @@ RC
             ibus engine xkb:us::eng 2>/dev/null && echo set) && break
         sleep 0.1
     done
-    stop_ime() { kill "$ibus_pid" "$bus_pid" 2>/dev/null; unset DBUS_SESSION_BUS_ADDRESS; }
+    # The cursor area nora reports reaches ibus as SetCursorLocation.
+    dbus-monitor --address "unix:abstract=nora-e2e-ibus-$$" >"$dir/monitor.txt" 2>&1 &
+    local monitor_pid=$!
+    stop_ime() { kill "$monitor_pid" "$ibus_pid" "$bus_pid" 2>/dev/null; unset DBUS_SESSION_BUS_ADDRESS; }
     [ "$engine" = set ] || { stop_ime; fail ime "ibus did not start"; return; }
     XMODIFIERS=@im=ibus ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch ime zsh -d -i \
         || { stop_ime; fail ime "no window"; return; }
@@ -931,6 +935,9 @@ RC
     shot "$dir/ghost.png"
     xdotool key ctrl+shift+u; xdotool type --delay 50 "00e9"; sleep 0.5
     shot "$dir/preedit.png"
+    local composing_lines
+    composing_lines=$(wc -l <"$dir/monitor.txt")
+    eval "$(xdotool getwindowgeometry --shell "$WIN" | grep -E '^(X|Y|WIDTH|HEIGHT)=')"
     xdotool key space; sleep 0.3
     xdotool type --delay 30 " >> $dir/out.txt"; xdotool key Return
     for _ in $(seq 1 30); do [ "$(wc -l <"$dir/out.txt" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
@@ -946,6 +953,15 @@ RC
     [ "$preedit" -le $((plain + 50)) ] || { fail ime "ghost text drawn while composing"; return; }
     [ "$(cat "$dir/out.txt")" = "$(printf 'ime-beta-1\nimeé')" ] \
         || { fail ime "committed text differs: $(tr '\n' '|' <"$dir/out.txt")"; return; }
+    # Candidate placement: while composing at row 1, column 10 ("% echo ime"),
+    # the XIM spot is the bottom-left of the cursor cell in root coordinates
+    # (the window is sized to the 80x24 grid).
+    local spot want
+    spot=$(head -n "$composing_lines" "$dir/monitor.txt" \
+        | awk '/InputContext.*member=SetCursorLocation/{getline x; getline y; split(x, a, " "); split(y, b, " "); s=a[2] "," b[2]} END{print s}')
+    want="$((X + 10 * WIDTH / 80)),$((Y + 2 * HEIGHT / 24))"
+    echo "  ime spot: $spot (expected $want)"
+    [ "$spot" = "$want" ] || { fail ime "candidate spot $spot, expected $want (bottom-left of the cursor cell)"; return; }
     pass ime
 }
 
