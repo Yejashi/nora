@@ -210,6 +210,8 @@ Pure encoding in `src/input/mouse.rs` (`encode_mouse_event`), headless fixtures 
 
 Selection uses engine-supported coordinates and wrapped-line information. Copy joins soft wraps without injecting newlines, preserves real newlines, and handles wide spacers/combining marks. During history trimming or reflow, use the engine's selection remapping or invalidate visibly; do not retain stale raw row indices.
 
+Implemented: the engine stores the selection (and with it the search-hit highlight) as `(line id, col)` bounds, where a line id is the grid line plus the lines scrolled into history, so output and viewport scrolling move the highlight with its text and copy takes that text even while it is off screen; lines trimmed from the history are skipped (`tests/selection.rs`). Not yet: a drag's start cell is re-anchored on each motion from viewport coordinates, so scrolling the view during a drag moves the start; copy still inserts a newline at soft wraps; whether reflow on resize keeps the anchor on its text is unverified.
+
 ## Scrollback search (N20a)
 
 Literal search over an owned scrollback snapshot (`nora::search`, headless fixtures in `tests/search.rs`). Search is core terminal-state logic: the engine and session are untouched, and the search never reaches into unbounded history.

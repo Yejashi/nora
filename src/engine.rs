@@ -54,7 +54,7 @@ pub struct Engine {
     /// Shared selection state (N14b): the window thread and pump thread
     /// both touch it through `&self` accessors, so it lives behind a
     /// mutex. `None` when nothing is selected.
-    selection: Arc<Mutex<Option<Selection>>>,
+    selection: Arc<Mutex<Option<AnchoredSelection>>>,
     /// The prompt-marker and graphics filters for [`Engine::feed`] (the PTY
     /// path runs its own [`crate::stream::StreamFilter`] on the same state).
     stream: crate::stream::StreamFilter,
@@ -380,6 +380,31 @@ impl CellText {
 pub struct Selection {
     pub start: (usize, usize),
     pub end: (usize, usize),
+}
+
+/// The stored selection: `(line id, col)` bounds in row-major order, where
+/// a line id is the grid line plus [`line_shift`] (stable while output
+/// scrolls lines into history and while the viewport scrolls), so the
+/// highlight and the copied text stay on the text that was selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnchoredSelection {
+    lo: (i64, usize),
+    hi: (i64, usize),
+}
+
+impl AnchoredSelection {
+    /// Whether the cell at (`line_id`, `col`) lies in the range.
+    fn contains(&self, line_id: i64, col: usize) -> bool {
+        (line_id, col) >= self.lo && (line_id, col) <= self.hi
+    }
+}
+
+/// The line id of viewport row `row` (see [`AnchoredSelection`]).
+fn row_line_id(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    row: usize,
+) -> i64 {
+    row as i64 - grid.display_offset() as i64 + line_shift(grid)
 }
 
 /// One owned screen snapshot with viewport metadata.
@@ -1248,11 +1273,26 @@ impl Engine {
     /// Set the selection to the range `start..=end` in viewport
     /// `(row, col)` coordinates (N14b). The range is linear row-major;
     /// `start` and `end` may be given in either order.
+    ///
+    /// The range is anchored to the text under it when it is set: output
+    /// that scrolls lines into history and viewport scrolling move the
+    /// highlight with that text, and copying takes it even once it is off
+    /// screen (lines that left the history are skipped).
     pub fn select(&self, start: (usize, usize), end: (usize, usize)) {
+        let anchored = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            let anchor = |(row, col): (usize, usize)| (row_line_id(grid, row), col);
+            let (a, b) = (anchor(start), anchor(end));
+            AnchoredSelection {
+                lo: a.min(b),
+                hi: a.max(b),
+            }
+        };
         *self
             .selection
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Selection { start, end });
+            .unwrap_or_else(PoisonError::into_inner) = Some(anchored);
     }
 
     /// Clear the selection (N14b).
@@ -1263,12 +1303,36 @@ impl Engine {
             .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
-    /// The current selection, if any (N14b).
+    /// The current selection in viewport coordinates, `start` before `end`
+    /// (N14b), clipped to the viewport: a part above the view starts at
+    /// the top-left cell, a part below ends at the bottom-right one.
+    /// `None` when nothing is selected or the selection is entirely off
+    /// screen (it still exists for [`Engine::copy_selection`]).
     pub fn selection(&self) -> Option<Selection> {
-        *self
+        let sel = (*self
             .selection
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner))?;
+        if self.rows == 0 || self.cols == 0 {
+            return None;
+        }
+        let term = self.term.lock();
+        let top = row_line_id(term.grid(), 0);
+        let bottom = top + self.rows as i64 - 1;
+        if sel.hi.0 < top || sel.lo.0 > bottom {
+            return None;
+        }
+        let start = if sel.lo.0 < top {
+            (0, 0)
+        } else {
+            ((sel.lo.0 - top) as usize, sel.lo.1)
+        };
+        let end = if sel.hi.0 > bottom {
+            (self.rows - 1, self.cols - 1)
+        } else {
+            ((sel.hi.0 - top) as usize, sel.hi.1)
+        };
+        Some(Selection { start, end })
     }
 
     /// Copy the selected text (N14b).
@@ -1284,39 +1348,43 @@ impl Engine {
             .unwrap_or_else(PoisonError::into_inner))?;
         let term = self.term.lock();
         let grid = term.grid();
-        let display_offset = grid.display_offset();
-        let rows = self.rows;
-        let cols = self.cols;
-        let start = sel.start.0 * cols + sel.start.1;
-        let end = sel.end.0 * cols + sel.end.1;
-        let lo = start.min(end);
-        let hi = start.max(end);
+        let shift = line_shift(grid);
+        let cols = grid.columns();
+        let topmost = grid.topmost_line().0 as i64;
+        let bottommost = grid.bottommost_line().0 as i64;
         let mut out = String::new();
-        let mut prev_row: Option<usize> = None;
-        for i in lo..=hi {
-            // Guard against a concurrent resize that shrank the grid below
-            // the selection range.
-            if i >= rows * cols {
-                break;
-            }
-            let row = i / cols;
-            let col = i % cols;
-            let grid_line = Line(row as i32 - display_offset as i32);
-            let cell = &grid[grid_line][Column(col)];
-            // Skip wide-char spacers: a wide char occupies two cells; the
-            // second (spacer) cell carries a placeholder space and must
-            // not be duplicated in the copied text.
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
+        let mut prev_row: Option<i64> = None;
+        for line_id in sel.lo.0..=sel.hi.0 {
+            // Lines that left the history (or a grid that a resize shrank
+            // below the range) have nothing to copy.
+            let line = line_id - shift;
+            if line < topmost || line > bottommost || cols == 0 {
                 continue;
             }
-            if prev_row.is_some() && prev_row != Some(row) {
-                out.push('\n');
+            let first = if line_id == sel.lo.0 { sel.lo.1 } else { 0 };
+            let last = if line_id == sel.hi.0 {
+                sel.hi.1.min(cols - 1)
+            } else {
+                cols - 1
+            };
+            let row = &grid[Line(line as i32)];
+            for col in first..=last {
+                let cell = &row[Column(col)];
+                // Skip wide-char spacers: a wide char occupies two cells;
+                // the second (spacer) cell carries a placeholder space and
+                // must not be duplicated in the copied text.
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                if prev_row.is_some() && prev_row != Some(line_id) {
+                    out.push('\n');
+                }
+                prev_row = Some(line_id);
+                out.push(cell.c);
             }
-            prev_row = Some(row);
-            out.push(cell.c);
         }
         Some(out)
     }
@@ -1373,7 +1441,7 @@ impl Engine {
             .map(|p| (p.line, p.column.0));
 
         // Per-cell selection state (N14b): a cell is selected iff its
-        // row-major index lies within the current selection range.
+        // anchored `(line id, col)` lies within the current selection range.
         let selected = {
             let sel = self
                 .selection
@@ -1381,15 +1449,14 @@ impl Engine {
                 .unwrap_or_else(PoisonError::into_inner);
             let mut selected = vec![false; self.rows * self.cols];
             if let Some(sel) = sel.as_ref() {
-                let start = sel.start.0 * self.cols + sel.start.1;
-                let end = sel.end.0 * self.cols + sel.end.1;
-                let lo = start.min(end);
-                let hi = start.max(end);
-                for i in lo..=hi {
-                    // Guard against a concurrent resize that shrank the
-                    // grid below the selection range.
-                    if i < selected.len() {
-                        selected[i] = true;
+                let top = row_line_id(term.grid(), 0);
+                for (row, cells) in selected.chunks_mut(self.cols.max(1)).enumerate() {
+                    let line_id = top + row as i64;
+                    if line_id < sel.lo.0 || line_id > sel.hi.0 {
+                        continue;
+                    }
+                    for (col, cell) in cells.iter_mut().enumerate() {
+                        *cell = sel.contains(line_id, col);
                     }
                 }
             }

@@ -187,3 +187,66 @@ fn selection_after_scroll() {
         "scrolled up by 10: the top visible row is around L07; got line {line_no}"
     );
 }
+
+/// A small engine with history whose rows read `L00`, `L01`, ...: after
+/// `lines` lines, the screen shows the last `rows - 1` of them.
+fn numbered(rows: usize, lines: u32) -> Engine {
+    let mut engine = Engine::with_history(rows, 20, 100);
+    for i in 0..lines {
+        engine.feed(format!("L{i:02}\r\n").as_bytes());
+    }
+    engine
+}
+
+/// The text of viewport row `row` in `snap`'s selected cells.
+fn selected_text(engine: &mut Engine) -> String {
+    let snap = engine.snapshot();
+    let mut out = String::new();
+    for cell in &snap.cells {
+        if snap.selected[cell.row * snap.cols + cell.col] && cell.ch != ' ' {
+            out.push(cell.ch);
+        }
+    }
+    out
+}
+
+/// The selection stays on the text it was made on when output scrolls
+/// the screen: the highlight moves up with the line and copy takes it.
+#[test]
+fn selection_follows_its_text_when_output_scrolls() {
+    let mut engine = numbered(5, 6);
+    // Rows: L02 L03 L04 L05 (blank). Select L03.
+    engine.select((1, 0), (1, 2));
+    assert_eq!(engine.copy_selection().as_deref(), Some("L03"));
+    engine.feed(b"L06\r\nL07\r\n");
+    assert_eq!(
+        engine.copy_selection().as_deref(),
+        Some("L03"),
+        "new output does not change what is selected"
+    );
+    assert_eq!(selected_text(&mut engine), "", "L03 scrolled off screen");
+    assert!(engine.selection().is_none(), "off screen: nothing to clip");
+    engine.scroll(Scroll::Delta(2));
+    assert_eq!(selected_text(&mut engine), "L03", "highlight is on L03");
+    let sel = engine.selection().expect("on screen again");
+    assert_eq!((sel.start, sel.end), ((1, 0), (1, 2)));
+}
+
+/// Scrolling the viewport moves the highlight with the text.
+#[test]
+fn selection_follows_its_text_when_the_view_scrolls() {
+    let mut engine = numbered(5, 12);
+    // Rows: L08 L09 L10 L11 (blank). Select L10..L11.
+    engine.select((2, 0), (3, 2));
+    engine.scroll(Scroll::Delta(1));
+    assert_eq!(selected_text(&mut engine), "L10L11");
+    let sel = engine.selection().expect("still visible");
+    assert_eq!((sel.start, sel.end), ((3, 0), (4, 2)));
+    let padded = format!("L10{}\nL11", " ".repeat(17));
+    assert_eq!(engine.copy_selection(), Some(padded.clone()));
+    // A selection partly below the view is clipped at the bottom.
+    engine.scroll(Scroll::Delta(1));
+    let sel = engine.selection().expect("partly visible");
+    assert_eq!((sel.start, sel.end), ((4, 0), (4, 19)));
+    assert_eq!(engine.copy_selection(), Some(padded));
+}
