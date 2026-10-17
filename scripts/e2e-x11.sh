@@ -739,7 +739,10 @@ RC
 scenario_tmux() {
     have tmux tmux || return
     local dir="$OUT/tmux"; mkdir -p "$dir"
-    launch tmux tmux -L nora-e2e -f /dev/null new-session "printf 'TMUX PANE TEXT\\n'; sleep 30" \
+    # tmux 3.8 defaults to `bg=themegreen` (not ANSI green); pin the 3.x
+    # default so the check is the same on every version.
+    echo "set -g status-style bg=green,fg=black" >"$dir/tmux.conf"
+    launch tmux tmux -L nora-e2e -f "$dir/tmux.conf" new-session "printf 'TMUX PANE TEXT\\n'; sleep 30" \
         || { fail tmux "no window"; return; }
     sleep 1.5
     shot "$dir/shot.png"
