@@ -78,8 +78,9 @@ Option 4, with these parts:
   (b) path completion for the token under the cursor, from the pane's
   reported cwd; (c) executable names on the shell's PATH for the first
   token. Stored in `$XDG_STATE_HOME/nora/history` with a size cap; disabled
-  entirely with `[autocomplete] enabled = false`; never stores lines typed
-  while the tty has ECHO off.
+  entirely with `[autocomplete] enabled = false`. Only command lines the
+  shell reports executing are stored, so text typed at a password prompt
+  (which the shell never reports) is not.
 - **Rendering.** Ghost text after the cursor in a dim color, through the
   same scene path as the IME preedit; never written into the grid.
 - **Acceptance.** Right arrow or End with the cursor at the end of the
@@ -88,8 +89,10 @@ Option 4, with these parts:
   bytes. Every other key passes through unchanged and the next buffer
   report recomputes or clears the suggestion. Keys are configurable.
 - **Suppression.** No suggestion when: no current buffer report; alternate
-  screen; IME composition active; the PTY's ECHO flag is off (password
-  prompts); a bracketed paste is in flight; the pane is not focused.
+  screen; IME composition active; the tty is in password input (canonical
+  mode with ECHO off; a line editor clears ECHO too but also leaves
+  canonical mode, so it does not count); a bracketed paste is in flight;
+  the pane is not focused.
 
 ## Consequences
 
@@ -149,8 +152,13 @@ Option 4, with these parts:
    drawn, Right then Enter runs exactly the suggested command, history
    saved. vim and `read -s` are excluded by construction (no buffer report
    outside the input phase); the alternate screen and an in-flight paste
-   are checked too. **Open:** the ECHO-off check (the PTY master is owned
-   by the event loop); the IME case is unverified with a real input
+   are checked too. **Done 2026-10-17:** the password-input check: the
+   session keeps a close-on-exec duplicate of the PTY master and reads
+   its line discipline (`PtySession::password_input`, ICANON set and ECHO
+   clear; measured: zsh ZLE runs `-icanon -echo`, `read -s` `icanon
+   -echo`); the pump re-reads it while a buffer is current and clears the
+   suggestion when it turns on. An unreadable mode counts as password
+   input. **Open:** the IME case is unverified with a real input
    method. (SIGTERM/SIGHUP/SIGINT now close nora in order and save the
    history: `src/signals.rs`, Unix only.)
 5. Measure keystroke-to-ghost-text latency and the cost of the zsh hook.

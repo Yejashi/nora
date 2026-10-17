@@ -440,6 +440,9 @@ struct PanePump {
     /// The shell's last reported editor buffer (ADR-013), for change
     /// detection.
     shell_buffer: Option<crate::shell_input::LineBuffer>,
+    /// Whether the terminal was in password input at the last buffer
+    /// check (ADR-013), for change detection.
+    password_input: bool,
 }
 
 impl PanePump {
@@ -457,6 +460,7 @@ impl PanePump {
             drain_deadline: None,
             exit_status: None,
             shell_buffer: None,
+            password_input: false,
         }
     }
 }
@@ -565,7 +569,8 @@ impl Suggestions {
 /// ADR-013: fold the pane's executed commands into the history and, when
 /// its editor buffer changed, send the window the suggestion for it. No
 /// suggestion with the cursor before the end of the buffer, on the
-/// alternate screen, or while a paste is being delivered.
+/// alternate screen, while a paste is being delivered, or while the
+/// terminal is set up for password input.
 fn update_suggestion(
     pane: PaneKey,
     pane_pump: &mut PanePump,
@@ -573,21 +578,25 @@ fn update_suggestion(
     events: &winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let now = unix_now();
-    let engine = pane_pump.session.engine();
-    let executed = engine.take_executed();
+    let executed = pane_pump.session.engine().take_executed();
     if let Some(s) = suggestions.as_mut() {
         for command in &executed {
             s.history
                 .record(&command.cmdline, command.cwd.as_deref(), command.exit, now);
         }
     }
-    let buffer = engine.shell_buffer();
-    if buffer == pane_pump.shell_buffer {
+    let buffer = pane_pump.session.engine().shell_buffer();
+    // The mode is read only while a buffer could be suggested for (one
+    // `tcgetattr`); a change in it alone recomputes the suggestion.
+    let password_input = buffer.is_some() && pane_pump.session.password_input();
+    if buffer == pane_pump.shell_buffer && password_input == pane_pump.password_input {
         return;
     }
+    let engine = pane_pump.session.engine();
     let suffix = match (&buffer, suggestions.as_mut()) {
         (Some(b), Some(s))
             if b.cursor_at_end()
+                && !password_input
                 && !engine.modes().contains(TermMode::ALT_SCREEN)
                 && pane_pump.paste_block.is_none() =>
         {
@@ -600,9 +609,13 @@ fn update_suggestion(
             Some(b) => eprintln!("shell: buffer {:?} cursor {}", b.text, b.cursor),
             None => eprintln!("shell: buffer none"),
         }
+        if password_input {
+            eprintln!("shell: password input");
+        }
         eprintln!("shell: suggestion {suffix:?}");
     }
     pane_pump.shell_buffer = buffer;
+    pane_pump.password_input = password_input;
     let _ = events.send_event(AppEvent::Suggestion { pane, suffix });
 }
 

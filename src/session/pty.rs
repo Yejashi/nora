@@ -318,6 +318,10 @@ pub struct PtySession {
     /// The child's pid, which is also its process group id.
     #[cfg(unix)]
     child_pid: libc::pid_t,
+    /// A duplicate of the PTY master for reading the terminal mode
+    /// (`password_input`); `None` after `close`.
+    #[cfg(unix)]
+    master: Option<std::fs::File>,
     /// Colors for OSC 4/10/11/12 queries the application did not set.
     palette: crate::render::palette::Palette,
     /// Bytes sent as `Msg::Input` and not yet written (decremented by the
@@ -412,6 +416,12 @@ impl PtySession {
         // process group id; kept for kill escalation in `close`.
         #[cfg(unix)]
         let child_pid = pty.child().id() as libc::pid_t;
+        // A close-on-exec duplicate of the master, so `password_input` can
+        // read the line discipline after the loop thread takes the PTY.
+        // It does not delay the child's hangup: dropping the pinned `Pty`
+        // sends SIGHUP itself.
+        #[cfg(unix)]
+        let master = pty.file().try_clone().map_err(PtyError::Spawn)?;
 
         // The slave keeps the kernel's cooked line discipline (ICANON,
         // ECHO, ISIG, ICRNL, OPOST|ONLCR); the pinned `tty::new` adds only
@@ -489,6 +499,8 @@ impl PtySession {
             in_flight,
             #[cfg(unix)]
             child_pid,
+            #[cfg(unix)]
+            master: Some(master),
             loop_handle: Some(loop_handle),
             lifecycle,
             done,
@@ -725,6 +737,10 @@ impl PtySession {
         {
             let _ = handle.join();
         }
+        #[cfg(unix)]
+        {
+            self.master = None;
+        }
         *self
             .lifecycle
             .lock()
@@ -766,6 +782,38 @@ impl PtySession {
     #[cfg(unix)]
     pub fn child_pid(&self) -> libc::pid_t {
         self.child_pid
+    }
+
+    /// Whether the child's terminal is set up for password input
+    /// (ADR-013): canonical input with echo off, as `getpass`, `sudo` and
+    /// `read -s` leave it. A shell's line editor turns echo off as well
+    /// but also leaves canonical mode, so it does not count. `true` when
+    /// the mode cannot be read (the session is closed, or the call
+    /// fails), so nothing is suggested into a terminal in an unknown mode.
+    #[cfg(unix)]
+    pub fn password_input(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(master) = &self.master else {
+            return true;
+        };
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: the fd is open for as long as `master` is borrowed, and
+        // `tcgetattr` writes at most one `termios` into the pointer it is
+        // given; it is read only after the call reported success.
+        let termios = unsafe {
+            if libc::tcgetattr(master.as_raw_fd(), termios.as_mut_ptr()) != 0 {
+                return true;
+            }
+            termios.assume_init()
+        };
+        termios.c_lflag & libc::ICANON != 0 && termios.c_lflag & libc::ECHO == 0
+    }
+
+    /// Whether the child's terminal is set up for password input: never
+    /// known off Unix (ConPTY has no line discipline to read).
+    #[cfg(not(unix))]
+    pub fn password_input(&self) -> bool {
+        false
     }
 
     /// SIGKILL the child's process group (and the child itself, in case it

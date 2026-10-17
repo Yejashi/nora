@@ -1467,6 +1467,116 @@ fn input_to_a_non_reading_child_is_bounded() {
     session.close();
 }
 
+/// ADR-013: password input is canonical mode with echo off (`read -s`,
+/// `sudo`); cooked mode and a line editor's raw mode without echo (zsh's
+/// ZLE runs in `-icanon -echo`) are not, and a closed session reports it
+/// as unknown, which counts as password input.
+#[test]
+#[cfg(unix)]
+fn password_input_follows_the_child_line_discipline() {
+    for (setup, expected) in [
+        ("stty -echo", true),
+        ("stty echo", false),
+        ("stty -icanon -echo", false),
+    ] {
+        let mut session = PtySession::spawn(
+            LaunchSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), format!("{setup}; echo READY; sleep 20")],
+                cwd: None,
+                env: Vec::new(),
+            },
+            24,
+            80,
+            cap(),
+        )
+        .expect("sh spawns over a real PTY");
+        pump(&mut session, |text, _events| text.contains("READY"))
+            .unwrap_or_else(|e| panic!("{setup}: child ready: {e}"));
+        assert_eq!(session.password_input(), expected, "after `{setup}`");
+        session.close();
+        assert!(session.password_input(), "closed session after `{setup}`");
+    }
+}
+
+/// ADR-013 against a real zsh with `shell/nora-zsh.zsh`: while ZLE edits
+/// a reported buffer the terminal is not in password input (ZLE turns echo
+/// off but leaves canonical mode), so suggestions stay on; `read -s` puts
+/// it in password input with no buffer current. Skipped without zsh.
+#[test]
+#[cfg(unix)]
+fn pty_zsh_editing_is_not_password_input() {
+    let Some(zsh) = ["/usr/bin/zsh", "/bin/zsh", "/run/current-system/sw/bin/zsh"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let script = std::env::current_dir()
+        .expect("test CWD is the package root")
+        .join("shell/nora-zsh.zsh");
+    let zdotdir = std::env::temp_dir().join(format!("nora-zsh-rc-{}", std::process::id()));
+    std::fs::create_dir_all(&zdotdir).expect("create the ZDOTDIR");
+    std::fs::write(
+        zdotdir.join(".zshrc"),
+        format!("PS1='$ '\nsource {}\n", script.display()),
+    )
+    .expect("write the zshrc");
+
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: zsh.to_string(),
+            // `-d`: no global rc files, only the ZDOTDIR one.
+            args: vec!["-d".to_string(), "-i".to_string()],
+            cwd: None,
+            env: vec![(
+                "ZDOTDIR".to_string(),
+                zdotdir.to_string_lossy().into_owned(),
+            )],
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("zsh spawns over a real PTY");
+
+    let wait = |session: &mut PtySession, what: &str, done: &dyn Fn(&mut PtySession) -> bool| {
+        let deadline = Instant::now() + DEADLINE;
+        while !done(session) {
+            let _ = session.poll_events();
+            let _ = session.flush(256);
+            assert!(
+                Instant::now() < deadline,
+                "{what} within the deadline; grid: {:?}",
+                grid_text(session).trim_end()
+            );
+            thread::sleep(POLL);
+        }
+    };
+    wait(&mut session, "prompt", &|s| grid_text(s).contains("$ "));
+    session.feed(b"ech").expect("feed a partial command");
+    wait(&mut session, "buffer report", &|s| {
+        s.engine().shell_buffer().is_some_and(|b| b.text == "ech")
+    });
+    assert!(
+        !session.password_input(),
+        "ZLE editing is not password input"
+    );
+
+    // Ctrl+U clears the line; `read -s` then waits for a hidden line.
+    session.feed(b"\x15read -s x\n").expect("feed read -s");
+    wait(&mut session, "password input", &|s| {
+        s.engine().shell_buffer().is_none() && s.password_input()
+    });
+    session.feed(b"pw\nexit\n").expect("feed the line and exit");
+    session.flush(256).expect("flush the line and exit to zsh");
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("zsh exits cleanly within the deadline");
+    session.close();
+    let _ = std::fs::remove_dir_all(&zdotdir);
+}
+
 /// Audit P6: a child that ignores SIGHUP used to block the loop's PTY
 /// teardown forever (the loop thread, the child and the PTY fds leaked).
 /// `close` now kills its process group after `CLOSE_GRACE` and returns
