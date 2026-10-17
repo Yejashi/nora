@@ -27,6 +27,11 @@ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
+/// nora: most bytes the exit drain reads after the child exited (output
+/// still queued in the PTY), and how long it may take.
+pub const MAX_EXIT_DRAIN: usize = 4 * 1024 * 1024;
+pub const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
 pub enum Msg {
@@ -221,13 +226,14 @@ where
         true
     }
 
+    /// nora: returns the bytes parsed this pass (upstream returns `()`).
     #[inline]
     fn pty_read<X>(
         &mut self,
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
-    ) -> io::Result<()>
+    ) -> io::Result<usize>
     where
         X: Write,
     {
@@ -338,7 +344,7 @@ where
 
         match deferred_err {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => Ok(processed),
         }
     }
 
@@ -440,7 +446,23 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(status));
                                 }
                                 if self.drain_on_exit {
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    // nora: one pass reads at most
+                                    // `MAX_LOCKED_READ`; upstream read once
+                                    // and dropped the rest of the child's
+                                    // final output. Read until a pass reads
+                                    // nothing or fails (EIO once drained),
+                                    // within a byte and time bound.
+                                    let deadline = Instant::now() + EXIT_DRAIN_TIMEOUT;
+                                    let mut drained = 0;
+                                    while let Ok(read @ 1..) =
+                                        self.pty_read(&mut state, &mut buf, pipe.as_mut())
+                                    {
+                                        drained += read;
+                                        if drained >= MAX_EXIT_DRAIN || Instant::now() >= deadline
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
                                 self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);

@@ -150,3 +150,7 @@ window the channel holds whatever the window sent.
 | Directory entries per path completion (`suggest::MAX_DIR_ENTRIES`) | 4 096 | no completion | `tests/suggest.rs` `truncated_listing_offers_no_completion` |
 | Path completion lookups (`suggest::PathCompleter`) | 1 running on a `nora-path-complete` thread, 1 waiting | a newer request replaces the waiting one; a lookup that never returns (dead network mount) holds that one thread and blocks later path completions, never the pump | `tests/suggest.rs` `background_paths` |
 | PATH listing (`suggest::MAX_PATH_ENTRIES`, `MAX_PATH_EXECUTABLES`) | 262 144 entries, 65 536 names, on a background thread every 5 min | no executable completion | `tests/suggest.rs` `path_executables_lists_executable_files` |
+
+## Exit drain (2026-10-17)
+
+After the child exits, the PTY loop reads the output still queued in the PTY until a pass reads nothing or the read fails (EIO), at most `event_loop::MAX_EXIT_DRAIN` (4 MiB) or `event_loop::EXIT_DRAIN_TIMEOUT` (1 s), whichever comes first; a grandchild that keeps the PTY open and keeps writing is cut off there. Evidence: `tests/event_loop_drain.rs`.
