@@ -31,25 +31,16 @@ pub fn on_termination(callback: impl FnOnce(i32) + Send + 'static) -> std::io::R
     // SAFETY: the read end is open and owned by nothing else; the `File`
     // takes ownership and closes it.
     let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-    imp::PIPE_WRITE.store(fds[1], Ordering::Release);
+    let close_writer = || {
+        // SAFETY: the write end is open and owned by this function only
+        // (the handler no longer sees it once `PIPE_WRITE` is reset);
+        // closing it gives the reader thread EOF, so it ends.
+        unsafe { libc::close(fds[1]) };
+    };
 
-    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
-        // SAFETY: `action` is zero-initialized (a valid `sigaction` with an
-        // empty mask), its handler is an `extern "C" fn(c_int)` that only
-        // makes async-signal-safe calls, and the old action is not needed.
-        let installed = unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = imp::on_signal as extern "C" fn(libc::c_int) as usize;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signal, &action, std::ptr::null_mut())
-        };
-        if installed != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-
-    std::thread::Builder::new()
+    // The reader thread exists before any handler is installed, so a
+    // caught signal always has a reader acting on it.
+    let spawned = std::thread::Builder::new()
         .name("nora-signals".to_string())
         .spawn(move || {
             let mut byte = [0u8; 1];
@@ -60,7 +51,43 @@ pub fn on_termination(callback: impl FnOnce(i32) + Send + 'static) -> std::io::R
             if reader.read_exact(&mut byte).is_ok() {
                 std::process::exit(128 + i32::from(byte[0]));
             }
-        })?;
+        });
+    if let Err(error) = spawned {
+        close_writer();
+        return Err(error);
+    }
+    imp::PIPE_WRITE.store(fds[1], Ordering::Release);
+
+    let signals = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+    // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, empty
+    // mask); a slot is only read back after `sigaction` filled it.
+    let mut previous: [libc::sigaction; 3] = unsafe { std::mem::zeroed() };
+    for (index, signal) in signals.into_iter().enumerate() {
+        // SAFETY: `action` is zero-initialized (a valid `sigaction` with an
+        // empty mask), its handler is an `extern "C" fn(c_int)` that only
+        // makes async-signal-safe calls, and `previous[index]` is a valid
+        // place for the old action.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = imp::on_signal as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, &mut previous[index])
+        };
+        if installed != 0 {
+            let error = std::io::Error::last_os_error();
+            // Put back the actions already replaced: a caught signal with
+            // no pipe behind it would otherwise be ignored.
+            for (signal, old) in signals.into_iter().zip(&previous).take(index) {
+                // SAFETY: `old` is the action `sigaction` reported for this
+                // signal above, a valid `sigaction`.
+                unsafe { libc::sigaction(signal, old, std::ptr::null_mut()) };
+            }
+            imp::PIPE_WRITE.store(-1, Ordering::Release);
+            close_writer();
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
