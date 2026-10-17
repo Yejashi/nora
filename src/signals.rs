@@ -1,6 +1,7 @@
 //! Termination signals (SIGTERM, SIGHUP, SIGINT) become an orderly
 //! shutdown: the window closes as if asked to, so every session is closed
-//! and the suggestion history is saved. A second signal exits at once, in
+//! and the suggestion history is saved. A second signal more than a
+//! second later exits at once (signals sent together count as one), in
 //! case the orderly path hangs.
 //!
 //! The handler only writes one byte to a pipe (async-signal-safe); a
@@ -11,8 +12,13 @@
 //! This is the crate's `unsafe` boundary for signals: `pipe`, `sigaction`
 //! and the handler's `write`, each with its safety argument below.
 
+/// How long after the first signal further signals count as part of the
+/// same request rather than a second one.
+pub const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Run `callback` with the signal number on the first SIGTERM, SIGHUP or
-/// SIGINT; exit with `128 + signal` on the next one. Call once.
+/// SIGINT; exit with `128 + signal` on a later one that arrives more than
+/// [`SIGNAL_GRACE`] after the callback returned. Call once.
 #[cfg(unix)]
 pub fn on_termination(callback: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
     use std::io::Read as _;
@@ -48,8 +54,14 @@ pub fn on_termination(callback: impl FnOnce(i32) + Send + 'static) -> std::io::R
                 return;
             }
             callback(i32::from(byte[0]));
-            if reader.read_exact(&mut byte).is_ok() {
-                std::process::exit(128 + i32::from(byte[0]));
+            // Signals that arrive together are one request: a logout sends
+            // SIGTERM and SIGHUP back to back. Only one that arrives after
+            // the grace period forces the exit.
+            let grace = std::time::Instant::now() + SIGNAL_GRACE;
+            while reader.read_exact(&mut byte).is_ok() {
+                if std::time::Instant::now() >= grace {
+                    std::process::exit(128 + i32::from(byte[0]));
+                }
             }
         });
     if let Err(error) = spawned {
