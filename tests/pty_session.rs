@@ -1616,6 +1616,72 @@ fn pty_zsh_editing_is_not_password_input() {
     let _ = std::fs::remove_dir_all(&zdotdir);
 }
 
+/// `shell/nora-zsh.zsh` honors `HISTORY_IGNORE`: an ignored command is
+/// marked (`C`) without its command line, so nora never records it, while
+/// other commands are still reported. Skipped without zsh.
+#[test]
+#[cfg(unix)]
+fn pty_zsh_history_ignore_keeps_commands_unreported() {
+    let Some(zsh) = ["/usr/bin/zsh", "/bin/zsh", "/run/current-system/sw/bin/zsh"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    else {
+        eprintln!("zsh not found; skipping");
+        return;
+    };
+    let script = std::env::current_dir()
+        .expect("test CWD is the package root")
+        .join("shell/nora-zsh.zsh");
+    let zdotdir = std::env::temp_dir().join(format!("nora-zsh-histignore-{}", std::process::id()));
+    std::fs::create_dir_all(&zdotdir).expect("create the ZDOTDIR");
+    std::fs::write(
+        zdotdir.join(".zshrc"),
+        format!(
+            "PS1='$ '\nHISTORY_IGNORE='(echo hidden*|ls)'\nsource {}\n",
+            script.display()
+        ),
+    )
+    .expect("write the zshrc");
+    let mut session = PtySession::spawn(
+        LaunchSpec {
+            program: zsh.to_string(),
+            args: vec!["-d".to_string(), "-i".to_string()],
+            cwd: None,
+            env: vec![(
+                "ZDOTDIR".to_string(),
+                zdotdir.to_string_lossy().into_owned(),
+            )],
+        },
+        24,
+        80,
+        cap(),
+    )
+    .expect("zsh spawns over a real PTY");
+    pump(&mut session, |text, _events| text.contains("$ ")).expect("prompt");
+    session
+        .feed(b"echo hidden-one\necho kept-one\nexit\n")
+        .expect("feed the commands");
+    session.flush(256).expect("flush the commands to zsh");
+    pump(&mut session, |_text, events| exited_with(events, 0))
+        .expect("zsh exits cleanly within the deadline");
+    let cmdlines: Vec<String> = session
+        .engine()
+        .take_executed()
+        .into_iter()
+        .map(|command| command.cmdline)
+        .collect();
+    assert!(
+        cmdlines.iter().any(|line| line == "echo kept-one"),
+        "a normal command is reported; got {cmdlines:?}"
+    );
+    assert!(
+        !cmdlines.iter().any(|line| line.contains("hidden")),
+        "an ignored command is not reported; got {cmdlines:?}"
+    );
+    session.close();
+    let _ = std::fs::remove_dir_all(&zdotdir);
+}
+
 /// Audit P6: a child that ignores SIGHUP used to block the loop's PTY
 /// teardown forever (the loop thread, the child and the PTY fds leaked).
 /// `close` now kills its process group after `CLOSE_GRACE` and returns

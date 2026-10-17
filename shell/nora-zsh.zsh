@@ -75,10 +75,17 @@ __nora_precmd() {
 }
 
 __nora_preexec() {
+    emulate -L zsh
+    typeset -g __nora_running=1
+    # A command HISTORY_IGNORE keeps out of the history file is not
+    # reported either, so nora does not record it.
+    if [[ -n ${HISTORY_IGNORE-} && $1 == ${~HISTORY_IGNORE} ]]; then
+        __nora_osc "133;C"
+        return
+    fi
     local REPLY
     __nora_urlencode "$1"
     __nora_osc "133;C;cmdline_url=$REPLY"
-    typeset -g __nora_running=1
 }
 
 typeset -g __nora_last_report=
