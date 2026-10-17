@@ -322,6 +322,10 @@ pub struct Term<T> {
     /// Currently inactive keyboard mode stack.
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
 
+    // nora: see `Term::alt_session`.
+    /// How many times the alternate screen was entered.
+    alt_session: u64,
+
     /// Information about damaged cells.
     damage: TermDamageState,
 
@@ -432,6 +436,7 @@ impl<T> Term<T> {
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
+            alt_session: 0,
             active_charset: Default::default(),
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
@@ -715,6 +720,19 @@ impl<T> Term<T> {
         active.or(inactive)
     }
 
+    // nora: tells alternate screen sessions apart.
+    /// How many times the alternate screen was entered ([`Term::swap_alt`]
+    /// from the primary screen): the session the alternate screen shows
+    /// now, or showed last. Anything recorded on the alternate screen with
+    /// another value belongs to an earlier session, even when nothing on
+    /// the primary screen was observed in between (`CSI ?1049l CSI ?1049h`
+    /// in one write). A reset leaves the alternate screen without changing
+    /// it; the next entry starts a new session.
+    #[inline]
+    pub fn alt_session(&self) -> u64 {
+        self.alt_session
+    }
+
     /// Active terminal modes.
     #[inline]
     pub fn mode(&self) -> &TermMode {
@@ -724,6 +742,9 @@ impl<T> Term<T> {
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
+            // nora: a new alternate screen session.
+            self.alt_session = self.alt_session.wrapping_add(1);
+
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
 

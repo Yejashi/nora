@@ -33,6 +33,7 @@ fn at(line: i32, col: usize) -> Cursor {
         columns: 80,
         lines: 24,
         alt: false,
+        alt_session: 0,
         cell_width: 10,
         cell_height: 20,
     }

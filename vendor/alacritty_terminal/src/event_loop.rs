@@ -99,6 +99,9 @@ pub struct MarkerContext {
     pub columns: usize,
     pub screen_lines: usize,
     pub alt_screen: bool,
+    /// [`Term::alt_session`]: which alternate screen session `alt_screen`
+    /// positions belong to.
+    pub alt_session: u64,
 }
 
 impl MarkerContext {
@@ -114,6 +117,7 @@ impl MarkerContext {
             columns: grid.columns(),
             screen_lines: grid.screen_lines(),
             alt_screen: term.mode().contains(crate::term::TermMode::ALT_SCREEN),
+            alt_session: term.alt_session(),
         }
     }
 }

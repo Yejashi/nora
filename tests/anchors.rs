@@ -238,3 +238,79 @@ fn alt_screen_prompts_are_not_main_screen_targets() {
     assert!(copied.ends_with("out 10\nout 11"), "{copied:?}");
     assert!(!copied.contains("alt"), "{copied:?}");
 }
+
+/// Leaving and re-entering the alternate screen in one write (`less`
+/// exits and `vim` starts within one pump tick) ends the first session,
+/// with no frame, drain or main-screen shell event in between.
+#[test]
+fn reentering_the_alt_screen_in_one_write_ends_its_session() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    let mut bytes = ENTER_ALT.to_vec();
+    bytes.extend_from_slice(b"\x1b[3;1H");
+    bytes.extend_from_slice(OSC_133_A);
+    bytes.extend(link("https://first.example", "first"));
+    bytes.extend_from_slice(LEAVE_ALT);
+    bytes.extend_from_slice(ENTER_ALT);
+    bytes.extend_from_slice(b"\x1b[5;1H");
+    bytes.extend(link("https://second.example", "second"));
+    engine.feed(&bytes);
+    assert!(
+        engine.drain_markers().is_empty(),
+        "the first session's prompt"
+    );
+    let links = engine.drain_hyperlinks();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(links[0].uri, "https://second.example");
+    assert_eq!(engine.hyperlink_count(), 1);
+    assert_eq!(engine.hyperlink_at(2, 1), None, "the first session's link");
+    assert_eq!(
+        engine.hyperlink_at(4, 1).as_deref(),
+        Some("https://second.example")
+    );
+}
+
+/// A reset (`ESC c`) leaves the alternate screen without `swap_alt`; the
+/// next entry is still a new session.
+#[test]
+fn reentering_the_alt_screen_after_a_reset_ends_its_session() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    let mut bytes = ENTER_ALT.to_vec();
+    bytes.extend_from_slice(b"\x1b[3;1H");
+    bytes.extend(link("https://first.example", "first"));
+    bytes.extend_from_slice(b"\x1bc");
+    bytes.extend_from_slice(ENTER_ALT);
+    engine.feed(&bytes);
+    assert!(engine.drain_hyperlinks().is_empty());
+    assert_eq!(engine.hyperlink_at(2, 1), None);
+}
+
+/// Entries already stored from an alternate screen session are absent in
+/// the next one from its first byte, and dropped at the next drain.
+#[test]
+fn stored_entries_of_an_earlier_alt_session_are_absent() {
+    let mut engine = Engine::with_history(8, 40, 100);
+    engine.feed(ENTER_ALT);
+    engine.feed(b"\x1b[3;1H");
+    engine.feed(&link("https://first.example", "first"));
+    engine.feed(b"\r\n\x1b]133;A\x07$ cmd\r\n\x1b]133;C\x07out\r\n\x1b]133;D\x07");
+    engine.drain_markers();
+    engine.drain_hyperlinks();
+    assert_eq!(
+        engine.hyperlink_at(2, 1).as_deref(),
+        Some("https://first.example")
+    );
+    assert!(engine.select_previous_command().is_some());
+    let mut bytes = LEAVE_ALT.to_vec();
+    bytes.extend_from_slice(ENTER_ALT);
+    bytes.extend_from_slice(b"\x1b[3;1Hvim text");
+    engine.feed(&bytes);
+    assert_eq!(engine.hyperlink_at(2, 1), None, "a new alternate screen");
+    assert!(
+        engine.select_previous_command().is_none(),
+        "the first session's command"
+    );
+    assert_eq!(engine.hyperlink_count(), 1, "still stored before a drain");
+    engine.drain_hyperlinks();
+    engine.drain_markers();
+    assert_eq!(engine.hyperlink_count(), 0, "dropped at the next drain");
+}

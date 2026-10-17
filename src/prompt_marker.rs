@@ -134,11 +134,47 @@ pub struct MarkerAtLine {
     /// that screen's grid's (each screen has its own), so the marker is
     /// only aged and looked up on that screen.
     pub alt: bool,
+    /// The alternate screen session (`Term::alt_session`) when `alt`; an
+    /// entry of an earlier session is absent on a later one (meaningless
+    /// on the main screen).
+    pub alt_session: u64,
     /// The marker event.
     pub event: PromptMarkerEvent,
 }
 
+/// The alternate-screen entries of a queue or store: how many there are
+/// and the alternate screen session they share. Inserting an entry
+/// retires those of another screen or session first, so they always
+/// share one.
+#[derive(Debug, Clone, Copy, Default)]
+struct AltEntries {
+    count: usize,
+    session: u64,
+}
+
+impl AltEntries {
+    /// Count an entry recorded on `screen` (`None` = the main screen).
+    fn add(&mut self, screen: Option<u64>) {
+        if let Some(session) = screen {
+            self.count += 1;
+            self.session = session;
+        }
+    }
+
+    /// Whether the counted entries are absent while `shown` is shown.
+    fn stale(&self, shown: Option<u64>) -> bool {
+        self.count > 0 && shown != Some(self.session)
+    }
+}
+
 impl MarkerAtLine {
+    /// The screen the marker was recorded on: `None` for the main screen,
+    /// else its alternate screen session. It is only present while that
+    /// screen is shown.
+    pub fn screen(&self) -> Option<u64> {
+        self.alt.then_some(self.alt_session)
+    }
+
     /// The byte cost of this entry (for queue/store bounding): its size,
     /// as it owns no heap data.
     pub fn byte_cost(&self) -> usize {
@@ -166,15 +202,16 @@ impl MarkerAtLine {
 /// [`MAX_MARKER_BYTES`].
 ///
 /// Alternate-screen entries ([`MarkerAtLine::alt`]) belong to the
-/// alternate screen session they were recorded in: a main-screen entry
-/// pushed after them means that session ended, so they are dropped, as
-/// they are by [`MarkerQueue::drop_alternate`].
+/// alternate screen session they were recorded in: a main-screen entry, or
+/// one of a later session ([`MarkerAtLine::alt_session`]), pushed after
+/// them means that session ended, so they are dropped, as they are by
+/// [`MarkerQueue::retire_alternate`].
 #[derive(Debug, Clone, Default)]
 pub struct MarkerQueue {
     events: VecDeque<MarkerAtLine>,
     total_bytes: usize,
     /// How many of `events` are alternate-screen entries.
-    alt: usize,
+    alt: AltEntries,
 }
 
 impl MarkerQueue {
@@ -184,19 +221,17 @@ impl MarkerQueue {
     }
 
     /// Push an entry, evicting the oldest entry(ies) if the total byte
-    /// cost exceeds [`MAX_MARKER_BYTES`]. A main-screen entry drops the
-    /// queued alternate-screen ones (that screen was left).
+    /// cost exceeds [`MAX_MARKER_BYTES`]. An entry of another screen or
+    /// session drops the queued alternate-screen ones (that session ended).
     pub fn push(&mut self, entry: MarkerAtLine) {
-        if !entry.alt {
-            self.drop_alternate();
-        }
+        self.retire_alternate(entry.screen());
         self.total_bytes += entry.byte_cost();
-        self.alt += usize::from(entry.alt);
+        self.alt.add(entry.screen());
         self.events.push_back(entry);
         while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
             if let Some(old) = self.events.pop_front() {
                 self.total_bytes -= old.byte_cost();
-                self.alt -= usize::from(old.alt);
+                self.alt.count -= usize::from(old.alt);
             }
         }
     }
@@ -206,14 +241,14 @@ impl MarkerQueue {
     /// Resets the byte accounting to zero (the queue is empty afterward).
     pub fn drain(&mut self) -> Vec<MarkerAtLine> {
         self.total_bytes = 0;
-        self.alt = 0;
+        self.alt.count = 0;
         self.events.drain(..).collect()
     }
 
     /// Drop the alternate-screen entries (that screen's session ended);
     /// returns how many were dropped.
     pub fn drop_alternate(&mut self) -> usize {
-        let dropped = std::mem::take(&mut self.alt);
+        let dropped = std::mem::take(&mut self.alt.count);
         if dropped > 0 {
             let total = &mut self.total_bytes;
             self.events.retain(|e| {
@@ -224,6 +259,18 @@ impl MarkerQueue {
             });
         }
         dropped
+    }
+
+    /// Drop the alternate-screen entries unless the shown screen `shown`
+    /// ([`MarkerAtLine::screen`]) is their session: on the main screen, or
+    /// on a later alternate screen session, they mean nothing. Returns how
+    /// many were dropped; free when there are none.
+    pub fn retire_alternate(&mut self, shown: Option<u64>) -> usize {
+        if self.alt.stale(shown) {
+            self.drop_alternate()
+        } else {
+            0
+        }
     }
 
     /// The queued entries, oldest first, to move their lines (a resize
@@ -259,14 +306,15 @@ pub const MAX_MARKERS: usize = 1024;
 /// oldest marker (the newest prompts are the useful ones), and tracks the
 /// total byte cost of stored markers (byte-cost accounting, mirroring
 /// [`crate::graphics_image::ImageStore`]). As in [`MarkerQueue`], a
-/// main-screen marker drops the alternate-screen ones stored before it.
+/// marker of another screen or session drops the alternate-screen ones
+/// stored before it.
 #[derive(Debug)]
 pub struct MarkerStore {
     markers: BTreeMap<usize, MarkerAtLine>,
     total_bytes: usize,
     next_id: usize,
     /// How many of `markers` are alternate-screen markers.
-    alt: usize,
+    alt: AltEntries,
 }
 
 impl Default for MarkerStore {
@@ -284,31 +332,29 @@ impl MarkerStore {
             markers: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
-            alt: 0,
+            alt: AltEntries::default(),
         }
     }
 
     /// Store a marker, auto-assigning the next 1-based ID. At the
     /// [`MAX_MARKERS`] cap the oldest marker is evicted first. A
-    /// main-screen marker drops the stored alternate-screen ones (that
-    /// screen was left).
+    /// marker of another screen or session drops the stored
+    /// alternate-screen ones (that session ended).
     ///
     /// Returns the new marker's ID (always `Some`; the `Option` is kept
     /// for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: MarkerAtLine) -> Option<usize> {
-        if !entry.alt {
-            self.drop_alternate();
-        }
+        self.retire_alternate(entry.screen());
         if self.markers.len() >= MAX_MARKERS
             && let Some((_, oldest)) = self.markers.pop_first()
         {
             self.total_bytes -= oldest.byte_cost();
-            self.alt -= usize::from(oldest.alt);
+            self.alt.count -= usize::from(oldest.alt);
         }
         let id = self.next_id;
         self.next_id += 1;
         self.total_bytes += entry.byte_cost();
-        self.alt += usize::from(entry.alt);
+        self.alt.add(entry.screen());
         self.markers.insert(id, entry);
         Some(id)
     }
@@ -316,7 +362,7 @@ impl MarkerStore {
     /// Drop the alternate-screen markers (that screen's session ended);
     /// returns how many were dropped.
     pub fn drop_alternate(&mut self) -> usize {
-        let dropped = std::mem::take(&mut self.alt);
+        let dropped = std::mem::take(&mut self.alt.count);
         if dropped > 0 {
             let total = &mut self.total_bytes;
             self.markers.retain(|_, e| {
@@ -327,6 +373,18 @@ impl MarkerStore {
             });
         }
         dropped
+    }
+
+    /// Drop the alternate-screen entries unless the shown screen `shown`
+    /// ([`MarkerAtLine::screen`]) is their session: on the main screen, or
+    /// on a later alternate screen session, they mean nothing. Returns how
+    /// many were dropped; free when there are none.
+    pub fn retire_alternate(&mut self, shown: Option<u64>) -> usize {
+        if self.alt.stale(shown) {
+            self.drop_alternate()
+        } else {
+            0
+        }
     }
 
     /// The number of stored markers.
@@ -359,7 +417,7 @@ impl MarkerStore {
     pub fn delete(&mut self, id: usize) -> Option<MarkerAtLine> {
         let entry = self.markers.remove(&id)?;
         self.total_bytes -= entry.byte_cost();
-        self.alt -= usize::from(entry.alt);
+        self.alt.count -= usize::from(entry.alt);
         Some(entry)
     }
 
@@ -367,7 +425,7 @@ impl MarkerStore {
     pub fn clear(&mut self) -> usize {
         let n = self.markers.len();
         self.total_bytes = 0;
-        self.alt = 0;
+        self.alt.count = 0;
         self.markers.clear();
         n
     }
@@ -396,11 +454,19 @@ pub struct HyperlinkAtLine {
     pub pulled: u64,
     /// Whether the alternate screen was shown (see [`MarkerAtLine::alt`]).
     pub alt: bool,
+    /// The alternate screen session (see [`MarkerAtLine::alt_session`]).
+    pub alt_session: u64,
     /// The hyperlink URI.
     pub uri: String,
 }
 
 impl HyperlinkAtLine {
+    /// The screen the hyperlink was recorded on (see
+    /// [`MarkerAtLine::screen`]).
+    pub fn screen(&self) -> Option<u64> {
+        self.alt.then_some(self.alt_session)
+    }
+
     /// The byte cost of this entry (for queue/store bounding): the entry
     /// itself plus the URI's heap allocation.
     pub fn byte_cost(&self) -> usize {
@@ -425,7 +491,7 @@ pub struct HyperlinkQueue {
     events: VecDeque<HyperlinkAtLine>,
     total_bytes: usize,
     /// How many of `events` are alternate-screen entries.
-    alt: usize,
+    alt: AltEntries,
 }
 
 impl HyperlinkQueue {
@@ -435,19 +501,17 @@ impl HyperlinkQueue {
     }
 
     /// Push an entry, evicting the oldest entry(ies) if the total byte
-    /// cost exceeds [`MAX_MARKER_BYTES`]. A main-screen entry drops the
-    /// queued alternate-screen ones (that screen was left).
+    /// cost exceeds [`MAX_MARKER_BYTES`]. An entry of another screen or
+    /// session drops the queued alternate-screen ones (that session ended).
     pub fn push(&mut self, entry: HyperlinkAtLine) {
-        if !entry.alt {
-            self.drop_alternate();
-        }
+        self.retire_alternate(entry.screen());
         self.total_bytes += entry.byte_cost();
-        self.alt += usize::from(entry.alt);
+        self.alt.add(entry.screen());
         self.events.push_back(entry);
         while self.total_bytes > MAX_MARKER_BYTES && !self.events.is_empty() {
             if let Some(old) = self.events.pop_front() {
                 self.total_bytes -= old.byte_cost();
-                self.alt -= usize::from(old.alt);
+                self.alt.count -= usize::from(old.alt);
             }
         }
     }
@@ -455,14 +519,14 @@ impl HyperlinkQueue {
     /// Drain the queue, returning all entries in order (oldest first).
     pub fn drain(&mut self) -> Vec<HyperlinkAtLine> {
         self.total_bytes = 0;
-        self.alt = 0;
+        self.alt.count = 0;
         self.events.drain(..).collect()
     }
 
     /// Drop the alternate-screen entries (that screen's session ended);
     /// returns how many were dropped.
     pub fn drop_alternate(&mut self) -> usize {
-        let dropped = std::mem::take(&mut self.alt);
+        let dropped = std::mem::take(&mut self.alt.count);
         if dropped > 0 {
             let total = &mut self.total_bytes;
             self.events.retain(|e| {
@@ -473,6 +537,18 @@ impl HyperlinkQueue {
             });
         }
         dropped
+    }
+
+    /// Drop the alternate-screen entries unless the shown screen `shown`
+    /// ([`MarkerAtLine::screen`]) is their session: on the main screen, or
+    /// on a later alternate screen session, they mean nothing. Returns how
+    /// many were dropped; free when there are none.
+    pub fn retire_alternate(&mut self, shown: Option<u64>) -> usize {
+        if self.alt.stale(shown) {
+            self.drop_alternate()
+        } else {
+            0
+        }
     }
 
     /// The queued entries, oldest first, to move their lines (a resize
@@ -500,7 +576,7 @@ impl HyperlinkQueue {
         self.events = kept;
         if let Some(entry) = removed {
             self.total_bytes = self.total_bytes.saturating_sub(entry.byte_cost());
-            self.alt -= usize::from(entry.alt);
+            self.alt.count -= usize::from(entry.alt);
             Some(entry)
         } else {
             None
@@ -536,7 +612,7 @@ pub struct HyperlinkStore {
     total_bytes: usize,
     next_id: usize,
     /// How many of `links` are alternate-screen hyperlinks.
-    alt: usize,
+    alt: AltEntries,
 }
 
 impl Default for HyperlinkStore {
@@ -552,32 +628,30 @@ impl HyperlinkStore {
             links: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
-            alt: 0,
+            alt: AltEntries::default(),
         }
     }
 
     /// Store a hyperlink, auto-assigning the next 1-based ID. At the
     /// [`MAX_MARKERS`] cap the oldest hyperlink is evicted first (the
-    /// newest output is where links are clicked). A main-screen
-    /// hyperlink drops the stored alternate-screen ones (that screen was
-    /// left).
+    /// newest output is where links are clicked). A hyperlink of
+    /// another screen or session drops the stored alternate-screen ones
+    /// (that session ended).
     ///
     /// Returns the new hyperlink's ID (always `Some`; the `Option` is
     /// kept for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: HyperlinkAtLine) -> Option<usize> {
-        if !entry.alt {
-            self.drop_alternate();
-        }
+        self.retire_alternate(entry.screen());
         if self.links.len() >= MAX_MARKERS
             && let Some((_, oldest)) = self.links.pop_first()
         {
             self.total_bytes -= oldest.byte_cost();
-            self.alt -= usize::from(oldest.alt);
+            self.alt.count -= usize::from(oldest.alt);
         }
         let id = self.next_id;
         self.next_id += 1;
         self.total_bytes += entry.byte_cost();
-        self.alt += usize::from(entry.alt);
+        self.alt.add(entry.screen());
         self.links.insert(id, entry);
         Some(id)
     }
@@ -585,7 +659,7 @@ impl HyperlinkStore {
     /// Drop the alternate-screen hyperlinks (that screen's session
     /// ended); returns how many were dropped.
     pub fn drop_alternate(&mut self) -> usize {
-        let dropped = std::mem::take(&mut self.alt);
+        let dropped = std::mem::take(&mut self.alt.count);
         if dropped > 0 {
             let total = &mut self.total_bytes;
             self.links.retain(|_, e| {
@@ -596,6 +670,18 @@ impl HyperlinkStore {
             });
         }
         dropped
+    }
+
+    /// Drop the alternate-screen entries unless the shown screen `shown`
+    /// ([`MarkerAtLine::screen`]) is their session: on the main screen, or
+    /// on a later alternate screen session, they mean nothing. Returns how
+    /// many were dropped; free when there are none.
+    pub fn retire_alternate(&mut self, shown: Option<u64>) -> usize {
+        if self.alt.stale(shown) {
+            self.drop_alternate()
+        } else {
+            0
+        }
     }
 
     /// The number of stored hyperlinks.
@@ -629,7 +715,7 @@ impl HyperlinkStore {
     pub fn delete(&mut self, id: usize) -> Option<HyperlinkAtLine> {
         let entry = self.links.remove(&id)?;
         self.total_bytes -= entry.byte_cost();
-        self.alt -= usize::from(entry.alt);
+        self.alt.count -= usize::from(entry.alt);
         Some(entry)
     }
 
@@ -637,7 +723,7 @@ impl HyperlinkStore {
     pub fn clear(&mut self) -> usize {
         let n = self.links.len();
         self.total_bytes = 0;
-        self.alt = 0;
+        self.alt.count = 0;
         self.links.clear();
         n
     }

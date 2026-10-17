@@ -65,9 +65,10 @@ pub struct StreamFilter {
     /// called once per reported position, in order.
     pending: Vec<Pending>,
     pending_index: usize,
-    /// A prompt marker or hyperlink was queued on the alternate screen
-    /// since the last shell event seen on the main screen.
-    alt_queued: bool,
+    /// The alternate screen session a prompt marker or hyperlink was
+    /// queued on since the last shell event seen on another screen or
+    /// session.
+    alt_queued: Option<u64>,
 }
 
 impl StreamFilter {
@@ -78,7 +79,7 @@ impl StreamFilter {
             targets,
             pending: Vec::new(),
             pending_index: 0,
-            alt_queued: false,
+            alt_queued: None,
         }
     }
 
@@ -201,20 +202,27 @@ impl StreamFilter {
 
     fn shell_event(&mut self, event: ShellEvent, at: &MarkerContext) {
         let t = &self.targets;
-        if at.alt_screen {
-            self.alt_queued |= matches!(event, ShellEvent::Marker(_) | ShellEvent::Hyperlink(_));
-        } else if std::mem::take(&mut self.alt_queued) {
-            // An event on the main screen after alternate-screen entries
-            // were queued: that alternate screen session ended, and its
-            // markers and hyperlinks mean nothing on the next one.
+        let screen = at.alt_screen.then_some(at.alt_session);
+        if self
+            .alt_queued
+            .is_some_and(|session| screen != Some(session))
+        {
+            // An event on the main screen, or on a later alternate screen
+            // session, after alternate-screen entries were queued: their
+            // session ended, and its markers and hyperlinks mean nothing
+            // on the next one.
+            self.alt_queued = None;
             t.markers
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .drop_alternate();
+                .retire_alternate(screen);
             t.hyperlinks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .drop_alternate();
+                .retire_alternate(screen);
+        }
+        if screen.is_some() && matches!(event, ShellEvent::Marker(_) | ShellEvent::Hyperlink(_)) {
+            self.alt_queued = screen;
         }
         {
             let cwd = t.cwd.lock().unwrap_or_else(PoisonError::into_inner);
@@ -233,6 +241,7 @@ impl StreamFilter {
                         scrolled: at.total_scrolled,
                         pulled: at.total_pulled,
                         alt: at.alt_screen,
+                        alt_session: at.alt_session,
                         event: m,
                     });
             }
@@ -249,6 +258,7 @@ impl StreamFilter {
                         scrolled: at.total_scrolled,
                         pulled: at.total_pulled,
                         alt: at.alt_screen,
+                        alt_session: at.alt_session,
                         uri,
                     });
             }
@@ -280,6 +290,7 @@ impl StreamFilter {
             columns: at.columns,
             lines: at.screen_lines,
             alt: at.alt_screen,
+            alt_session: at.alt_session,
             cell_width,
             cell_height,
         };

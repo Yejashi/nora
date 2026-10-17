@@ -185,6 +185,29 @@ fn the_alternate_screen_has_its_own_images() {
     );
 }
 
+/// Leaving and re-entering the alternate screen in one write, with no
+/// frame in between, still ends the first session's placements.
+#[test]
+fn reentering_the_alternate_screen_in_one_write_drops_its_images() {
+    let mut e = engine();
+    let mut bytes = b"\x1b[?1049h".to_vec();
+    bytes.extend(apc(&format!("Ga=T,i=1,C=1,s=8,v=16;{}", zeros(8, 16))));
+    bytes.extend_from_slice(b"\x1b[?1049l\x1b[?1049h");
+    e.feed(&bytes);
+    assert!(
+        e.snapshot().images.is_empty(),
+        "the first session's image is gone"
+    );
+    let mut bytes = b"\x1b[?1049l\x1b[?1049h".to_vec();
+    bytes.extend(apc("Ga=p,i=1,C=1"));
+    e.feed(&bytes);
+    assert_eq!(
+        e.snapshot().images.len(),
+        1,
+        "the new session's placement is shown"
+    );
+}
+
 #[test]
 fn markers_and_images_in_one_chunk_keep_their_order() {
     let mut e = engine();

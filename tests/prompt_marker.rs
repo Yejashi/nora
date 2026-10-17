@@ -38,6 +38,7 @@ fn entry(kind: MarkerKind) -> MarkerAtLine {
         scrolled: 0,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(kind),
     }
 }
@@ -683,6 +684,7 @@ fn current_line_no_scroll() {
         scrolled: 0,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(0, 0), Some(0));
@@ -697,6 +699,7 @@ fn current_line_after_scroll() {
         scrolled: 0,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(3, 0), Some(-3));
@@ -711,6 +714,7 @@ fn current_line_above_bottom() {
         scrolled: 10,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(15, 0), Some(-7));
@@ -725,6 +729,7 @@ fn current_line_after_resize_pull() {
         scrolled: 8,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(MarkerKind::A),
     };
     // 10 lines scrolled (total_scrolled 8 -> 18) and a resize pulled 5
@@ -742,6 +747,7 @@ fn current_line_saturates() {
         scrolled: 10,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         event: marker_event(MarkerKind::A),
     };
     assert_eq!(m.current_line(5, 0), Some(0));
@@ -808,6 +814,7 @@ fn link(uri: &str) -> nora::prompt_marker::HyperlinkAtLine {
         scrolled: 0,
         pulled: 0,
         alt: false,
+        alt_session: 0,
         uri: uri.to_string(),
     }
 }

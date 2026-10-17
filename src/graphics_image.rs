@@ -96,9 +96,19 @@ pub struct Cursor {
     pub lines: usize,
     /// The alternate screen is active.
     pub alt: bool,
+    /// The alternate screen session (`Term::alt_session`) when `alt`.
+    pub alt_session: u64,
     /// The cell size in pixels.
     pub cell_width: u32,
     pub cell_height: u32,
+}
+
+impl Cursor {
+    /// The screen shown: `None` for the main screen, else the alternate
+    /// screen session.
+    pub fn screen(&self) -> Option<u64> {
+        self.alt.then_some(self.alt_session)
+    }
 }
 
 /// What handling a command produced.
@@ -132,6 +142,9 @@ pub struct Placement {
     pub rows: u32,
     pub z: i32,
     pub alt: bool,
+    /// The alternate screen session when `alt`: a placement of an earlier
+    /// session is dropped on a later one.
+    alt_session: u64,
     /// A virtual placement (`U=1`): drawn only where the text has Unicode
     /// placeholder cells for it, never on its own.
     pub is_virtual: bool,
@@ -250,6 +263,7 @@ impl GraphicsState {
         at: &Cursor,
         media: Option<LoadedMedia>,
     ) -> Outcome {
+        self.retire_alternate(at.screen());
         if event.command != b'G' {
             return Outcome::default();
         }
@@ -581,6 +595,7 @@ impl GraphicsState {
             rows,
             z: keys.i32("z"),
             alt: at.alt && !is_virtual,
+            alt_session: at.alt_session,
             is_virtual,
             serial: self.serial,
         });
@@ -683,6 +698,7 @@ impl GraphicsState {
 
     /// `CSI 2 J`: delete the placements on the current screen.
     pub fn clear_screen(&mut self, at: &Cursor) {
+        self.retire_alternate(at.screen());
         self.version += 1;
         let lines = at.lines as i64;
         self.placements.retain(|p| {
@@ -695,6 +711,7 @@ impl GraphicsState {
     /// screen has none, and its grid's scroll counters say nothing about
     /// the main screen's placements, so there it deletes nothing.
     pub fn clear_scrollback(&mut self, at: &Cursor) {
+        self.retire_alternate(at.screen());
         self.version += 1;
         if at.alt {
             return;
@@ -715,7 +732,6 @@ impl GraphicsState {
         self.chunk = None;
     }
 
-    /// Drop the alternate screen's placements (it was left).
     /// Move the main screen's placements after a resize reflowed it:
     /// `map` takes a top-left cell's `(grid line, col)` under the counters
     /// `scrolled`/`pulled` (the main screen's, after the resize) to where
@@ -739,9 +755,13 @@ impl GraphicsState {
         }
     }
 
-    pub fn leave_alternate_screen(&mut self) {
+    /// Drop the alternate screen's placements unless the shown screen
+    /// `shown` (`None` = the main screen, else an alternate screen
+    /// session, [`Cursor::screen`]) is theirs: that session ended.
+    pub fn retire_alternate(&mut self, shown: Option<u64>) {
         let before = self.placements.len();
-        self.placements.retain(|p| !p.alt);
+        self.placements
+            .retain(|p| !p.alt || shown == Some(p.alt_session));
         if self.placements.len() != before {
             self.version += 1;
         }

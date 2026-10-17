@@ -393,15 +393,24 @@ struct AnchoredSelection {
     anchor: (i64, usize),
     lo: (i64, usize),
     hi: (i64, usize),
-    /// Whether it was made on the alternate screen. Line ids are per
+    /// The screen it was made on ([`shown_screen`]). Line ids are per
     /// screen, so on the other screen the selection is absent (no
-    /// highlight, nothing to copy) until that screen is shown again.
-    alt: bool,
+    /// highlight, nothing to copy) until that screen is shown again; an
+    /// alternate screen selection is absent on a later session.
+    screen: Option<u64>,
 }
 
 /// Whether `term` shows its alternate screen.
 fn alt_screen<T>(term: &Term<T>) -> bool {
     term.mode().contains(TermMode::ALT_SCREEN)
+}
+
+/// The screen `term` shows: `None` for the main screen, else the
+/// alternate screen session ([`Term::alt_session`]). Alternate-screen
+/// anchors (markers, hyperlinks, images, a selection) recorded under
+/// another value belong to an ended session and are absent.
+fn shown_screen<T>(term: &Term<T>) -> Option<u64> {
+    alt_screen(term).then(|| term.alt_session())
 }
 
 impl AnchoredSelection {
@@ -412,13 +421,13 @@ impl AnchoredSelection {
             anchor: start,
             lo: start.min(end),
             hi: start.max(end),
-            alt: alt_screen(term),
+            screen: shown_screen(term),
         }
     }
 
     /// Whether the selection belongs to the screen `term` shows.
     fn on_screen<T>(&self, term: &Term<T>) -> bool {
-        self.alt == alt_screen(term)
+        self.screen == shown_screen(term)
     }
 
     /// Whether the cell at (`line_id`, `col`) lies in the range.
@@ -766,7 +775,7 @@ impl Engine {
                 .selection
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(sel) = selection.as_mut().filter(|sel| !sel.alt) {
+            if let Some(sel) = selection.as_mut().filter(|sel| sel.screen.is_none()) {
                 let (a, b) = (remap.id_point(sel.lo), remap.id_point(sel.hi));
                 sel.anchor = remap.id_point(sel.anchor);
                 sel.lo = a.min(b);
@@ -907,20 +916,23 @@ impl Engine {
     /// [`MarkerStore`](crate::prompt_marker::MarkerStore) (N35b), so it
     /// can be consulted by prompt navigation. Entries that exceed the
     /// store's cap are dropped (the store returns `None` for them).
-    /// Alternate-screen markers are dropped from the store once the main
-    /// screen is shown (that screen's session ended).
+    /// Alternate-screen markers of an ended session (the main screen or a
+    /// later alternate screen session is shown) are dropped from the queue
+    /// and the store, not returned.
     pub fn drain_markers(&mut self) -> Vec<crate::prompt_marker::MarkerAtLine> {
         // The screen and the queue are read under one term lock: the PTY
         // thread queues markers under it.
         let term = self.term.lock();
-        let main = !alt_screen(&term);
-        let entries = self.lock_markers().drain();
+        let shown = shown_screen(&term);
+        let entries = {
+            let mut queue = self.lock_markers();
+            queue.retire_alternate(shown);
+            queue.drain()
+        };
         drop(term);
+        self.marker_store.retire_alternate(shown);
         for entry in &entries {
             self.marker_store.insert(entry.clone());
-        }
-        if main {
-            self.marker_store.drop_alternate();
         }
         entries
     }
@@ -944,7 +956,7 @@ impl Engine {
     /// is above the view (no integration, or the oldest one is already
     /// shown). A prompt beyond the history scrolls to its top.
     pub fn jump_to_previous_prompt(&mut self) -> Option<usize> {
-        let (scrolled, pulled, top, history, alt) = {
+        let (scrolled, pulled, top, history, shown) = {
             let term = self.term.lock();
             let grid = term.grid();
             (
@@ -952,7 +964,7 @@ impl Engine {
                 grid.total_pulled(),
                 -(grid.display_offset() as i32),
                 grid.total_lines().saturating_sub(grid.screen_lines()),
-                alt_screen(&term),
+                shown_screen(&term),
             )
         };
         // Only the shown screen's prompts: the other screen's lines and
@@ -960,7 +972,7 @@ impl Engine {
         let (id, line) = self
             .marker_store
             .iter()
-            .filter(|(_, entry)| entry.alt == alt)
+            .filter(|(_, entry)| entry.screen() == shown)
             .filter(|(_, entry)| entry.event.kind == crate::prompt_marker::MarkerKind::A)
             .filter_map(|(id, entry)| Some((id, entry.current_line(scrolled, pulled)?)))
             .filter(|&(_, line)| line < top)
@@ -997,21 +1009,25 @@ impl Engine {
             return None;
         }
         use crate::prompt_marker::MarkerKind;
-        let (scrolled, pulled, topmost, alt) = {
+        let (scrolled, pulled, topmost, shown) = {
             let term = self.term.lock();
             let grid = term.grid();
             (
                 grid.total_scrolled(),
                 grid.total_pulled(),
                 grid.topmost_line().0,
-                alt_screen(&term),
+                shown_screen(&term),
             )
         };
         // Find the latest `C` and the latest `D` marker (by ID) of the
         // shown screen.
         let mut latest_c: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
         let mut latest_d: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
-        for (id, entry) in self.marker_store.iter().filter(|(_, e)| e.alt == alt) {
+        for (id, entry) in self
+            .marker_store
+            .iter()
+            .filter(|(_, e)| e.screen() == shown)
+        {
             match entry.event.kind {
                 MarkerKind::C if latest_c.as_ref().is_none_or(|(cid, _)| id > *cid) => {
                     latest_c = Some((id, entry));
@@ -1187,17 +1203,20 @@ impl Engine {
     /// Each drained entry is also inserted into the engine's
     /// [`HyperlinkStore`](crate::prompt_marker::HyperlinkStore), so it can
     /// be consulted by hyperlink activation. Alternate-screen hyperlinks
-    /// are dropped from the store once the main screen is shown.
+    /// of an ended session are dropped, as markers are by
+    /// [`Engine::drain_markers`].
     pub fn drain_hyperlinks(&mut self) -> Vec<crate::prompt_marker::HyperlinkAtLine> {
         let term = self.term.lock();
-        let main = !alt_screen(&term);
-        let entries = self.lock_hyperlinks().drain();
+        let shown = shown_screen(&term);
+        let entries = {
+            let mut queue = self.lock_hyperlinks();
+            queue.retire_alternate(shown);
+            queue.drain()
+        };
         drop(term);
+        self.hyperlink_store.retire_alternate(shown);
         for entry in &entries {
             self.hyperlink_store.insert(entry.clone());
-        }
-        if main {
-            self.hyperlink_store.drop_alternate();
         }
         entries
     }
@@ -1216,7 +1235,7 @@ impl Engine {
     /// Returns `None` when no hyperlink matches. Only the shown screen's
     /// hyperlinks are considered.
     pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
-        let (target_line, scrolled_now, pulled_now, alt) = {
+        let (target_line, scrolled_now, pulled_now, shown) = {
             let term = self.term.lock();
             let display_offset = term.grid().display_offset() as i32;
             let line = row as i32 - display_offset;
@@ -1224,12 +1243,12 @@ impl Engine {
                 line,
                 term.grid().total_scrolled(),
                 term.grid().total_pulled(),
-                alt_screen(&term),
+                shown_screen(&term),
             )
         };
         let mut best: Option<(usize, String)> = None;
         for (_id, entry) in self.hyperlink_store.iter() {
-            if entry.alt != alt || entry.col > col {
+            if entry.screen() != shown || entry.col > col {
                 continue;
             }
             if entry.current_line(scrolled_now, pulled_now) != Some(target_line) {
@@ -1252,14 +1271,14 @@ impl Engine {
     /// consumed (removed from the queue) whether or not its scheme is
     /// allowed. Only the shown screen's hyperlinks are considered.
     pub fn activate_hyperlink(&mut self, row: usize, col: usize) -> Option<Vec<String>> {
-        let alt = alt_screen(&self.term.lock());
+        let shown = shown_screen(&self.term.lock());
         let mut queue = self
             .hyperlink_queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let idx = queue
             .iter()
-            .find(|(_, h)| h.alt == alt && h.line == row as i32 && h.col == col)
+            .find(|(_, h)| h.screen() == shown && h.line == row as i32 && h.col == col)
             .map(|(i, _)| i);
         match idx {
             Some(i) => queue.remove_at(i).and_then(|h| opener_argv(&h.uri)),
@@ -1692,32 +1711,24 @@ impl Engine {
             selected
         };
 
-        // Leaving the alternate screen ends its session: the prompt markers
-        // and hyperlinks recorded there are dropped, as its images are
-        // below (a main-screen entry recorded after them drops them too).
-        if !content.mode.contains(TermMode::ALT_SCREEN) {
-            self.marker_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .drop_alternate();
-            self.hyperlink_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .drop_alternate();
-            self.marker_store.drop_alternate();
-            self.hyperlink_store.drop_alternate();
-        }
+        // Leaving the alternate screen, or entering it again, ends its
+        // session: the prompt markers and hyperlinks recorded there are
+        // dropped, as its images are below (an entry of another screen or
+        // session recorded after them drops them too). Free when none.
+        let shown = shown_screen(&term);
+        self.lock_markers().retire_alternate(shown);
+        self.lock_hyperlinks().retire_alternate(shown);
+        self.marker_store.retire_alternate(shown);
+        self.hyperlink_store.retire_alternate(shown);
 
-        // Kitty graphics in the viewport; leaving the alternate screen drops
-        // its placements.
+        // Kitty graphics in the viewport; leaving or re-entering the
+        // alternate screen drops its placements.
         let images = {
             let alt = content.mode.contains(TermMode::ALT_SCREEN);
             let grid = term.grid();
             let history = grid.total_lines().saturating_sub(grid.screen_lines());
             let mut graphics = self.graphics.lock().unwrap_or_else(PoisonError::into_inner);
-            if !alt {
-                graphics.leave_alternate_screen();
-            }
+            graphics.retire_alternate(shown);
             self.graphics_seen = graphics.version();
             let mut images = graphics.visible(
                 grid.total_scrolled(),
