@@ -883,7 +883,7 @@ CHILD
 # levels. The atlas must trim glyphs a frame no longer uses: no frame may
 # fail to draw, the last screen's text must be visible, and the second
 # pass (new glyph sizes, while fonts and the shaping cache are already at
-# their bounds) must not grow memory much. Untrimmed, the second pass
+# their bounds) must not raise the peak memory much. Untrimmed, the second pass
 # grows the atlas texture, which lavapipe keeps in process memory.
 scenario_atlas() {
     local dir="$OUT/atlas"; mkdir -p "$dir"
@@ -913,11 +913,11 @@ CHILD
     chmod +x "$dir/child.sh"
     LC_ALL=C.UTF-8 launch atlas "$dir/child.sh" "$dir" || { fail atlas "no window"; return; }
     rss_now() { awk '/^VmRSS/{print $2}' "/proc/$NORA_PID/status" 2>/dev/null; }
-    local pass rss peak start1 end1
+    local pass rss peak start1 peak1
     for pass in 1 2; do
         xdotool key ctrl+shift+equal ctrl+shift+equal
         sleep 0.3
-        [ "$pass" = 2 ] && end1=$(rss_now)
+        [ "$pass" = 2 ] && peak1=$peak
         [ "$pass" = 1 ] && start1=$(rss_now)
         peak=$(rss_now)
         : >"$dir/go$pass"
@@ -935,11 +935,14 @@ CHILD
     local white failures growth
     white=$(count_color "$dir/shot.png" '#FFFFFF')
     failures=$(grep -c 'frame draw failed' "$OUT/atlas/nora.log")
-    growth=$(( (peak - end1) / 1024 ))
-    echo "  rows: $(wc -l <"$dir/glyphs.esc"); rss ${start1} kB, after pass 1 ${end1} kB, pass 2 peak ${peak} kB (+${growth} MiB); text px $white; failed frames $failures"
+    # Peak against peak: RSS between the passes varies with what the
+    # allocator has returned, the plateau does not.
+    growth=$(( (peak - peak1) / 1024 ))
+    echo "  rows: $(wc -l <"$dir/glyphs.esc"); rss ${start1} kB, pass 1 peak ${peak1} kB, pass 2 peak ${peak} kB (+${growth} MiB); text px $white; failed frames $failures"
     [ "$failures" -eq 0 ] || { fail atlas "$failures frame(s) failed: $(grep -m1 'frame draw failed' "$OUT/atlas/nora.log")"; return; }
     [ "$white" -gt 5000 ] || { fail atlas "text missing after the soak"; return; }
-    [ "$growth" -le 16 ] || { fail atlas "memory grew ${growth} MiB in the second pass"; return; }
+    # Trimmed: 12-14 MiB (lavapipe); untrimmed: about 145 MiB.
+    [ "$growth" -le 48 ] || { fail atlas "peak memory grew ${growth} MiB in the second pass"; return; }
     pass atlas
 }
 
