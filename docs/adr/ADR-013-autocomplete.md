@@ -143,7 +143,9 @@ Option 4, with these parts:
    last word completes as a path (cwd from OSC 7, `~/` from HOME) or, as
    the first word, as an executable on PATH; only an unambiguous extension
    (the matches' common prefix, `/` after a single directory), no hidden
-   names unless typed, none for words with quotes, escapes or globs. At
+   names unless typed, none for words with quotes, escapes or globs, and
+   none whose added text has a blank or a shell metacharacter
+   (`;|&()<>$`\"'*?[]{}!#~^=`; it would be typed unquoted). At
    most 4 096 entries are read per directory. PATH is listed on a
    background thread (cold scan measured at 223 ms for 1 921 executables
    in 16 directories, warm 13 ms) and again every 5 minutes.

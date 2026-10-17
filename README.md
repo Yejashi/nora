@@ -245,7 +245,9 @@ status. nora suggests from the history of commands you ran. It scores
 each one by frequency and recency, triples the score for commands run in
 the current directory, and lowers it for commands that failed. With no
 match, it completes the last word as a path or command name, but only
-when the completion is unambiguous. The suggestion appears only with the
+when the completion is unambiguous and has no blank or character special
+to the shell (such as `;`, `|`, `$` or a quote), since it is typed
+unquoted. The suggestion appears only with the
 cursor at the end of the line, never in full-screen programs or during a
 paste. The encoding runs inside zsh with no process per keystroke, and
 other terminals ignore the sequences.
