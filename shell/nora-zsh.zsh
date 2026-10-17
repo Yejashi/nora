@@ -70,7 +70,8 @@ __nora_precmd() {
     fi
     local REPLY
     __nora_urlencode "$PWD"
-    __nora_osc "7;file://$REPLY"
+    # The host names the machine the path is on (over ssh, the remote).
+    __nora_osc "7;file://$HOST$REPLY"
     __nora_osc "133;A"
 }
 
