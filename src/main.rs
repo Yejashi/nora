@@ -162,6 +162,11 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // What loading repaired (a deprecated key, a clamped value): shown once
+    // here, which `--check-config` also passes through.
+    for warning in &loaded_config.warnings {
+        eprintln!("{NAME}: warning: {warning}");
+    }
 
     // `--check-config` is headless: validate and exit, no display or GPU.
     if check_config {

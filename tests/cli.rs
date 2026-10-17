@@ -305,6 +305,40 @@ fn check_config_invalid() {
     );
 }
 
+/// `nora --check-config` accepts a file that earlier versions accepted (the
+/// deprecated `terminal.mouse`, a font size out of range): it exits 0 and
+/// prints one warning per repair, once.
+#[test]
+fn check_config_warns_about_repairs() {
+    let path = write_config(
+        "repaired.toml",
+        "[terminal]\nmouse = false\n\n[font]\nsize = 3\n",
+    );
+    let mut cmd = Command::new(nora_bin());
+    no_config_env(&mut cmd)
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&path);
+    let out = run_bounded(&mut cmd);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(out.stdout.contains("config OK"), "stdout={:?}", out.stdout);
+    for key in ["terminal.mouse", "font.size"] {
+        assert_eq!(
+            out.stderr.matches(key).count(),
+            1,
+            "one warning for {key}; stderr={:?}",
+            out.stderr
+        );
+    }
+    assert!(out.stderr.contains("warning"), "stderr={:?}", out.stderr);
+}
+
 /// `nora --check-config` with no discoverable config file exits 0 on the
 /// built-in defaults (no display or GPU needed).
 #[test]

@@ -150,23 +150,92 @@ fn validate_invalid_font_size() {
     }
 }
 
-/// `terminal.mouse` was parsed but never did anything: it is rejected with
-/// a message saying so, rather than silently ignored.
+/// `terminal.mouse` was documented as a boolean but never did anything: a
+/// file that sets it still loads, the key dropped with one deprecation
+/// warning, so an old config does not stop nora from starting.
 #[test]
-fn terminal_mouse_is_rejected_as_unsupported() {
+fn terminal_mouse_is_ignored_with_a_warning() {
     for value in ["true", "false"] {
-        let err = parse_config(&format!("[terminal]\nmouse = {value}\n"))
-            .expect_err("terminal.mouse is not supported");
-        match err {
-            ConfigError::Validation { errors, .. } => assert!(
-                errors
-                    .iter()
-                    .any(|e| e.starts_with("terminal.mouse") && e.contains("not supported")),
-                "{errors:?}"
-            ),
-            other => panic!("expected a Validation error, got: {other:?}"),
-        }
+        let text = format!("[terminal]\nmouse = {value}\nhistory = 77\n");
+        let c = parse_config(&text).expect("terminal.mouse is accepted");
+        assert_eq!(c.terminal.mouse, None);
+        assert_eq!(c.terminal.history, 77);
+
+        let tmp = TempDir::new();
+        let path = write_config(&tmp.0, "config.toml", &text);
+        let loaded = load_config(Some(path.to_str().unwrap())).expect("loads");
+        assert_eq!(loaded.config.terminal.mouse, None);
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].starts_with("terminal.mouse")
+                && loaded.warnings[0].contains("deprecated"),
+            "{:?}",
+            loaded.warnings
+        );
+        // The reload path goes through the same repair.
+        let state = ConfigState::new(loaded).reload().expect("reloads");
+        assert_eq!(state.current.terminal.mouse, None);
     }
+}
+
+/// A finite, positive `font.size` outside 4..=200 (which earlier versions
+/// accepted up to 1000) is clamped with a warning instead of failing the
+/// load; zero, negative and non-finite sizes stay errors.
+#[test]
+fn font_size_out_of_range_is_clamped_with_a_warning() {
+    for (given, used) in [
+        ("3", MIN_FONT_SIZE),
+        ("0.5", MIN_FONT_SIZE),
+        ("201", MAX_FONT_SIZE),
+        ("1000.0", MAX_FONT_SIZE),
+        ("4", 4.0),
+        ("200.0", 200.0),
+    ] {
+        let tmp = TempDir::new();
+        let path = write_config(&tmp.0, "config.toml", &format!("[font]\nsize = {given}\n"));
+        let loaded = load_config(Some(path.to_str().unwrap()))
+            .unwrap_or_else(|e| panic!("size {given} loads: {e}"));
+        assert_eq!(loaded.config.font.size, used, "size {given}");
+        let clamped = given.parse::<f32>() != Ok(used);
+        assert_eq!(
+            loaded.warnings.len(),
+            usize::from(clamped),
+            "size {given}: {:?}",
+            loaded.warnings
+        );
+        if clamped {
+            assert!(
+                loaded.warnings[0].starts_with("font.size"),
+                "{:?}",
+                loaded.warnings
+            );
+        }
+        assert_eq!(
+            parse_config(&format!("[font]\nsize = {given}\n"))
+                .expect("parses")
+                .font
+                .size,
+            used
+        );
+    }
+    for bad in ["0.0", "-1.0", "nan", "inf"] {
+        let err = parse_config(&format!("[font]\nsize = {bad}\n"))
+            .expect_err("a non-positive or non-finite size is an error");
+        assert!(
+            matches!(&err, ConfigError::Validation { errors, .. }
+                if errors.iter().any(|e| e.starts_with("font.size"))),
+            "size {bad}: {err:?}"
+        );
+    }
+}
+
+/// `normalize` reports nothing and changes nothing for a valid config.
+#[test]
+fn normalize_leaves_a_valid_config_alone() {
+    let mut c = NoraConfig::default();
+    c.font.size = 13.0;
+    assert!(c.normalize().is_empty());
+    assert_eq!(c.font.size, 13.0);
 }
 
 #[test]

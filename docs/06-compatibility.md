@@ -349,16 +349,16 @@ Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless
 | Setting | Type | Default | Constraint |
 | --- | --- | --- | --- |
 | `terminal.history` | integer | `10000` | `0`..=`1000000` |
-| `terminal.mouse` | — | — | rejected: not supported (mouse reporting is always available to applications that request it) |
+| `terminal.mouse` | boolean | — | deprecated and ignored, with a warning at load (mouse reporting is always available to applications that request it) |
 | `font.family` | string | `"monospace"` | — |
-| `font.size` | float | `15.0` | `4.0`..=`200.0` points |
+| `font.size` | float | `15.0` | `4.0`..=`200.0` points; a finite positive size outside the range is clamped with a warning, zero, negative or non-finite is an error |
 | `theme.background` | string | `"#000000"` | `#RRGGBB` |
 | `theme.foreground` | string | `"#ffffff"` | `#RRGGBB` |
 | `theme.cursor` | string | `"#ffffff"` | `#RRGGBB` |
 | `theme.colors` | array of strings | `[]` | each `#RRGGBB` |
 | `keys.bindings` | table (string → string) | `{}` | — |
 
-**Validation.** Unknown fields are rejected at parse time (`deny_unknown_fields` on every section). Numeric ranges and `#RRGGBB` colors are checked after parsing and reported as `ConfigError::Validation` with one line per problem; I/O and TOML syntax failures are `ConfigError::Io` / `ConfigError::Parse`. Only settings that are actually implemented are accepted — the schema is intentionally minimal and grows with the features that consume it.
+**Validation.** Unknown fields are rejected at parse time (`deny_unknown_fields` on every section). Numeric ranges and `#RRGGBB` colors are checked after parsing and reported as `ConfigError::Validation` with one line per problem; I/O and TOML syntax failures are `ConfigError::Io` / `ConfigError::Parse`. Before validation, `NoraConfig::normalize` repairs what earlier versions accepted (it drops `terminal.mouse`, clamps `font.size`) and returns one warning per repair in `LoadedConfig::warnings`, which `src/main.rs` prints once at load. Only settings that are actually implemented are accepted — the schema is intentionally minimal and grows with the features that consume it.
 
 ### CLI integration (N18b)
 
@@ -367,7 +367,7 @@ Validated TOML configuration lives in `src/config.rs` (`nora::config`), headless
 | Flag | Behavior |
 | --- | --- |
 | `--config <path>` | Use an explicit config file; a missing, unreadable or invalid file exits 1 |
-| `--check-config` | Validate the loaded config and exit — headless, no display or GPU: `config OK: <path or defaults>` on stdout with exit 0, one validation error per line on stderr with exit 1 |
+| `--check-config` | Validate the loaded config and exit — headless, no display or GPU: `config OK: <path or defaults>` on stdout with exit 0, one validation error per line on stderr with exit 1; load warnings (`nora: warning: …`, a deprecated key ignored or a value clamped) go to stderr once, here and at every start |
 | `--reload` | Re-read the config from disk before launch and swap in the new state transactionally (N19a); a failed reload keeps the last valid config |
 | `--working-directory <path>` | Working directory for the child process (CLI value; the config schema has no `working_directory` field yet) |
 

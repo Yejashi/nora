@@ -183,9 +183,10 @@ pub struct TerminalConfig {
     /// Scrollback lines (0 to [`MAX_HISTORY`]).
     #[serde(default = "default_history")]
     pub history: usize,
-    /// Not supported: parsed only so that [`NoraConfig::validate`] can say
-    /// so. Mouse reporting is always available to an application that
-    /// asks for it (DECSET 1000 and friends); there is no switch.
+    /// Deprecated and ignored: [`NoraConfig::normalize`] drops it with a
+    /// warning (it was once documented as a boolean). Mouse reporting is
+    /// always available to an application that asks for it (DECSET 1000
+    /// and friends); there is no switch.
     #[serde(default)]
     pub mouse: Option<bool>,
 }
@@ -330,10 +331,41 @@ impl NoraConfig {
             .collect()
     }
 
+    /// Repair what a config file may hold but nora no longer accepts as is,
+    /// returning one human-readable warning per repair (empty when nothing
+    /// changed). Loading runs this before [`validate`](Self::validate), so
+    /// a file that earlier versions accepted still loads:
+    /// - `terminal.mouse` (deprecated, ignored) is dropped;
+    /// - a positive, finite `font.size` outside [`MIN_FONT_SIZE`] ..=
+    ///   [`MAX_FONT_SIZE`] is clamped into it. Zero, negative and
+    ///   non-finite sizes are left for `validate` to reject.
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.terminal.mouse.take().is_some() {
+            warnings.push(
+                "terminal.mouse is deprecated and ignored: mouse reporting is always \
+                 available to applications that request it (remove this key)"
+                    .to_string(),
+            );
+        }
+        let size = self.font.size;
+        if size.is_finite() && size > 0.0 && !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) {
+            let clamped = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+            warnings.push(format!(
+                "font.size: {size} is outside {MIN_FONT_SIZE} to {MAX_FONT_SIZE} points; \
+                 using {clamped}"
+            ));
+            self.font.size = clamped;
+        }
+        warnings
+    }
+
     /// Validate the configuration and return a list of human-readable errors.
     ///
     /// An empty list means the config is valid. This is a pure check: it does
-    /// not mutate the config and does not consult the environment.
+    /// not mutate the config and does not consult the environment. It checks
+    /// the strict ranges; a loaded config was [`normalize`](Self::normalize)d
+    /// first, which clamps a font size out of range.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
@@ -398,14 +430,6 @@ impl NoraConfig {
                 "terminal.history: {} exceeds maximum of {}",
                 self.terminal.history, MAX_HISTORY
             ));
-        }
-
-        if self.terminal.mouse.is_some() {
-            errors.push(
-                "terminal.mouse: not supported; mouse reporting is always available to \
-                 applications that request it (remove this key)"
-                    .to_string(),
-            );
         }
 
         // Validate font size.
@@ -475,6 +499,10 @@ pub struct LoadedConfig {
     /// The path the config was loaded from (if any). `None` when the built-in
     /// defaults were used because no config file was found.
     pub path: Option<PathBuf>,
+    /// What [`NoraConfig::normalize`] repaired while loading (a deprecated
+    /// key dropped, a value clamped), one line each, for the caller to show
+    /// once.
+    pub warnings: Vec<String>,
 }
 
 /// Errors that can occur when loading configuration.
@@ -579,6 +607,7 @@ pub fn load_config_with_candidates(
     Ok(LoadedConfig {
         config: NoraConfig::default(),
         path: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -611,10 +640,11 @@ fn load_from_path(path: PathBuf) -> Result<LoadedConfig, ConfigError> {
         error: e.to_string(),
     })?;
 
-    let config: NoraConfig = toml::from_str(&content).map_err(|e| ConfigError::Parse {
+    let mut config: NoraConfig = toml::from_str(&content).map_err(|e| ConfigError::Parse {
         path: path.clone(),
         error: e.to_string(),
     })?;
+    let warnings = config.normalize();
 
     // Validate.
     let errors = config.validate();
@@ -628,16 +658,18 @@ fn load_from_path(path: PathBuf) -> Result<LoadedConfig, ConfigError> {
     Ok(LoadedConfig {
         config,
         path: Some(path),
+        warnings,
     })
 }
 
-/// Convenience for tests and callers: parse TOML from a string and validate it,
-/// without touching the filesystem.
+/// Convenience for tests and callers: parse TOML from a string, normalize it
+/// (dropping the warnings) and validate it, without touching the filesystem.
 pub fn parse_config(toml_text: &str) -> Result<NoraConfig, ConfigError> {
-    let config: NoraConfig = toml::from_str(toml_text).map_err(|e| ConfigError::Parse {
+    let mut config: NoraConfig = toml::from_str(toml_text).map_err(|e| ConfigError::Parse {
         path: PathBuf::from("<string>"),
         error: e.to_string(),
     })?;
+    config.normalize();
 
     let errors = config.validate();
     if !errors.is_empty() {
