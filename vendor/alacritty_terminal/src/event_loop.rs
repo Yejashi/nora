@@ -525,7 +525,15 @@ pub struct EventLoopSender {
 impl EventLoopSender {
     pub fn send(&self, msg: Msg) -> Result<(), EventLoopSendError> {
         self.sender.send(msg).map_err(EventLoopSendError::Send)?;
-        self.poller.notify().map_err(EventLoopSendError::Io)
+        // nora: once the message is queued it is accepted, whatever the
+        // wake-up does. Returning the notify error here made callers treat
+        // queued input as unsent and resend it (duplicate bytes, in-flight
+        // counted twice). The loop still drains the channel on its next
+        // wake-up (the next PTY event or a later successful notify).
+        if let Err(err) = self.poller.notify() {
+            error!("Event loop notify failed after queueing a message: {err}");
+        }
+        Ok(())
     }
 }
 
