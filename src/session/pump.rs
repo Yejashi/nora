@@ -823,15 +823,21 @@ pub fn pump_thread(
                 // The wake only ended the wait; the tick above already
                 // picked up the new output.
                 PumpMsg::Wake => {}
+                // The PTY filter queues prompt markers; fold them into the
+                // engine's store before navigating by them.
                 PumpMsg::PreviousPrompt { pane } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        let _ = pane_pump.session.engine().jump_to_previous_prompt();
+                        let engine = pane_pump.session.engine();
+                        engine.drain_markers();
+                        let _ = engine.jump_to_previous_prompt();
                         pane_pump.force_snapshot = true;
                     }
                 }
                 PumpMsg::SelectPreviousCommand { pane } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        let _ = pane_pump.session.engine().select_previous_command();
+                        let engine = pane_pump.session.engine();
+                        engine.drain_markers();
+                        let _ = engine.select_previous_command();
                         pane_pump.force_snapshot = true;
                     }
                 }

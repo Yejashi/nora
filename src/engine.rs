@@ -821,37 +821,40 @@ impl Engine {
 
     /// Jump to the previous prompt (N35b).
     ///
-    /// Finds the most recent prompt marker (an `A` marker, which marks the
-    /// start of a prompt) in the store, computes its current grid line
-    /// (accounting for the grid's scrolls and vertical resizes since it
-    /// was stored), and scrolls the display to it.
+    /// Finds the newest prompt marker (an `A` marker, which marks the
+    /// start of a prompt) above the top of the view, computing each
+    /// marker's current grid line (accounting for the grid's scrolls and
+    /// vertical resizes since it was stored), and scrolls so that prompt
+    /// is the top row, with its command's output below it. Each call goes
+    /// one prompt further back; a prompt already in view (the shell's
+    /// current one) is not a target.
     ///
-    /// Returns the marker's ID on success, or `None` when there is no
-    /// prompt marker to jump to (e.g. no integration is active). When the
-    /// marker has scrolled out of the history, the viewport is scrolled
-    /// to the top of the history (the closest reachable position).
+    /// Returns the marker's ID, or `None` without scrolling when no prompt
+    /// is above the view (no integration, or the oldest one is already
+    /// shown). A prompt beyond the history scrolls to its top.
     pub fn jump_to_previous_prompt(&mut self) -> Option<usize> {
-        // Find the most recent prompt marker (an `A` marker).
-        let mut best: Option<(usize, &crate::prompt_marker::MarkerAtLine)> = None;
-        for (id, entry) in self.marker_store.iter() {
-            if entry.event.kind == crate::prompt_marker::MarkerKind::A {
-                match best {
-                    Some((best_id, _)) if id > best_id => best = Some((id, entry)),
-                    None => best = Some((id, entry)),
-                    Some(_) => {}
-                }
-            }
-        }
-        let (id, entry) = best?;
-        // Compute the marker's current grid line (accounting for scrolls and
-        // resizes since it was stored).
-        let (scrolled, pulled) = {
+        let (scrolled, pulled, top, history) = {
             let term = self.term.lock();
-            (term.grid().total_scrolled(), term.grid().total_pulled())
+            let grid = term.grid();
+            (
+                grid.total_scrolled(),
+                grid.total_pulled(),
+                -(grid.display_offset() as i32),
+                grid.total_lines().saturating_sub(grid.screen_lines()),
+            )
         };
-        let line = entry.current_line(scrolled, pulled)?;
-        // Scroll the display to the marker's line.
-        self.scroll_to_line(line);
+        let (id, line) = self
+            .marker_store
+            .iter()
+            .filter(|(_, entry)| entry.event.kind == crate::prompt_marker::MarkerKind::A)
+            .filter_map(|(id, entry)| Some((id, entry.current_line(scrolled, pulled)?)))
+            .filter(|&(_, line)| line < top)
+            .max_by_key(|&(id, _)| id)?;
+        let target = (line.unsigned_abs() as usize).min(history);
+        let delta = target as i64 - self.display_offset() as i64;
+        if delta != 0 {
+            self.scroll(Scroll::Delta(delta as i32));
+        }
         Some(id)
     }
 

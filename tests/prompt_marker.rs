@@ -511,8 +511,9 @@ fn store_auto_assign_1_based() {
     assert!(store.query(2).is_some());
 }
 
-/// Insert up to the cap; verify the cap is enforced (the next insert
-/// returns None) and the store is bounded.
+/// Insert past the cap: the store stays bounded and evicts the oldest
+/// marker, so the newest prompt is always kept (it used to refuse new
+/// markers once full, leaving navigation on stale prompts).
 #[test]
 fn store_bounded_by_max_markers() {
     let mut store = MarkerStore::new();
@@ -521,9 +522,17 @@ fn store_bounded_by_max_markers() {
         assert!(store.insert(entry(MarkerKind::A)).is_some());
     }
     assert_eq!(store.len(), cap);
-    // One more exceeds the cap.
-    assert!(store.insert(entry(MarkerKind::B)).is_none());
+    let bytes = store.total_bytes();
+    let newest = store
+        .insert(entry(MarkerKind::B))
+        .expect("insert at the cap");
     assert_eq!(store.len(), cap);
+    assert_eq!(store.total_bytes(), bytes, "one evicted, one added");
+    assert!(store.query(1).is_none(), "the oldest was evicted");
+    assert_eq!(
+        store.query(newest).map(|m| m.event.kind),
+        Some(MarkerKind::B)
+    );
 }
 
 /// Insert, delete, and clear; verify byte accounting mirrors the ImageStore

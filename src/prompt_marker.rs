@@ -20,7 +20,7 @@
 //! store of detected markers with 1-based IDs and byte-cost accounting
 //! (mirroring [`crate::graphics_image::ImageStore`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// An OSC 133 prompt-marker kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,13 +212,14 @@ pub const MAX_MARKERS: usize = 1024;
 
 /// A bounded store of detected prompt markers.
 ///
-/// Marker IDs are auto-assigned starting at 1 (1-based). The store is
-/// bounded by [`MAX_MARKERS`] and tracks the total byte cost of stored
-/// markers (byte-cost accounting, mirroring
+/// Marker IDs are auto-assigned starting at 1 (1-based) and grow with
+/// detection order. The store is bounded by [`MAX_MARKERS`], evicting the
+/// oldest marker (the newest prompts are the useful ones), and tracks the
+/// total byte cost of stored markers (byte-cost accounting, mirroring
 /// [`crate::graphics_image::ImageStore`]).
 #[derive(Debug)]
 pub struct MarkerStore {
-    markers: HashMap<usize, MarkerAtLine>,
+    markers: BTreeMap<usize, MarkerAtLine>,
     total_bytes: usize,
     next_id: usize,
 }
@@ -235,19 +236,22 @@ impl MarkerStore {
     /// Marker IDs are auto-assigned starting at 1 (1-based).
     pub fn new() -> Self {
         Self {
-            markers: HashMap::new(),
+            markers: BTreeMap::new(),
             total_bytes: 0,
             next_id: 1,
         }
     }
 
-    /// Store a marker, auto-assigning the next 1-based ID.
+    /// Store a marker, auto-assigning the next 1-based ID. At the
+    /// [`MAX_MARKERS`] cap the oldest marker is evicted first.
     ///
-    /// Returns the marker ID on success, or `None` when the
-    /// [`MAX_MARKERS`] cap would be exceeded.
+    /// Returns the new marker's ID (always `Some`; the `Option` is kept
+    /// for callers of the earlier refusing store).
     pub fn insert(&mut self, entry: MarkerAtLine) -> Option<usize> {
-        if self.markers.len() >= MAX_MARKERS {
-            return None;
+        if self.markers.len() >= MAX_MARKERS
+            && let Some((_, oldest)) = self.markers.pop_first()
+        {
+            self.total_bytes -= oldest.byte_cost();
         }
         let id = self.next_id;
         self.next_id += 1;
