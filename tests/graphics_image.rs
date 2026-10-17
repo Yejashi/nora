@@ -244,6 +244,41 @@ fn deletes() {
     assert!(g.image(1).is_some());
 }
 
+/// A flood of tiny images is bounded by count and by a per-image charge;
+/// placed images are evicted last, and puts by number find the newest.
+#[test]
+fn image_count_and_overhead_are_bounded() {
+    use nora::graphics_image::{IMAGE_OVERHEAD, MAX_IMAGES, MAX_TOTAL_BYTES};
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,s=1,v=1,i=1", &rgba(1, 1)), &at(0, 0));
+    for _ in 0..MAX_IMAGES * 3 {
+        g.handle(&cmd("a=t,s=1,v=1", &rgba(1, 1)), &at(0, 0));
+        assert!(g.image_count() <= MAX_IMAGES);
+    }
+    assert_eq!(g.image_count(), MAX_IMAGES);
+    assert_eq!(g.total_bytes(), MAX_IMAGES * (4 + IMAGE_OVERHEAD));
+    assert!(g.total_bytes() <= MAX_TOTAL_BYTES);
+    assert!(g.image(1).is_some(), "the placed image outlives newer ones");
+    // Two images with one number: a put by number shows the newer one.
+    let id_of = |out: &Outcome| -> u32 {
+        let r = reply(out).expect("reply");
+        r[r.find("i=").unwrap() + 2..r.find(",I=").unwrap()]
+            .parse()
+            .unwrap()
+    };
+    let older = id_of(&g.handle(&cmd("a=t,s=1,v=1,I=9", &rgba(1, 1)), &at(0, 0)));
+    let newer = id_of(&g.handle(&cmd("a=t,s=1,v=1,I=9", &rgba(1, 1)), &at(0, 0)));
+    assert_ne!(older, newer);
+    g.handle(&cmd("a=p,I=9", &[]), &at(0, 0));
+    assert_eq!(g.placements().last().map(|p| p.image_id), Some(newer));
+    g.handle(&cmd("a=d,d=N,I=9", &[]), &at(0, 0));
+    assert!(g.image(newer).is_none());
+    g.handle(&cmd("a=p,I=9", &[]), &at(0, 0));
+    assert_eq!(g.placements().last().map(|p| p.image_id), Some(older));
+    g.reset();
+    assert_eq!((g.image_count(), g.total_bytes()), (0, 0));
+}
+
 /// `d=R` frees the images with ids in `x..=y`; `y < x` is an empty range.
 #[test]
 fn an_empty_id_range_frees_nothing() {

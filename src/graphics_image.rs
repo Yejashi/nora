@@ -18,7 +18,7 @@
 //! animation (`a=f`, `a=a`, `a=c`) and relative placements (`P`, `Q`,
 //! `H`, `V`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,8 +36,15 @@ fn next_generation() -> u64 {
 
 /// Largest decoded image (RGBA bytes).
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-/// Total decoded bytes kept for all images.
+/// Total bytes kept for all images: decoded pixels plus
+/// [`IMAGE_OVERHEAD`] per image.
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// Most images kept; images without placements go first, oldest first.
+pub const MAX_IMAGES: usize = 4096;
+/// The bytes each image is charged on top of its pixels (its record and
+/// index entries), so many tiny images cannot hide behind a small pixel
+/// count.
+pub const IMAGE_OVERHEAD: usize = 256;
 /// Largest transfer (chunks, file or decompressed data) for one image.
 pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 /// Largest width or height (a texture must fit the GPU's 8192 limit).
@@ -67,6 +74,13 @@ pub struct Image {
     /// client, so no client command (put, delete by id or range, transmit
     /// over it, placeholder) addresses it.
     pub internal: bool,
+}
+
+impl Image {
+    /// What the image is charged against [`MAX_TOTAL_BYTES`].
+    fn cost(&self) -> usize {
+        self.pixels.len() + IMAGE_OVERHEAD
+    }
 }
 
 /// Where a command arrived: the cursor and screen at that point.
@@ -161,6 +175,11 @@ const EBADF: Failure = Failure("EBADF", "Failed to read image data");
 #[derive(Debug, Default)]
 pub struct GraphicsState {
     images: BTreeMap<u32, Image>,
+    /// The images by upload generation (oldest first), for eviction.
+    by_age: BTreeMap<u64, u32>,
+    /// The images with a number, by (number, generation).
+    by_number: BTreeMap<(u32, u64), u32>,
+    /// The images' cost: pixel bytes plus [`IMAGE_OVERHEAD`] each.
     total_bytes: usize,
     placements: Vec<Placement>,
     /// The first chunk of a chunked transfer, with the data so far.
@@ -325,7 +344,7 @@ impl GraphicsState {
     }
 
     /// Store an image, replacing one with the same id (and its
-    /// placements), evicting others to stay within the budget.
+    /// placements), evicting others to stay within the budgets.
     fn store(&mut self, id: u32, number: u32, width: u32, height: u32, pixels: Vec<u8>) -> u32 {
         let internal = id == 0 && number == 0;
         let id = if id != 0 {
@@ -334,40 +353,79 @@ impl GraphicsState {
         } else {
             self.internal_id()
         };
-        if let Some(old) = self.images.remove(&id) {
-            self.total_bytes -= old.pixels.len();
+        if self.remove_image(id).is_some() {
             self.placements.retain(|p| p.image_id != id);
         }
-        let bytes = pixels.len();
-        while self.total_bytes + bytes > MAX_TOTAL_BYTES {
-            // Images without placements go first, then the oldest.
-            let victim = self
-                .images
-                .values()
-                .filter(|image| !self.placements.iter().any(|p| p.image_id == image.id))
-                .min_by_key(|image| image.generation)
-                .or_else(|| self.images.values().min_by_key(|image| image.generation))
-                .map(|image| image.id);
-            let Some(victim) = victim else { break };
-            if let Some(old) = self.images.remove(&victim) {
-                self.total_bytes -= old.pixels.len();
-            }
-            self.placements.retain(|p| p.image_id != victim);
-        }
-        self.total_bytes += bytes;
-        self.images.insert(
+        self.evict_for(pixels.len() + IMAGE_OVERHEAD);
+        self.insert_image(Image {
             id,
-            Image {
-                id,
-                number: (number != 0).then_some(number),
-                width,
-                height,
-                pixels: pixels.into(),
-                generation: next_generation(),
-                internal,
-            },
-        );
+            number: (number != 0).then_some(number),
+            width,
+            height,
+            pixels: pixels.into(),
+            generation: next_generation(),
+            internal,
+        });
         id
+    }
+
+    /// Evict images until one costing `cost` fits both budgets: images
+    /// without placements first, then placed ones, oldest first. One pass
+    /// in age order; at most [`MAX_PLACEMENTS`] placed images are skipped
+    /// before an unplaced one, so a store at the count cap stays cheap.
+    fn evict_for(&mut self, cost: usize) {
+        let fits =
+            |bytes: usize, count: usize| bytes + cost <= MAX_TOTAL_BYTES && count < MAX_IMAGES;
+        let (mut bytes, mut count) = (self.total_bytes, self.images.len());
+        if fits(bytes, count) {
+            return;
+        }
+        let placed: HashSet<u32> = self.placements.iter().map(|p| p.image_id).collect();
+        let mut victims = Vec::new();
+        let mut placed_victim = false;
+        for evict_placed in [false, true] {
+            for id in self.by_age.values() {
+                if fits(bytes, count) {
+                    break;
+                }
+                if placed.contains(id) != evict_placed {
+                    continue;
+                }
+                bytes -= self.images.get(id).map_or(0, Image::cost);
+                count -= 1;
+                victims.push(*id);
+                placed_victim |= evict_placed;
+            }
+        }
+        for id in &victims {
+            self.remove_image(*id);
+        }
+        if placed_victim {
+            let victims: HashSet<u32> = victims.into_iter().collect();
+            self.placements.retain(|p| !victims.contains(&p.image_id));
+        }
+    }
+
+    /// Add an image to the map, its indexes and the byte count.
+    fn insert_image(&mut self, image: Image) {
+        self.total_bytes += image.cost();
+        self.by_age.insert(image.generation, image.id);
+        if let Some(number) = image.number {
+            self.by_number.insert((number, image.generation), image.id);
+        }
+        self.images.insert(image.id, image);
+    }
+
+    /// Remove image `id` from the map, its indexes and the byte count
+    /// (callers drop its placements).
+    fn remove_image(&mut self, id: u32) -> Option<Image> {
+        let image = self.images.remove(&id)?;
+        self.total_bytes -= image.cost();
+        self.by_age.remove(&image.generation);
+        if let Some(number) = image.number {
+            self.by_number.remove(&(number, image.generation));
+        }
+        Some(image)
     }
 
     /// Image `id` if a client command may address it (it exists and is
@@ -387,9 +445,9 @@ impl GraphicsState {
             return;
         }
         let fresh = self.internal_id();
-        if let Some(mut image) = self.images.remove(&id) {
+        if let Some(mut image) = self.remove_image(id) {
             image.id = fresh;
-            self.images.insert(fresh, image);
+            self.insert_image(image);
         }
         for p in self.placements.iter_mut().filter(|p| p.image_id == id) {
             p.image_id = fresh;
@@ -407,11 +465,10 @@ impl GraphicsState {
     }
 
     fn newest_with_number(&self, number: u32) -> Option<u32> {
-        self.images
-            .values()
-            .filter(|image| image.number == Some(number))
-            .max_by_key(|image| image.generation)
-            .map(|image| image.id)
+        self.by_number
+            .range((number, 0)..=(number, u64::MAX))
+            .next_back()
+            .map(|(_, id)| *id)
     }
 
     /// Place image `id` at the cursor; returns the cursor movement unless
@@ -588,11 +645,10 @@ impl GraphicsState {
                         .map(|(id, _)| *id),
                 );
             }
+            let placed: HashSet<u32> = self.placements.iter().map(|p| p.image_id).collect();
             for image in candidates {
-                if !self.placements.iter().any(|p| p.image_id == image)
-                    && let Some(old) = self.images.remove(&image)
-                {
-                    self.total_bytes -= old.pixels.len();
+                if !placed.contains(&image) {
+                    self.remove_image(image);
                 }
             }
         }
@@ -626,6 +682,8 @@ impl GraphicsState {
         self.version += 1;
         self.placements.clear();
         self.images.clear();
+        self.by_age.clear();
+        self.by_number.clear();
         self.total_bytes = 0;
         self.chunk = None;
     }
@@ -758,7 +816,8 @@ impl GraphicsState {
         self.images.len()
     }
 
-    /// Decoded bytes held for all images.
+    /// Bytes charged for all images: decoded pixels plus [`IMAGE_OVERHEAD`]
+    /// each.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }

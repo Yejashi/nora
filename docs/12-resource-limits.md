@@ -126,6 +126,7 @@ This document audits all growth limits in nora. Each section documents the limit
 | --- | --- | --- | --- |
 | OSC frame | 64 KiB (`prompt_marker::MAX_OSC_BYTES`) | frame dropped whole at its terminator; the parser never sees it | unit `unterminated_osc_is_bounded_and_dropped`; e2e `flood`: 200 MiB unterminated OSC, peak RSS +5.5 MiB (was +798 MiB) |
 | APC frame | 4 MiB (`graphics_filter::MAX_APC_BYTES`) | frame ignored for graphics | unit `unterminated_apc_is_bounded` |
+| Kitty images | 4096 images (`graphics_image::MAX_IMAGES`); 256 MiB of pixels plus 256 bytes per image (`MAX_TOTAL_BYTES`, `IMAGE_OVERHEAD`) | unplaced images evicted first, oldest first, in one pass over an age index | test `image_count_and_overhead_are_bounded` |
 | CSI bytes seen by the graphics filter | 8 parameter and intermediate bytes (`graphics_filter::MAX_CSI_BYTES`) | further bytes not kept (the sequence is not `2J`/`3J`) | unit `endless_csi_intermediates_are_bounded` |
 
 ## Input bounds per pane (2026-10-15, M1.7c)

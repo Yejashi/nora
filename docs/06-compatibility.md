@@ -103,7 +103,7 @@ Images are handled on the reader thread at their place in the output
 | --- | --- | --- |
 | Actions | `t` store, `T` store and display, `p` display a stored image (by `i`, or the newest with `I`), `q` check without storing, `d` delete | `tests/graphics_image.rs` |
 | Data | formats 24 (RGB), 32 (RGBA), 100 (PNG); `o=z` zlib; media `d` (inline, chunked with `m`), `f` and `t` (regular files only; `/proc`, `/sys` and `/dev` other than `/dev/shm` refused; one `EBADF` for every failure; `t` removes only temp files whose path contains `tty-graphics-protocol`), `s` (a POSIX shared-memory object, `/dev/shm/<name>`, unlinked once it decoded as the image) | `tests/graphics_image.rs` |
-| Limits | 64 MiB per decoded image, 256 MiB in all (unplaced images evicted first), 8192 px per side, 64 MiB per transfer, 1024 placements | `tests/graphics_image.rs` |
+| Limits | 64 MiB per decoded image, 256 MiB in all with 256 bytes charged per image, 4096 images (unplaced images evicted first, oldest first), 8192 px per side, 64 MiB per transfer, 1024 placements | `tests/graphics_image.rs` |
 | Replies | `ESC _ G i=..[,I=..][,p=..];OK ESC \` or `;CODE:message`, only for commands naming an image; `q=1` drops OK, `q=2` errors; ordered with the parser's replies (a query then `CSI c` answers in that order) | `tests/graphics_protocol.rs` |
 | Placement | at the cursor; size from `c`/`r` (aspect kept for one of them) or the image's pixels; source rectangle `x,y,w,h`; offset `X,Y` inside the cell; scales with the cell on zoom | `tests/graphics_image.rs`; e2e `graphics` |
 | Cursor | moves right by the columns and down by the rows minus one (scrolling at the bottom; to the next line at the right edge); `C=1` keeps it | `tests/graphics_protocol.rs`; e2e `graphics` |
