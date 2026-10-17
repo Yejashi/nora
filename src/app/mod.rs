@@ -630,6 +630,11 @@ struct WinApp {
     /// released: its drag motion and releases are reported clamped into
     /// it even when the pointer leaves it.
     mouse_grab: Option<PaneKey>,
+    /// The last render attempt gathered content but the surface skipped the
+    /// frame (acquire `Timeout`/`Occluded`): the gathered snapshots were
+    /// retained but never presented, so the next attempt must draw them
+    /// even when no fresh snapshot arrived.
+    frame_skipped: bool,
     /// Native clipboard backend (N15): `None` when no display server is
     /// available; clipboard operations are no-ops in that case.
     clipboard: Option<Arc<dyn ClipboardBackend>>,
@@ -764,6 +769,7 @@ pub fn run_windowed(
         cursor: (0.0, 0.0),
         pressed_buttons: Vec::new(),
         mouse_grab: None,
+        frame_skipped: false,
         clipboard: create_clipboard(),
         paste_in_flight: false,
         zoom: nora::config::ZOOM_DEFAULT,
@@ -1982,9 +1988,9 @@ impl WinApp {
             // A slot was emptied: the pump may build the next snapshot.
             let _ = self.pump_commands.send(PumpMsg::Wake);
         }
-        if !fresh_any && !retained {
+        if !fresh_any && !retained && !self.frame_skipped {
             // Coalesced pulse: the earlier pulse already presented
-            // the latest content.
+            // the latest content (unless its frame was skipped).
             for (key, .., snap) in panes {
                 if let Some(snap) = snap {
                     self.pane_last.insert(key, snap);
@@ -2019,6 +2025,7 @@ impl WinApp {
         }
         match action {
             Action::Render => {
+                self.frame_skipped = false;
                 let fonts = self.fonts.as_mut().expect("fonts are loaded at startup");
                 let active_entry = panes.iter().find(|p| p.0 == active);
                 let frame_bg = match active_entry.and_then(|p| p.5.as_ref()) {
@@ -2315,8 +2322,13 @@ impl WinApp {
             }
             Action::Skip => {
                 // No retry budget: drop the frame and wait for the next
-                // event.
+                // event. What was gathered is retained but unpresented:
+                // the next pulse or redraw must draw it. (No redraw is
+                // requested here: an occluded or stalled surface would
+                // turn that into a retry loop; X11 exposes and later
+                // pulses retry.)
                 drop(frame);
+                self.frame_skipped = true;
             }
             Action::Close => {
                 // `Close` folds only from `ChildExited`, which is folded
