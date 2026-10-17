@@ -226,6 +226,9 @@ pub enum PumpMsg {
         /// Whether bracketed paste mode is active (the engine's live
         /// `TermMode::BRACKETED_PASTE`).
         bracketed: bool,
+        /// The window's input number for this paste, as for
+        /// [`PumpMsg::Input`] (stale suggestions are discarded by it).
+        seq: u64,
     },
     /// Cancel the in-flight paste for the pane (N17b): the not-yet-fed
     /// paste bytes are dropped; keystrokes are unaffected.
@@ -1241,8 +1244,10 @@ pub fn pump_thread(
                     pane,
                     text,
                     bracketed,
+                    seq,
                 } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
+                        pane_pump.input_seq = seq;
                         // Bracket markers add 12 bytes; newline
                         // normalization never grows the text.
                         if pane_pump.pending_input.len() + text.len() + 12 > MAX_PENDING_INPUT {

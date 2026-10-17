@@ -1490,10 +1490,16 @@ impl WinApp {
         }
         let bracketed = self.modes_of(pane).contains(TermMode::BRACKETED_PASTE);
         self.suggestions.remove(&pane);
+        // Numbered like keys, so a suggestion computed before the paste
+        // is recognised as stale.
+        self.input_seq += 1;
+        let seq = self.input_seq;
+        self.pane_input_seq.insert(pane, seq);
         let _ = self.pump_commands.send(PumpMsg::Paste {
             pane,
             text,
             bracketed,
+            seq,
         });
     }
 
