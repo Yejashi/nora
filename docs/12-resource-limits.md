@@ -133,7 +133,8 @@ This document audits all growth limits in nora. Each section documents the limit
 
 | Stage | Limit | Past the limit |
 | --- | --- | --- |
-| Pump queue (`pump::MAX_PENDING_INPUT`) | 2 MiB | pastes refused (not accepted then dropped) |
+| Pump queue (`pump::MAX_PENDING_INPUT`) | 2 MiB, pastes held behind the one being fed included | pastes refused (not accepted then dropped) |
+| Pastes held behind the one being fed (`pump::MAX_HELD_PASTES`) | 8 | further pastes refused |
 | Pump key headroom (`pump::INPUT_HEADROOM`) | 16 KiB past the 2 MiB | keys, mouse reports and suggestions refused; pastes never use it, so Ctrl+C behind a full paste queue is still accepted |
 | Session writer (`pty::DEFAULT_CAP`) | 1 MiB (64 KiB reserved for replies) | `feed` accepts nothing |
 | In flight to the PTY (`pty::MAX_IN_FLIGHT`) | 1 MiB | `flush` holds bytes in the writer |

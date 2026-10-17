@@ -301,6 +301,9 @@ pub enum PasteApply {
     /// The paste exceeded `crate::input::paste::MAX_PASTE_SIZE`; the final
     /// size and the cap.
     TooLarge { size: usize, max: usize },
+    /// The pane's input queue has no room for the paste
+    /// ([`queue_paste`]).
+    Full,
 }
 
 /// Length of each bracketed-paste marker (`CSI 200 ~` / `CSI 201 ~`) that
@@ -333,8 +336,8 @@ impl PasteBlock {
 /// `[start, end)`. On rejection, `pending_input` and `paste_block` are
 /// left unchanged.
 ///
-/// A new paste replaces any previously tracked block: only the most
-/// recent paste is cancellable.
+/// A new paste replaces any previously tracked block, so the pump queues
+/// a paste behind one still in flight with [`queue_paste`] instead.
 pub fn apply_paste(
     pending_input: &mut Vec<u8>,
     paste_block: &mut Option<PasteBlock>,
@@ -611,6 +614,195 @@ pub fn queue_key_input(
     accept_input(pending_input, bytes)
 }
 
+/// Most pastes a pane holds behind its in-flight paste ([`HeldInput`]);
+/// a paste past it is refused, as one over [`MAX_PENDING_INPUT`] is.
+pub const MAX_HELD_PASTES: usize = 8;
+
+/// One entry held behind the in-flight paste.
+#[derive(Debug)]
+enum HeldEntry {
+    /// A validated paste (markers included) and whether it is bracketed.
+    Paste { bytes: Vec<u8>, bracketed: bool },
+    /// Key input that arrived after a held paste (consecutive inputs are
+    /// merged into one entry).
+    Input(Vec<u8>),
+}
+
+/// Input a pane holds behind its in-flight paste: a paste that arrives
+/// while another is still being fed waits here, with the input typed
+/// after it, until the first is fully fed or cancelled. Only one paste
+/// is in `pending_input` at a time, so its [`PasteBlock`] alone decides
+/// reply segmentation ([`paste_segment`]), the [`PASTE_WINDOW`] hold and
+/// cancellation. Bounded by [`MAX_HELD_PASTES`] pastes and, together with
+/// `pending_input`, by [`MAX_PENDING_INPUT`] (+ [`INPUT_HEADROOM`] for
+/// keys) bytes. Empty or starting with a paste.
+#[derive(Debug, Default)]
+pub struct HeldInput {
+    entries: std::collections::VecDeque<HeldEntry>,
+    bytes: usize,
+    pastes: usize,
+}
+
+impl HeldInput {
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The bytes held (pastes with their markers, and keys).
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The pastes held.
+    pub fn pastes(&self) -> usize {
+        self.pastes
+    }
+}
+
+/// Queue a paste (see [`apply_paste`]): into `pending_input` when no
+/// paste is in flight or held, else held behind them ([`HeldInput`]).
+/// Refused ([`PasteApply::Full`]) when it would pass
+/// [`MAX_PENDING_INPUT`] or [`MAX_HELD_PASTES`]; nothing changes then.
+pub fn queue_paste(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    held: &mut HeldInput,
+    text: &str,
+    bracketed: bool,
+) -> PasteApply {
+    // Bracket markers add 12 bytes; newline normalization never grows the
+    // text.
+    if pending_input.len() + held.bytes + text.len() + 2 * BRACKET_MARKER_LEN > MAX_PENDING_INPUT
+        || ((paste_block.is_some() || !held.is_empty()) && held.pastes >= MAX_HELD_PASTES)
+    {
+        return PasteApply::Full;
+    }
+    if paste_block.is_none() && held.is_empty() {
+        return apply_paste(pending_input, paste_block, text, bracketed);
+    }
+    match validate_paste(text, bracketed) {
+        PasteValidation::Ok { bytes, bracketed } => {
+            let n = bytes.len();
+            held.bytes += n;
+            held.pastes += 1;
+            held.entries
+                .push_back(HeldEntry::Paste { bytes, bracketed });
+            PasteApply::Queued(n)
+        }
+        PasteValidation::TooLarge { size, max } => PasteApply::TooLarge { size, max },
+    }
+}
+
+/// Move held entries into `pending_input`, in order, while no paste is in
+/// flight: input is appended, and the first held paste becomes the
+/// in-flight block, followed by the input typed after it (the next held
+/// paste and what follows it stay held).
+pub fn release_held(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    held: &mut HeldInput,
+) {
+    while let Some(front) = held.entries.front() {
+        if matches!(front, HeldEntry::Paste { .. }) && paste_block.is_some() {
+            break;
+        }
+        let Some(entry) = held.entries.pop_front() else {
+            break;
+        };
+        match entry {
+            HeldEntry::Input(bytes) => {
+                held.bytes -= bytes.len();
+                pending_input.extend_from_slice(&bytes);
+            }
+            HeldEntry::Paste { bytes, bracketed } => {
+                held.bytes -= bytes.len();
+                held.pastes -= 1;
+                let start = pending_input.len();
+                pending_input.extend_from_slice(&bytes);
+                *paste_block = (pending_input.len() > start).then_some(PasteBlock {
+                    start,
+                    end: pending_input.len(),
+                    fed: 0,
+                    bracketed,
+                });
+            }
+        }
+    }
+}
+
+/// Cancel the in-flight paste ([`cancel_paste_keeping_tail`]) and every
+/// held paste; held input stays, in order, behind what is kept of the
+/// in-flight paste. Returns the count of paste bytes dropped.
+pub fn cancel_pastes(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    held: &mut HeldInput,
+) -> usize {
+    let mut dropped = cancel_paste_keeping_tail(pending_input, paste_block);
+    for entry in held.entries.drain(..) {
+        match entry {
+            HeldEntry::Input(bytes) => pending_input.extend_from_slice(&bytes),
+            HeldEntry::Paste { bytes, .. } => dropped += bytes.len(),
+        }
+    }
+    held.bytes = 0;
+    held.pastes = 0;
+    dropped
+}
+
+/// [`queue_key_input`] with held pastes: a cancel key cancels the
+/// in-flight paste and every held one ([`cancel_pastes`]) and follows
+/// what is kept; any other key waits behind a held paste, so it reaches
+/// the child after it. Refused (never partly queued) past
+/// [`MAX_PENDING_INPUT`] + [`INPUT_HEADROOM`] bytes, held ones included.
+pub fn queue_key_held(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    held: &mut HeldInput,
+    bytes: &[u8],
+) -> bool {
+    if (paste_block.is_some() || !held.is_empty()) && is_paste_cancel_key(bytes) {
+        let dropped = cancel_pastes(pending_input, paste_block, held);
+        if debug_enabled() {
+            eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
+        }
+    }
+    if held.is_empty() {
+        return accept_input(pending_input, bytes);
+    }
+    if pending_input.len() + held.bytes + bytes.len() > MAX_PENDING_INPUT + INPUT_HEADROOM {
+        return false;
+    }
+    held.bytes += bytes.len();
+    match held.entries.back_mut() {
+        Some(HeldEntry::Input(last)) => last.extend_from_slice(bytes),
+        _ => held.entries.push_back(HeldEntry::Input(bytes.to_vec())),
+    }
+    true
+}
+
+/// [`feed_pending`], releasing held input ([`release_held`]) each time
+/// the in-flight paste is done, so a held paste follows the one before it
+/// as soon as that one is fully fed.
+pub fn feed_pending_held(
+    session: &mut PtySession,
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+    held: &mut HeldInput,
+) -> usize {
+    let mut fed = 0;
+    loop {
+        release_held(pending_input, paste_block, held);
+        let n = feed_pending(session, pending_input, paste_block);
+        fed += n;
+        if n == 0 || held.is_empty() || paste_block.is_some() {
+            break;
+        }
+    }
+    fed
+}
+
 /// Most paste bytes a pane hands its session at a time (writer queue plus
 /// bytes in flight to the PTY loop): the rest waits in the pump, so a
 /// cancel drops it (see [`is_paste_cancel_key`]). At the pump's 10 ms busy
@@ -694,6 +886,9 @@ struct PanePump {
     /// The in-flight paste block within `pending_input`, as a half-open
     /// byte range `[start, end)` (N17b); `None` when no paste is in flight.
     paste_block: Option<PasteBlock>,
+    /// Pastes (and the input typed after them) waiting for the in-flight
+    /// paste to be fully fed or cancelled.
+    held_input: HeldInput,
     /// The last published engine `TermMode` (N10b); `None` until the first
     /// tick, so the first tick always publishes.
     last_modes: Option<TermMode>,
@@ -725,6 +920,7 @@ impl PanePump {
             search: None,
             pending_input: Vec::new(),
             paste_block: None,
+            held_input: HeldInput::default(),
             last_modes: None,
             draining: false,
             drain_deadline: None,
@@ -976,7 +1172,8 @@ fn update_suggestion(
             if b.cursor_at_end()
                 && !password_input
                 && !engine.modes().contains(TermMode::ALT_SCREEN)
-                && pane_pump.paste_block.is_none() =>
+                && pane_pump.paste_block.is_none()
+                && pane_pump.held_input.is_empty() =>
         {
             s.suggest((pane, seq), &b.text, engine.cwd().as_deref(), now)
         }
@@ -1367,9 +1564,10 @@ pub fn pump_thread(
                         // Refused (never accepted, then dropped) when the
                         // pane's queue is full: the child stopped reading.
                         // Keys keep a headroom pastes cannot fill.
-                        let accepted = queue_key_input(
+                        let accepted = queue_key_held(
                             &mut pane_pump.pending_input,
                             &mut pane_pump.paste_block,
+                            &mut pane_pump.held_input,
                             &bytes,
                         );
                         if !accepted && debug_enabled() {
@@ -1445,21 +1643,21 @@ pub fn pump_thread(
                 } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
                         pane_pump.input_seq = seq;
-                        // Bracket markers add 12 bytes; newline
-                        // normalization never grows the text.
-                        if pane_pump.pending_input.len() + text.len() + 12 > MAX_PENDING_INPUT {
-                            if debug_enabled() {
-                                eprintln!("debug: pump: paste refused, {pane:?} queue full");
-                            }
-                            continue;
-                        }
-                        let applied = apply_paste(
+                        // Held behind a paste still being fed, so only
+                        // one paste is in the queue at a time.
+                        let applied = queue_paste(
                             &mut pane_pump.pending_input,
                             &mut pane_pump.paste_block,
+                            &mut pane_pump.held_input,
                             &text,
                             bracketed,
                         );
                         match applied {
+                            PasteApply::Full => {
+                                if debug_enabled() {
+                                    eprintln!("debug: pump: paste refused, {pane:?} queue full");
+                                }
+                            }
                             PasteApply::Queued(n) => {
                                 if debug_enabled() {
                                     eprintln!("debug: pump: paste queued {n} byte(s)");
@@ -1477,9 +1675,10 @@ pub fn pump_thread(
                 }
                 PumpMsg::CancelPaste { pane } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        let dropped = cancel_paste_keeping_tail(
+                        let dropped = cancel_pastes(
                             &mut pane_pump.pending_input,
                             &mut pane_pump.paste_block,
+                            &mut pane_pump.held_input,
                         );
                         if debug_enabled() {
                             eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
@@ -1495,15 +1694,16 @@ pub fn pump_thread(
         // flushed to forward any final ledger replies.
         for pane_pump in sessions.values_mut() {
             if !pane_pump.draining {
-                feed_pending(
+                feed_pending_held(
                     &mut pane_pump.session,
                     &mut pane_pump.pending_input,
                     &mut pane_pump.paste_block,
+                    &mut pane_pump.held_input,
                 );
             }
             // Every queued input reached the session: the shell's next
             // buffer report can reflect the latest one.
-            if pane_pump.pending_input.is_empty() {
+            if pane_pump.pending_input.is_empty() && pane_pump.held_input.is_empty() {
                 pane_pump.fed_seq = pane_pump.input_seq;
             }
             let _ = pane_pump.session.flush(1024 * 1024);
@@ -1534,9 +1734,12 @@ pub fn pump_thread(
         // (final output after child exit) or input still queued behind
         // the writer's cap. Otherwise wait for a wake; the heartbeat only
         // bounds how stale an unexpected missed wake can get.
-        let busy = sessions
-            .values()
-            .any(|p| p.draining || !p.pending_input.is_empty() || p.session.outstanding() > 0);
+        let busy = sessions.values().any(|p| {
+            p.draining
+                || !p.pending_input.is_empty()
+                || !p.held_input.is_empty()
+                || p.session.outstanding() > 0
+        });
         // A command in (2) may have changed the view (scroll, search,
         // selection, config) after this pass's tick: tick again now
         // rather than at the next wake (audit RV2: up to 500 ms late on
