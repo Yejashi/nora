@@ -1,427 +1,316 @@
-//! Tests for the kitty-graphics image store, placement store, and protocol
-//! handler (N33a, N34).
-//!
-//! The handler speaks the real kitty-graphics protocol (per ADR-011): a `G`
-//! command character followed by comma-separated `key=value` control data,
-//! with the optional base64 payload after a `;`.
+//! Kitty graphics protocol state (ADR-014): commands, formats, replies,
+//! placements and deletes, against
+//! <https://sw.kovidgoyal.net/kitty/graphics-protocol/>.
 
-use nora::graphics_filter::{GraphicsEvent, parse_payload};
-use nora::graphics_image::{
-    GraphicsHandler, ImageStore, MAX_DIMENSION, MAX_IMAGE_BYTES, PlacementStore, UploadError,
-    convert_to_rgba,
-};
+use std::io::Write;
 
-/// Base64-encode a byte slice (standard alphabet, with padding).
-/// Hand-written, mirroring the hand-written decoder in `graphics_filter`
-/// (no external test dependency).
-fn b64(data: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(A[(n >> 18) as usize & 63] as char);
-        out.push(A[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            A[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[n as usize & 63] as char
-        } else {
-            '='
-        });
+use nora::graphics_filter::GraphicsEvent;
+use nora::graphics_image::{Cursor, GraphicsState, Outcome};
+
+/// A command from its control keys (`a=T,i=5`) and decoded payload.
+fn cmd(keys: &str, data: &[u8]) -> GraphicsEvent {
+    GraphicsEvent {
+        command: b'G',
+        keys: keys
+            .split(',')
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').expect("key=value");
+                (k.to_string(), v.to_string())
+            })
+            .collect(),
+        data: data.to_vec(),
     }
-    out
 }
 
-/// Build a [`GraphicsEvent`] from a full `G<control data>[;<base64>]`
-/// payload (the bytes that appear between `ESC _` and `ESC \`).
-fn ev(payload: &str) -> GraphicsEvent {
-    parse_payload(payload.as_bytes()).expect("parse payload")
-}
-
-/// A 2x2 RGBA image (16 bytes).
-fn sample_rgba() -> Vec<u8> {
-    vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-}
-
-// ---------------------------------------------------------------------------
-// parse_payload (real protocol)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn parse_payload_transmit() {
-    let data = b64(&sample_rgba());
-    let payload = format!("Gi=5,s=2,v=2,f=32;{data}");
-    let event = ev(&payload);
-    assert_eq!(event.command, b'G');
-    assert_eq!(event.get("i"), Some("5"));
-    assert_eq!(event.get("s"), Some("2"));
-    assert_eq!(event.get("v"), Some("2"));
-    assert_eq!(event.get("f"), Some("32"));
-    assert_eq!(event.data, sample_rgba());
-}
-
-#[test]
-fn parse_payload_query_no_data() {
-    let event = ev("Ga=q,i=5");
-    assert_eq!(event.command, b'G');
-    assert_eq!(event.get("a"), Some("q"));
-    assert_eq!(event.get("i"), Some("5"));
-    assert!(event.data.is_empty());
-}
-
-#[test]
-fn parse_payload_delete_no_data() {
-    let event = ev("Ga=d,d=i,i=10");
-    assert_eq!(event.get("a"), Some("d"));
-    assert_eq!(event.get("d"), Some("i"));
-    assert_eq!(event.get("i"), Some("10"));
-    assert!(event.data.is_empty());
-}
-
-#[test]
-fn parse_payload_get_u32() {
-    let event = ev("Gs=100,v=30,X=-5");
-    assert_eq!(event.get_u32("s"), Some(100));
-    assert_eq!(event.get_u32("v"), Some(30));
-    // X is negative, so get_u32 returns None.
-    assert_eq!(event.get_u32("X"), None);
-    assert_eq!(event.get_i32("X"), Some(-5));
-}
-
-// ---------------------------------------------------------------------------
-// convert_to_rgba
-// ---------------------------------------------------------------------------
-
-#[test]
-fn convert_to_rgba_rgb_f24() {
-    // 2x2 RGB (f=24): 12 bytes in, 16 bytes RGBA out.
-    let data: Vec<u8> = (0..12).collect();
-    let out = convert_to_rgba(24, 2, 2, &data).expect("convert");
-    assert_eq!(out.len(), 16);
-    assert_eq!(&out[0..4], &[0, 1, 2, 255]);
-    assert_eq!(&out[4..8], &[3, 4, 5, 255]);
-}
-
-#[test]
-fn convert_to_rgba_rgba_f32() {
-    // 2x2 RGBA (f=32, default): 16 bytes in, 16 bytes out (passthrough).
-    let data: Vec<u8> = (0..16).collect();
-    let out = convert_to_rgba(32, 2, 2, &data).expect("convert");
-    assert_eq!(out, data);
-}
-
-#[test]
-fn convert_to_rgba_unsupported_format() {
-    // f=100 (PNG) is a later slice; unsupported here.
-    let data: Vec<u8> = vec![0; 4];
-    assert_eq!(
-        convert_to_rgba(100, 1, 1, &data),
-        Err(UploadError::UnsupportedFormat)
-    );
-}
-
-#[test]
-fn convert_to_rgba_length_mismatch() {
-    // f=32, 2x2 expects 16 bytes; 15 is a mismatch.
-    let data: Vec<u8> = vec![0; 15];
-    assert_eq!(
-        convert_to_rgba(32, 2, 2, &data),
-        Err(UploadError::DataLengthMismatch)
-    );
-}
-
-#[test]
-fn convert_to_rgba_zero_dimension() {
-    let data: Vec<u8> = vec![];
-    assert_eq!(
-        convert_to_rgba(32, 0, 4, &data),
-        Err(UploadError::DimensionTooLarge)
-    );
-}
-
-// ---------------------------------------------------------------------------
-// ImageStore::upload_rgba
-// ---------------------------------------------------------------------------
-
-#[test]
-fn upload_rgba_auto_assign() {
-    let mut store = ImageStore::new();
-    let rgba = vec![0u8; 16]; // 2x2 RGBA.
-    let id = store.upload_rgba(2, 2, &rgba, None).expect("upload");
-    assert_eq!(id, 1); // IDs are 1-based.
-    assert_eq!(store.len(), 1);
-    let img = store.query(id).expect("query");
-    assert_eq!(img.width, 2);
-    assert_eq!(img.height, 2);
-    assert_eq!(img.pixels, rgba);
-    let id2 = store.upload_rgba(2, 2, &rgba, None).expect("upload");
-    assert_eq!(id2, 2);
-}
-
-#[test]
-fn upload_rgba_explicit_id() {
-    let mut store = ImageStore::new();
-    let rgba = vec![0u8; 16];
-    let id = store.upload_rgba(2, 2, &rgba, Some(5)).expect("upload");
-    assert_eq!(id, 5);
-    assert!(store.query(5).is_some());
-    assert!(store.query(1).is_none());
-}
-
-#[test]
-fn upload_rgba_id_collision() {
-    let mut store = ImageStore::new();
-    let rgba = vec![0u8; 16];
-    assert!(store.upload_rgba(2, 2, &rgba, Some(5)).is_ok());
-    assert_eq!(
-        store.upload_rgba(2, 2, &rgba, Some(5)),
-        Err(UploadError::MalformedParams)
-    );
-}
-
-#[test]
-fn upload_rgba_dimension_too_large() {
-    let mut store = ImageStore::new();
-    let rgba = vec![0u8; 16];
-    assert_eq!(
-        store.upload_rgba(MAX_DIMENSION + 1, 1, &rgba, None),
-        Err(UploadError::DimensionTooLarge)
-    );
-}
-
-#[test]
-fn upload_rgba_total_budget() {
-    let mut store = ImageStore::new();
-    // 2048x4096 RGBA = 32 MiB per image (== MAX_IMAGE_BYTES). Four such
-    // images fill MAX_TOTAL_BYTES (128 MiB); a fifth exceeds it.
-    let rgba: Vec<u8> = vec![0; 2048 * 4096 * 4];
-    assert_eq!(rgba.len(), MAX_IMAGE_BYTES);
-    for _ in 0..4 {
-        assert!(store.upload_rgba(2048, 4096, &rgba, None).is_ok());
+/// The cursor at (line, col) on an 80x24 screen with 10x20 cells.
+fn at(line: i32, col: usize) -> Cursor {
+    Cursor {
+        line,
+        col,
+        scrolled: 0,
+        pulled: 0,
+        columns: 80,
+        lines: 24,
+        alt: false,
+        cell_width: 10,
+        cell_height: 20,
     }
-    // One more byte exceeds the total budget.
-    let rgba2: Vec<u8> = vec![0; 4];
-    assert_eq!(
-        store.upload_rgba(1, 1, &rgba2, None),
-        Err(UploadError::TotalBudget)
+}
+
+fn reply(outcome: &Outcome) -> Option<String> {
+    outcome
+        .reply
+        .as_ref()
+        .map(|r| String::from_utf8(r.clone()).expect("ASCII reply"))
+}
+
+fn rgba(width: u32, height: u32) -> Vec<u8> {
+    [255u8, 0, 0, 255].repeat((width * height) as usize)
+}
+
+#[test]
+fn transmit_replies_only_when_an_image_is_named() {
+    let mut g = GraphicsState::new();
+    let out = g.handle(&cmd("a=t,f=32,s=2,v=1,i=5", &rgba(2, 1)), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=5;OK\x1b\\"));
+    assert_eq!(out.move_cursor, None, "transmit only does not display");
+    let image = g.image(5).expect("stored");
+    assert_eq!((image.width, image.height), (2, 1));
+    let out = g.handle(&cmd("f=32,s=1,v=1", &rgba(1, 1)), &at(0, 0));
+    assert_eq!(out.reply, None, "no id, no reply");
+    assert_eq!(g.image_count(), 2);
+}
+
+#[test]
+fn quiet_modes_and_errors() {
+    let mut g = GraphicsState::new();
+    let ok = g.handle(&cmd("a=t,s=1,v=1,i=1,q=1", &rgba(1, 1)), &at(0, 0));
+    assert_eq!(ok.reply, None, "q=1 drops OK");
+    let short = g.handle(&cmd("a=t,s=2,v=2,i=2,q=1", &rgba(1, 1)), &at(0, 0));
+    assert!(
+        reply(&short).unwrap().starts_with("\x1b_Gi=2;ENODATA:"),
+        "q=1 keeps errors"
+    );
+    let silent = g.handle(&cmd("a=t,s=2,v=2,i=3,q=2", &rgba(1, 1)), &at(0, 0));
+    assert_eq!(silent.reply, None, "q=2 drops errors");
+    let both = g.handle(&cmd("a=t,s=1,v=1,i=4,I=7", &rgba(1, 1)), &at(0, 0));
+    assert!(reply(&both).unwrap().contains(";EINVAL:"));
+    let format = g.handle(&cmd("a=t,f=7,s=1,v=1,i=6", &rgba(1, 1)), &at(0, 0));
+    assert!(reply(&format).unwrap().contains(";EINVAL:"));
+    let shm = g.handle(&cmd("a=t,t=s,s=1,v=1,i=8", b"/name"), &at(0, 0));
+    assert!(
+        reply(&shm).unwrap().contains(";EINVAL:"),
+        "shared memory is refused"
     );
 }
 
 #[test]
-fn image_store_clear() {
-    let mut store = ImageStore::new();
-    let rgba = vec![0u8; 16];
-    store.upload_rgba(2, 2, &rgba, None).expect("upload");
-    store.upload_rgba(2, 2, &rgba, None).expect("upload");
-    assert_eq!(store.len(), 2);
-    assert_eq!(store.total_bytes(), 32);
-    let n = store.clear();
-    assert_eq!(n, 2);
-    assert_eq!(store.len(), 0);
-    assert_eq!(store.total_bytes(), 0);
-}
+fn rgb_png_and_zlib() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=t,f=24,s=2,v=1,i=1", &[1, 2, 3, 4, 5, 6]), &at(0, 0));
+    assert_eq!(&*g.image(1).unwrap().pixels, &[1, 2, 3, 255, 4, 5, 6, 255]);
 
-// ---------------------------------------------------------------------------
-// PlacementStore
-// ---------------------------------------------------------------------------
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[9, 8, 7, 6, 5, 4]).unwrap();
+    }
+    let out = g.handle(&cmd("a=t,f=100,i=2", &png_bytes), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=2;OK\x1b\\"));
+    let image = g.image(2).unwrap();
+    assert_eq!((image.width, image.height), (2, 1), "size from the PNG");
+    assert_eq!(&*image.pixels, &[9, 8, 7, 255, 6, 5, 4, 255]);
+    let bad = g.handle(&cmd("a=t,f=100,i=3", b"not a png"), &at(0, 0));
+    assert!(reply(&bad).unwrap().contains(";EBADPNG:"));
 
-#[test]
-fn placement_store_place_and_delete() {
-    let mut store = PlacementStore::new();
-    let id = store.place(1, 0, 0, 10, 5).expect("place");
-    assert_eq!(id, 1);
-    assert_eq!(store.len(), 1);
-    assert!(store.get(1).is_some());
-    let p = store.delete(1);
-    assert!(p.is_some());
-    assert!(store.is_empty());
-}
-
-#[test]
-fn placement_store_zero_dimensions() {
-    let mut store = PlacementStore::new();
-    assert!(store.place(1, 0, 0, 0, 5).is_err());
-    assert!(store.place(1, 0, 0, 10, 0).is_err());
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&rgba(3, 2)).unwrap();
+    let out = g.handle(&cmd("a=t,o=z,s=3,v=2,i=4", &z.finish().unwrap()), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=4;OK\x1b\\"));
+    assert_eq!(g.image(4).unwrap().pixels.len(), 3 * 2 * 4);
 }
 
 #[test]
-fn placement_store_clear() {
-    let mut store = PlacementStore::new();
-    store.place(1, 0, 0, 10, 5).expect("place");
-    store.place(1, 1, 1, 10, 5).expect("place");
-    assert_eq!(store.len(), 2);
-    store.clear();
-    assert!(store.is_empty());
-}
-
-// ---------------------------------------------------------------------------
-// GraphicsHandler (real protocol)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn handler_transmit_no_id_no_reply() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    let event = ev(&format!("Gs=2,v=2;{data}"));
-    let reply = h.process(&event);
-    // No `i` key: no reply (real protocol), but the image is stored.
-    assert!(reply.is_none());
-    assert_eq!(h.images.len(), 1);
+fn chunked_transfer_replies_at_the_end() {
+    let mut g = GraphicsState::new();
+    let data = rgba(2, 2);
+    let first = g.handle(&cmd("a=T,s=2,v=2,i=9,m=1", &data[..8]), &at(3, 4));
+    assert_eq!(first, Outcome::default());
+    let middle = g.handle(&cmd("m=1", &data[8..12]), &at(3, 4));
+    assert_eq!(middle, Outcome::default());
+    let last = g.handle(&cmd("m=0", &data[12..]), &at(3, 4));
+    assert_eq!(reply(&last).as_deref(), Some("\x1b_Gi=9;OK\x1b\\"));
+    assert_eq!(
+        last.move_cursor,
+        Some((1, 1)),
+        "the first chunk's a=T displays"
+    );
+    assert_eq!(g.image(9).unwrap().pixels.len(), 16);
 }
 
 #[test]
-fn handler_transmit_with_id_reply() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    let event = ev(&format!("Gi=5,s=2,v=2;{data}"));
-    let reply = h.process(&event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=5;OK ST");
-    assert_eq!(h.images.len(), 1);
-    assert!(h.images.query(5).is_some());
+fn display_size_and_cursor_movement() {
+    let mut g = GraphicsState::new();
+    // 25x45 px at 10x20 cells: 3 columns, 3 rows.
+    let out = g.handle(&cmd("a=T,s=25,v=45,i=1", &rgba(25, 45)), &at(2, 5));
+    assert_eq!(out.move_cursor, Some((3, 3)));
+    let p = g.placements().last().unwrap();
+    assert_eq!((p.col, p.columns, p.rows, p.size), (5, 3, 3, (25, 45)));
+    // C=1 keeps the cursor; c only keeps the aspect ratio; c and r stretch.
+    let still = g.handle(&cmd("a=p,i=1,C=1", &[]), &at(0, 0));
+    assert_eq!(still.move_cursor, None);
+    g.handle(&cmd("a=p,i=1,c=5", &[]), &at(0, 0));
+    assert_eq!(g.placements().last().unwrap().size, (50, 90));
+    g.handle(&cmd("a=p,i=1,c=4,r=2", &[]), &at(0, 0));
+    assert_eq!(g.placements().last().unwrap().size, (40, 40));
+    // A source rectangle and a pixel offset (clamped inside the cell).
+    g.handle(&cmd("a=p,i=1,x=5,y=5,w=10,h=10,X=8,Y=30", &[]), &at(0, 0));
+    let p = g.placements().last().unwrap();
+    assert_eq!(
+        (p.source, p.offset, p.columns, p.rows),
+        ([5, 5, 10, 10], (8, 19), 2, 2)
+    );
 }
 
 #[test]
-fn handler_transmit_bad_format() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    let event = ev(&format!("Gi=5,f=100,s=2,v=2;{data}"));
-    let reply = h.process(&event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=5;ERR ST");
-    assert_eq!(h.images.len(), 0);
+fn put_by_id_or_number() {
+    let mut g = GraphicsState::new();
+    let missing = g.handle(&cmd("a=p,i=42", &[]), &at(0, 0));
+    assert!(reply(&missing).unwrap().starts_with("\x1b_Gi=42;ENOENT:"));
+    let first = g.handle(&cmd("a=t,s=1,v=1,I=3", &rgba(1, 1)), &at(0, 0));
+    let first = reply(&first).unwrap();
+    assert!(
+        first.starts_with("\x1b_Gi=") && first.ends_with(",I=3;OK\x1b\\"),
+        "{first:?}"
+    );
+    g.handle(&cmd("a=t,s=2,v=2,I=3,q=2", &rgba(2, 2)), &at(0, 0));
+    let put = g.handle(&cmd("a=p,I=3,p=7", &[]), &at(0, 0));
+    assert!(reply(&put).unwrap().ends_with(",I=3,p=7;OK\x1b\\"));
+    let newest = g.placements().last().unwrap().image_id;
+    assert_eq!(
+        g.image(newest).unwrap().width,
+        2,
+        "the newest image with that number"
+    );
 }
 
 #[test]
-fn handler_transmit_default_format() {
-    // No `f` key: defaults to f=32 (RGBA).
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    let event = ev(&format!("Gi=1,s=2,v=2;{data}"));
-    let reply = h.process(&event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=1;OK ST");
+fn query_does_not_store() {
+    let mut g = GraphicsState::new();
+    // The support-detection query.
+    let out = g.handle(&cmd("i=31,s=1,v=1,a=q,t=d,f=24", &[0, 0, 0]), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=31;OK\x1b\\"));
+    assert_eq!(g.image_count(), 0);
+    assert_eq!(out.move_cursor, None);
 }
 
 #[test]
-fn handler_place() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=5,s=2,v=2;{data}")));
-    let place_event = ev("Ga=p,i=5,X=1,Y=2,c=10,r=5");
-    let reply = h.process(&place_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=5,p=1;OK ST");
-    assert_eq!(h.placements.len(), 1);
+fn placements_scroll_with_the_text() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,s=10,v=40,i=1", &rgba(10, 40)), &at(5, 0));
+    let rows = |g: &mut GraphicsState, scrolled, offset| -> Vec<i32> {
+        g.visible(scrolled, 0, offset, 24, 100, false)
+            .iter()
+            .map(|v| v.row)
+            .collect()
+    };
+    assert_eq!(rows(&mut g, 0, 0), vec![5]);
+    assert_eq!(rows(&mut g, 3, 0), vec![2], "three lines scrolled up");
+    assert_eq!(
+        rows(&mut g, 3, 2),
+        vec![4],
+        "viewport two lines into the history"
+    );
+    assert_eq!(
+        rows(&mut g, 6, 0),
+        vec![-1],
+        "partly above the screen, still drawn"
+    );
+    assert_eq!(
+        rows(&mut g, 7, 0),
+        Vec::<i32>::new(),
+        "in the history, off screen"
+    );
+    assert_eq!(rows(&mut g, 200, 0), Vec::<i32>::new());
+    assert_eq!(g.placements().count(), 0, "dropped once out of the history");
+    assert!(g.visible(0, 0, 0, 24, 100, true).is_empty(), "other screen");
 }
 
 #[test]
-fn handler_place_missing_image() {
-    let mut h = GraphicsHandler::new();
-    let place_event = ev("Ga=p,i=99,X=0,Y=0,c=10,r=5");
-    let reply = h.process(&place_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=99;ERR ST");
+fn deletes() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,s=10,v=20,i=1", &rgba(10, 20)), &at(0, 0));
+    g.handle(&cmd("a=T,s=10,v=20,i=2,z=-1", &rgba(10, 20)), &at(1, 3));
+    g.handle(&cmd("a=T,s=10,v=20,i=3,p=4", &rgba(10, 20)), &at(2, 6));
+    let ids = |g: &GraphicsState| -> Vec<u32> { g.placements().map(|p| p.image_id).collect() };
+    let out = g.handle(&cmd("a=d,d=i,i=1", &[]), &at(9, 9));
+    assert_eq!(out, Outcome::default(), "deletes do not reply");
+    assert_eq!(ids(&g), vec![2, 3]);
+    assert!(g.image(1).is_some(), "lowercase keeps the image");
+    g.handle(&cmd("a=d,d=z,z=-1", &[]), &at(9, 9));
+    assert_eq!(ids(&g), vec![3]);
+    g.handle(&cmd("a=d,d=p,x=7,y=3", &[]), &at(9, 9));
+    assert!(ids(&g).is_empty(), "the placement covering cell (7,3)");
+    g.handle(&cmd("a=p,i=2", &[]), &at(0, 0));
+    g.handle(&cmd("a=d,d=I,i=2", &[]), &at(9, 9));
+    assert!(g.image(2).is_none(), "uppercase frees the image");
+    g.handle(&cmd("a=p,i=1", &[]), &at(0, 0));
+    g.handle(&cmd("a=d", &[]), &at(9, 9));
+    assert!(ids(&g).is_empty(), "d=a: all on the screen");
+    assert!(g.image(1).is_some());
 }
 
 #[test]
-fn handler_query_found() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=5,s=2,v=2;{data}")));
-    let query_event = ev("Ga=q,i=5");
-    let reply = h.process(&query_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=5,s=2,v=2;OK ST");
+fn replacing_an_image_drops_its_placements() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,s=1,v=1,i=1", &rgba(1, 1)), &at(0, 0));
+    let generation = g.image(1).unwrap().generation;
+    g.handle(&cmd("a=t,s=2,v=2,i=1", &rgba(2, 2)), &at(0, 0));
+    assert_eq!(g.placements().count(), 0);
+    assert!(g.image(1).unwrap().generation > generation);
 }
 
 #[test]
-fn handler_query_not_found() {
-    let mut h = GraphicsHandler::new();
-    let query_event = ev("Ga=q,i=99");
-    let reply = h.process(&query_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=99;ERR ST");
+fn clears() {
+    let mut g = GraphicsState::new();
+    g.handle(&cmd("a=T,s=1,v=1,i=1", &rgba(1, 1)), &at(0, 0));
+    let mut scrolled = at(0, 0);
+    scrolled.scrolled = 30;
+    g.handle(&cmd("a=T,s=1,v=1,i=1,p=2", &[]), &at(0, 0));
+    g.handle(&cmd("a=p,i=1", &[]), &scrolled);
+    // Two placements in the scrollback (lines -30), one on the screen.
+    g.clear_screen(&scrolled);
+    assert_eq!(g.placements().count(), 1, "only the screen's");
+    g.clear_scrollback(&scrolled);
+    assert_eq!(g.placements().count(), 0);
+    g.reset();
+    assert_eq!((g.image_count(), g.total_bytes()), (0, 0));
 }
 
 #[test]
-fn handler_delete_image() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=5,s=2,v=2;{data}")));
-    let delete_event = ev("Ga=d,d=i,i=5");
-    let reply = h.process(&delete_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=5;OK ST");
-    assert_eq!(h.images.len(), 0);
-}
-
-#[test]
-fn handler_delete_image_not_found() {
-    let mut h = GraphicsHandler::new();
-    let delete_event = ev("Ga=d,d=i,i=99");
-    let reply = h.process(&delete_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=99;ERR ST");
-}
-
-#[test]
-fn handler_delete_all_images() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=1,s=2,v=2;{data}")));
-    h.process(&ev(&format!("Gi=2,s=2,v=2;{data}")));
-    assert_eq!(h.images.len(), 2);
-    let delete_event = ev("Ga=d,d=i");
-    let reply = h.process(&delete_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=0;OK ST");
-    assert_eq!(h.images.len(), 0);
-}
-
-#[test]
-fn handler_delete_placement() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=5,s=2,v=2;{data}")));
-    h.process(&ev("Ga=p,i=5,X=0,Y=0,c=10,r=5"));
-    assert_eq!(h.placements.len(), 1);
-    let delete_event = ev("Ga=d,d=p,p=1");
-    let reply = h.process(&delete_event).expect("reply");
-    assert_eq!(reply, "ESC _ G p=1;OK ST");
-    assert_eq!(h.placements.len(), 0);
-}
-
-#[test]
-fn handler_delete_clear_placements() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    h.process(&ev(&format!("Gi=5,s=2,v=2;{data}")));
-    h.process(&ev("Ga=p,i=5,X=0,Y=0,c=10,r=5"));
-    assert_eq!(h.placements.len(), 1);
-    // a=d with no d key: clear all visible placements.
-    let delete_event = ev("Ga=d");
-    let reply = h.process(&delete_event).expect("reply");
-    assert_eq!(reply, "ESC _ G i=0;OK ST");
-    assert_eq!(h.placements.len(), 0);
-    // The image is still stored.
-    assert_eq!(h.images.len(), 1);
-}
-
-#[test]
-fn handler_quiet_suppresses_reply() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    let event = ev(&format!("Gq=1,i=5,s=2,v=2;{data}"));
-    let reply = h.process(&event);
-    // q=1: no reply, but the image is still stored.
-    assert!(reply.is_none());
-    assert_eq!(h.images.len(), 1);
-}
-
-#[test]
-fn handler_non_g_command_no_reply() {
-    let mut h = GraphicsHandler::new();
-    let data = b64(&sample_rgba());
-    // A non-G command is not the graphics protocol.
-    let mut event = ev(&format!("es=2,v=2;{data}"));
-    event.command = b'e';
-    let reply = h.process(&event);
-    assert!(reply.is_none());
+fn file_media() {
+    let dir = std::env::temp_dir().join(format!("nora-graphics-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("image.rgba");
+    std::fs::write(&file, rgba(2, 2)).unwrap();
+    let mut g = GraphicsState::new();
+    let path = file.to_string_lossy().into_owned();
+    let out = g.handle(&cmd("a=t,t=f,s=2,v=2,i=1", path.as_bytes()), &at(0, 0));
+    assert_eq!(reply(&out).as_deref(), Some("\x1b_Gi=1;OK\x1b\\"));
+    assert!(file.exists(), "t=f keeps the file");
+    for bad in ["/proc/self/status", "/nonexistent/x", "/etc"] {
+        let out = g.handle(&cmd("a=t,t=f,s=1,v=1,i=2", bad.as_bytes()), &at(0, 0));
+        assert_eq!(
+            reply(&out).as_deref(),
+            Some("\x1b_Gi=2;EBADF:Failed to read image data\x1b\\"),
+            "{bad}"
+        );
+    }
+    // A decode failure on a readable file is the same EBADF.
+    std::fs::write(&file, b"short").unwrap();
+    let out = g.handle(&cmd("a=t,t=f,s=2,v=2,i=3", path.as_bytes()), &at(0, 0));
+    assert!(reply(&out).unwrap().contains(";EBADF:"));
+    // t=t removes only a protocol temp file.
+    let temp = std::env::temp_dir().join(format!("tty-graphics-protocol-{}", std::process::id()));
+    std::fs::write(&temp, rgba(1, 1)).unwrap();
+    let canonical = std::fs::canonicalize(&temp).unwrap();
+    let in_tmp = ["/tmp", "/dev/shm"]
+        .iter()
+        .any(|d| canonical.starts_with(d))
+        || std::env::var_os("TMPDIR").is_some();
+    g.handle(
+        &cmd("a=t,t=t,s=1,v=1,i=4", temp.to_string_lossy().as_bytes()),
+        &at(0, 0),
+    );
+    assert!(g.image(4).is_some());
+    assert_eq!(!temp.exists(), in_tmp, "deleted when in a temp directory");
+    std::fs::write(&file, rgba(2, 2)).unwrap();
+    g.handle(&cmd("a=t,t=t,s=2,v=2,i=5", path.as_bytes()), &at(0, 0));
+    assert!(file.exists(), "not a protocol temp file: kept");
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_dir_all(&dir);
 }

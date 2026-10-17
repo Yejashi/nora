@@ -31,9 +31,15 @@ base64 = "0.22.1"
 # Direct dependency (same pinned version glyphon pulls in): enables
 # `Font::unicode_codepoints()` for per-char font fallback (N13a).
 cosmic-text = { version = "0.19", features = ["monospace_fallback"] }
+# Kitty graphics (ADR-014): zlib-compressed transfers (`o=z`). Already in
+# the lock through png.
+flate2 = "1.1.10"
 glyphon = "0.12.0"
 libc = "0.2"
 pollster = "0.4"
+# Kitty graphics (ADR-014): PNG images (`f=100`). Already in the lock
+# through arboard's image.
+png = "0.18.1"
 # Pinned to the `serde` already in the lock (1.0.229) via `glyphon`/`winit`.
 serde = { version = "1", features = ["derive"] }
 # Validated TOML configuration (N18a). Resolves against the existing

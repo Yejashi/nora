@@ -1,684 +1,747 @@
-//! Bounded inline image upload and storage (N33a, N34).
+//! Kitty graphics protocol state (ADR-014):
+//! <https://sw.kovidgoyal.net/kitty/graphics-protocol/>.
 //!
-//! [`ImageStore`] stores uploaded graphics images with strict size
-//! validation, checked allocation arithmetic, and per-image and total byte
-//! budgets. It advertises only the capabilities it supports (the `f=24`
-//! RGB and `f=32` RGBA pixel formats, stored internally as RGBA).
-//! [`GraphicsHandler`] processes the real kitty-graphics protocol
-//! (`G` + `key=value` control data, per ADR-011) against the image and
-//! placement stores and generates protocol replies.
+//! [`GraphicsState`] handles one complete APC command at a time, at its
+//! place in the output stream: [`GraphicsState::handle`] gets the cursor
+//! there ([`Cursor`]) and returns the reply to send and how far to move the
+//! cursor ([`Outcome`]). Images are decoded to RGBA (formats 24, 32 and
+//! 100 = PNG, optionally zlib-compressed) and kept within byte budgets.
+//! Placements are anchored to the grid line under the cursor with the
+//! grid's scroll counters, as prompt markers are, so they scroll with the
+//! text; [`GraphicsState::visible`] lists the ones in a viewport.
+//!
+//! Not implemented (answered with an error where a reply is due): shared
+//! memory (`t=s`), animation (`a=f`, `a=a`, `a=c`), relative placements and
+//! Unicode placeholders.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::sync::Arc;
 
 use crate::graphics_filter::GraphicsEvent;
 
-/// Maximum dimension (width or height) for a single image.
+/// Largest decoded image (RGBA bytes).
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Total decoded bytes kept for all images.
+pub const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// Largest transfer (chunks, file or decompressed data) for one image.
+pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+/// Largest width or height (a texture must fit the GPU's 8192 limit).
 pub const MAX_DIMENSION: u32 = 8192;
-/// Per-image byte budget (32 MiB).
-pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Total byte budget across all images (128 MiB).
-pub const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
-/// Maximum number of stored image IDs.
-pub const MAX_IMAGE_IDS: usize = 1024;
+/// Most placements kept; the oldest goes first.
+pub const MAX_PLACEMENTS: usize = 1024;
+/// Images with no id from the application get ids from here up.
+const INTERNAL_ID_BASE: u32 = 1 << 31;
 
-/// An upload error (protocol-appropriate).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UploadError {
-    /// The params string is malformed (wrong number of fields or invalid values).
-    MalformedParams,
-    /// The requested pixel format is not supported.
-    UnsupportedFormat,
-    /// The image dimensions exceed the maximum.
-    DimensionTooLarge,
-    /// The pixel data length does not match the expected size.
-    DataLengthMismatch,
-    /// The per-image byte budget would be exceeded.
-    PerImageBudget,
-    /// The total byte budget would be exceeded.
-    TotalBudget,
-    /// The maximum number of image IDs would be exceeded.
-    TooManyIds,
-}
-
-/// A decoded image (RGBA, 4 bytes per pixel).
+/// A stored image.
 #[derive(Debug, Clone)]
 pub struct Image {
-    /// The image width in pixels.
+    pub id: u32,
+    /// The application's image number (`I`), if it gave one.
+    pub number: Option<u32>,
     pub width: u32,
-    /// The image height in pixels.
     pub height: u32,
-    /// The RGBA pixel data (width * height * 4 bytes).
-    pub pixels: Vec<u8>,
+    /// RGBA, `width * height * 4` bytes, shared with snapshots.
+    pub pixels: Arc<[u8]>,
+    /// Distinguishes uploads under the same id (for texture caches).
+    pub generation: u64,
 }
 
-impl Image {
-    /// The byte cost of this image (the pixel data length).
-    pub fn byte_cost(&self) -> usize {
-        self.pixels.len()
-    }
-}
-
-/// Bytes per source pixel for each supported kitty pixel format.
-///
-/// The real protocol uses `f=24` (8-bit RGB) and `f=32` (8-bit RGBA, the
-/// default); `f=100` (PNG) is a later slice. Returns `None` for unsupported
-/// formats.
-fn bytes_per_pixel(format: u32) -> Option<usize> {
-    Some(match format {
-        24 => 3, // 8-bit-per-channel RGB (f=24)
-        32 => 4, // 8-bit-per-channel RGBA (f=32)
-        _ => return None,
-    })
-}
-
-/// Convert pixel data from a supported kitty format to the internal RGBA
-/// representation (4 bytes per pixel).
-///
-/// `data` must be exactly `width * height * bytes_per_pixel(format)` bytes;
-/// a mismatch is a `DataLengthMismatch` error. An unsupported `format` is an
-/// `UnsupportedFormat` error. The colorspace field is ignored (all source
-/// values are used as-is; linear/scRGB conversion is a later concern).
-pub fn convert_to_rgba(
-    format: u32,
-    width: u32,
-    height: u32,
-    data: &[u8],
-) -> Result<Vec<u8>, UploadError> {
-    let bpp = bytes_per_pixel(format).ok_or(UploadError::UnsupportedFormat)?;
-    // A zero dimension is degenerate; reject it (consistent with upload_rgba).
-    if width == 0 || height == 0 {
-        return Err(UploadError::DimensionTooLarge);
-    }
-    let expected = (width as u64)
-        .checked_mul(height as u64)
-        .and_then(|v| v.checked_mul(bpp as u64))
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or(UploadError::DimensionTooLarge)?;
-    if data.len() != expected as usize {
-        return Err(UploadError::DataLengthMismatch);
-    }
-    let pixels = width as usize * height as usize;
-    let mut out = Vec::with_capacity(pixels * 4);
-    match format {
-        32 => out.extend_from_slice(data),
-        24 => {
-            // RGB: append alpha = 255.
-            for &[r, g, b] in data.as_chunks::<3>().0 {
-                out.extend_from_slice(&[r, g, b, 255]);
-            }
-        }
-        _ => return Err(UploadError::UnsupportedFormat),
-    }
-    Ok(out)
-}
-
-/// The capabilities the graphics implementation advertises.
-///
-/// Only what is actually supported is listed; unsupported capabilities are
-/// not advertised as full protocol support.
+/// Where a command arrived: the cursor and screen at that point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GraphicsCapabilities {
-    /// Supported pixel format `f` values (`24` RGB, `32` RGBA; stored
-    /// internally as RGBA).
-    pub supported_formats: &'static [u32],
-    /// Maximum dimension (width or height) for a single image.
-    pub max_dimension: u32,
-    /// Per-image byte budget.
-    pub max_image_bytes: usize,
-    /// Total byte budget across all images.
-    pub max_total_bytes: usize,
-    /// Maximum number of stored image IDs.
-    pub max_image_ids: usize,
+pub struct Cursor {
+    /// The cursor's grid line (0 = top of the screen).
+    pub line: i32,
+    pub col: usize,
+    /// The grid's `total_scrolled` and `total_pulled` counters.
+    pub scrolled: u64,
+    pub pulled: u64,
+    pub columns: usize,
+    pub lines: usize,
+    /// The alternate screen is active.
+    pub alt: bool,
+    /// The cell size in pixels.
+    pub cell_width: u32,
+    pub cell_height: u32,
 }
 
-/// A bounded image cache (per-image and total budgets).
-#[derive(Debug)]
-pub struct ImageStore {
-    images: HashMap<u32, Image>,
+/// What handling a command produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// The reply to send to the application, as bytes.
+    pub reply: Option<Vec<u8>>,
+    /// Move the cursor right by `.0` columns and down by `.1 - 1` rows.
+    pub move_cursor: Option<(u32, u32)>,
+}
+
+/// An image placed on the grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub image_id: u32,
+    /// The application's placement id (`p`), 0 when none.
+    pub placement_id: u32,
+    line: i32,
+    scrolled: u64,
+    pulled: u64,
+    pub col: usize,
+    /// Pixel offset inside the first cell.
+    pub offset: (u32, u32),
+    /// Source rectangle in the image: x, y, width, height.
+    pub source: [u32; 4],
+    /// Drawn size in pixels at `cell` size; scales with the cell.
+    pub size: (u32, u32),
+    /// The cell size the placement was made at.
+    pub cell: (u32, u32),
+    pub columns: u32,
+    pub rows: u32,
+    pub z: i32,
+    pub alt: bool,
+    /// Placement order, for eviction and stable drawing.
+    serial: u64,
+}
+
+impl Placement {
+    /// The grid line of the placement's top row now.
+    fn line_now(&self, scrolled: u64, pulled: u64) -> i64 {
+        i64::from(self.line) - scrolled.saturating_sub(self.scrolled) as i64
+            + pulled.saturating_sub(self.pulled) as i64
+    }
+}
+
+/// A placement in a viewport, with what is needed to draw it.
+#[derive(Debug, Clone)]
+pub struct VisibleImage {
+    pub image_id: u32,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
+    /// The viewport row of the placement's top (may be negative).
+    pub row: i32,
+    pub col: u32,
+    pub offset: (u32, u32),
+    pub source: [u32; 4],
+    pub size: (u32, u32),
+    pub cell: (u32, u32),
+    pub z: i32,
+}
+
+/// A failure, as the protocol's error code and message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failure(&'static str, &'static str);
+
+const EBADF: Failure = Failure("EBADF", "Failed to read image data");
+
+/// The protocol state of one terminal.
+#[derive(Debug, Default)]
+pub struct GraphicsState {
+    images: BTreeMap<u32, Image>,
     total_bytes: usize,
-    next_id: u32,
+    placements: Vec<Placement>,
+    /// The first chunk of a chunked transfer, with the data so far.
+    chunk: Option<GraphicsEvent>,
+    chunk_overflow: bool,
+    next_internal: u32,
+    generation: u64,
+    serial: u64,
 }
 
-impl Default for ImageStore {
-    fn default() -> Self {
-        Self::new()
+/// A command's control keys, with the protocol's defaults.
+struct Keys<'a>(&'a GraphicsEvent);
+
+impl Keys<'_> {
+    fn str(&self, key: &str) -> Option<&str> {
+        self.0.get(key)
+    }
+    fn char(&self, key: &str, default: char) -> char {
+        self.str(key)
+            .and_then(|v| v.chars().next())
+            .unwrap_or(default)
+    }
+    fn u32(&self, key: &str) -> u32 {
+        self.0.get_u32(key).unwrap_or(0)
+    }
+    fn i32(&self, key: &str) -> i32 {
+        self.0.get_i32(key).unwrap_or(0)
     }
 }
 
-impl ImageStore {
-    /// Create an empty store.
-    ///
-    /// Image IDs are auto-assigned starting at 1 (0 is reserved for the
-    /// "clear all" delete sentinel).
+impl GraphicsState {
     pub fn new() -> Self {
-        Self {
-            images: HashMap::new(),
-            total_bytes: 0,
-            next_id: 1,
+        Self::default()
+    }
+
+    /// Handle one APC graphics command arriving with the cursor at `at`.
+    pub fn handle(&mut self, event: &GraphicsEvent, at: &Cursor) -> Outcome {
+        if event.command != b'G' {
+            return Outcome::default();
+        }
+        // Chunking: the first chunk carries the keys; later ones only `m`
+        // (and perhaps `q`) and data. A delete aborts a transfer.
+        let more = event.get("m") == Some("1");
+        let keys = Keys(event);
+        if keys.char("a", 't') == 'd' && self.chunk.is_some() && event.get("m").is_none() {
+            self.chunk = None;
+        }
+        if let Some(chunk) = self.chunk.as_mut() {
+            if chunk.data.len() + event.data.len() > MAX_TRANSFER_BYTES {
+                self.chunk_overflow = true;
+            } else if !self.chunk_overflow {
+                chunk.data.extend_from_slice(&event.data);
+            }
+            if more {
+                return Outcome::default();
+            }
+            let complete = self.chunk.take().expect("chunk in progress");
+            let overflow = std::mem::take(&mut self.chunk_overflow);
+            return self.complete(&complete, at, overflow);
+        }
+        if more {
+            self.chunk = Some(event.clone());
+            self.chunk_overflow = event.data.len() > MAX_TRANSFER_BYTES;
+            return Outcome::default();
+        }
+        self.complete(event, at, false)
+    }
+
+    fn complete(&mut self, event: &GraphicsEvent, at: &Cursor, overflow: bool) -> Outcome {
+        let keys = Keys(event);
+        let action = keys.char("a", 't');
+        let id = keys.u32("i");
+        let number = keys.u32("I");
+        let placement_id = keys.u32("p");
+        let quiet = keys.u32("q");
+        let mut outcome = Outcome::default();
+        let result: Result<u32, Failure> = if id != 0 && number != 0 {
+            Err(Failure("EINVAL", "Image id and number are both given"))
+        } else {
+            match action {
+                't' | 'T' | 'q' => {
+                    let decoded = if overflow {
+                        Err(Failure("EFBIG", "Image data too large"))
+                    } else {
+                        decode(&keys)
+                    };
+                    match (action, decoded) {
+                        (_, Err(failure)) => Err(failure),
+                        ('q', Ok(_)) => Ok(id),
+                        (_, Ok((width, height, pixels))) => {
+                            let stored = self.store(id, number, width, height, pixels);
+                            if action == 'T' {
+                                outcome.move_cursor = self.place(stored, placement_id, &keys, at);
+                            }
+                            Ok(stored)
+                        }
+                    }
+                }
+                'p' => {
+                    let target = if number != 0 {
+                        self.newest_with_number(number)
+                    } else {
+                        self.images.contains_key(&id).then_some(id)
+                    };
+                    match target {
+                        Some(image) => {
+                            outcome.move_cursor = self.place(image, placement_id, &keys, at);
+                            Ok(image)
+                        }
+                        None => Err(Failure("ENOENT", "No such image")),
+                    }
+                }
+                'd' => {
+                    self.delete(&keys, at);
+                    return Outcome::default();
+                }
+                _ => Err(Failure("EINVAL", "Unsupported action")),
+            }
+        };
+        // Replies only for commands that name an image (by id or number).
+        if id == 0 && number == 0 {
+            return outcome;
+        }
+        let mut head = String::new();
+        match &result {
+            Ok(image) if number != 0 => head.push_str(&format!("i={image},I={number}")),
+            _ if number != 0 => head.push_str(&format!("I={number}")),
+            _ => head.push_str(&format!("i={id}")),
+        }
+        if placement_id != 0 && action != 't' && action != 'q' {
+            head.push_str(&format!(",p={placement_id}"));
+        }
+        let message = match &result {
+            Ok(_) if quiet >= 1 => return outcome,
+            Ok(_) => "OK".to_string(),
+            Err(_) if quiet >= 2 => return outcome,
+            Err(Failure(code, text)) => format!("{code}:{text}"),
+        };
+        outcome.reply = Some(format!("\x1b_G{head};{message}\x1b\\").into_bytes());
+        outcome
+    }
+
+    /// Store an image, replacing one with the same id (and its
+    /// placements), evicting others to stay within the budget.
+    fn store(&mut self, id: u32, number: u32, width: u32, height: u32, pixels: Vec<u8>) -> u32 {
+        let id = if id != 0 { id } else { self.internal_id() };
+        if let Some(old) = self.images.remove(&id) {
+            self.total_bytes -= old.pixels.len();
+            self.placements.retain(|p| p.image_id != id);
+        }
+        let bytes = pixels.len();
+        while self.total_bytes + bytes > MAX_TOTAL_BYTES {
+            // Images without placements go first, then the oldest.
+            let victim = self
+                .images
+                .values()
+                .filter(|image| !self.placements.iter().any(|p| p.image_id == image.id))
+                .min_by_key(|image| image.generation)
+                .or_else(|| self.images.values().min_by_key(|image| image.generation))
+                .map(|image| image.id);
+            let Some(victim) = victim else { break };
+            if let Some(old) = self.images.remove(&victim) {
+                self.total_bytes -= old.pixels.len();
+            }
+            self.placements.retain(|p| p.image_id != victim);
+        }
+        self.generation += 1;
+        self.total_bytes += bytes;
+        self.images.insert(
+            id,
+            Image {
+                id,
+                number: (number != 0).then_some(number),
+                width,
+                height,
+                pixels: pixels.into(),
+                generation: self.generation,
+            },
+        );
+        id
+    }
+
+    fn internal_id(&mut self) -> u32 {
+        loop {
+            self.next_internal = self.next_internal.wrapping_add(1);
+            let id = INTERNAL_ID_BASE | (self.next_internal & !INTERNAL_ID_BASE);
+            if id != 0 && !self.images.contains_key(&id) {
+                return id;
+            }
         }
     }
 
-    /// Store an image from decoded RGBA pixel data.
-    ///
-    /// `rgba` is the pixel data (4 bytes per pixel, `width * height * 4`
-    /// bytes) already converted to the internal RGBA representation (see
-    /// [`convert_to_rgba`]). `image_id` is the requested image ID, or `None`
-    /// (or `Some(0)`) to auto-assign.
-    ///
-    /// Returns the image ID on success, or an error on failure.
-    pub fn upload_rgba(
+    fn newest_with_number(&self, number: u32) -> Option<u32> {
+        self.images
+            .values()
+            .filter(|image| image.number == Some(number))
+            .max_by_key(|image| image.generation)
+            .map(|image| image.id)
+    }
+
+    /// Place image `id` at the cursor; returns the cursor movement unless
+    /// `C=1`.
+    fn place(
         &mut self,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-        image_id: Option<u32>,
-    ) -> Result<u32, UploadError> {
-        // Validate dimensions (non-zero, within max).
-        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
-            return Err(UploadError::DimensionTooLarge);
-        }
-        // Enforce the per-image byte budget (on the stored RGBA data).
-        if rgba.len() > MAX_IMAGE_BYTES {
-            return Err(UploadError::PerImageBudget);
-        }
-        // Enforce the total byte budget.
-        if self.total_bytes + rgba.len() > MAX_TOTAL_BYTES {
-            return Err(UploadError::TotalBudget);
-        }
-        // Determine the image ID (auto-assign if absent or 0).
-        let image_id = match image_id {
-            Some(0) | None => {
-                if self.images.len() >= MAX_IMAGE_IDS {
-                    return Err(UploadError::TooManyIds);
-                }
-                // IDs are 1-based (0 is the auto-assign / clear-all sentinel).
-                let new_id = self.next_id;
-                self.next_id = self.next_id.wrapping_add(1);
-                new_id
-            }
-            Some(id) => {
-                // Explicit ID: must not already be in use.
-                if self.images.contains_key(&id) {
-                    return Err(UploadError::MalformedParams);
-                }
-                if self.images.len() >= MAX_IMAGE_IDS {
-                    return Err(UploadError::TooManyIds);
-                }
-                id
+        id: u32,
+        placement_id: u32,
+        keys: &Keys,
+        at: &Cursor,
+    ) -> Option<(u32, u32)> {
+        let image = self.images.get(&id)?;
+        let (cw, ch) = (at.cell_width.max(1), at.cell_height.max(1));
+        let sx = keys.u32("x").min(image.width);
+        let sy = keys.u32("y").min(image.height);
+        let sw = match keys.u32("w") {
+            0 => image.width - sx,
+            w => w.min(image.width - sx),
+        };
+        let sh = match keys.u32("h") {
+            0 => image.height - sy,
+            h => h.min(image.height - sy),
+        };
+        let (c, r) = (keys.u32("c"), keys.u32("r"));
+        let ratio = |a: u32, b: u32, n: u64| -> u32 {
+            if b == 0 {
+                0
+            } else {
+                (n * u64::from(a) / u64::from(b)) as u32
             }
         };
-        // Store the image.
-        let image = Image {
-            width,
-            height,
-            pixels: rgba.to_vec(),
+        let size = match (c, r) {
+            (0, 0) => (sw, sh),
+            (c, 0) => (c * cw, ratio(sh, sw, u64::from(c * cw))),
+            (0, r) => (ratio(sw, sh, u64::from(r * ch)), r * ch),
+            (c, r) => (c * cw, r * ch),
         };
-        self.total_bytes += image.byte_cost();
-        self.images.insert(image_id, image);
-        Ok(image_id)
+        let offset = (keys.u32("X").min(cw - 1), keys.u32("Y").min(ch - 1));
+        let columns = (offset.0 + size.0).div_ceil(cw).max(1);
+        let rows = (offset.1 + size.1).div_ceil(ch).max(1);
+        if placement_id != 0 {
+            self.placements
+                .retain(|p| !(p.image_id == id && p.placement_id == placement_id));
+        }
+        if self.placements.len() >= MAX_PLACEMENTS
+            && let Some(oldest) = self
+                .placements
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, p)| p.serial)
+                .map(|(i, _)| i)
+        {
+            self.placements.remove(oldest);
+        }
+        self.serial += 1;
+        self.placements.push(Placement {
+            image_id: id,
+            placement_id,
+            line: at.line,
+            scrolled: at.scrolled,
+            pulled: at.pulled,
+            col: at.col,
+            offset,
+            source: [sx, sy, sw, sh],
+            size,
+            cell: (cw, ch),
+            columns,
+            rows,
+            z: keys.i32("z"),
+            alt: at.alt,
+            serial: self.serial,
+        });
+        (keys.u32("C") != 1).then_some((columns, rows))
     }
 
-    /// The number of stored images.
-    pub fn len(&self) -> usize {
-        self.images.len()
+    /// `a=d`: delete placements (lowercase) or placements and their now
+    /// unused images (uppercase). Cell coordinates are 1-based.
+    fn delete(&mut self, keys: &Keys, at: &Cursor) {
+        let what = keys.char("d", 'a');
+        let free = what.is_ascii_uppercase();
+        let (x, y) = (keys.u32("x"), keys.u32("y"));
+        let z = keys.i32("z");
+        let id = keys.u32("i");
+        let number = keys.u32("I");
+        let pid = keys.u32("p");
+        let screen_lines = at.lines as i64;
+        let covers_col = |p: &Placement, col: u32| {
+            col >= 1 && (p.col as u32) < col && col <= p.col as u32 + p.columns
+        };
+        let covers_row = |p: &Placement, row: u32| {
+            let top = p.line_now(at.scrolled, at.pulled);
+            let row = i64::from(row) - 1;
+            row >= top && row < top + i64::from(p.rows)
+        };
+        let target_image = match what.to_ascii_lowercase() {
+            'n' => self.newest_with_number(number),
+            _ => Some(id),
+        };
+        let doomed = |p: &Placement| -> bool {
+            if p.alt != at.alt {
+                return false;
+            }
+            match what.to_ascii_lowercase() {
+                'a' => {
+                    let top = p.line_now(at.scrolled, at.pulled);
+                    top + i64::from(p.rows) > 0 && top < screen_lines
+                }
+                'i' | 'n' => {
+                    Some(p.image_id) == target_image && (pid == 0 || p.placement_id == pid)
+                }
+                'c' => covers_col(p, at.col as u32 + 1) && covers_row(p, (at.line + 1) as u32),
+                'p' => covers_col(p, x) && covers_row(p, y),
+                'q' => covers_col(p, x) && covers_row(p, y) && p.z == z,
+                'x' => covers_col(p, x),
+                'y' => covers_row(p, y),
+                'z' => p.z == z,
+                'r' => p.image_id >= x && p.image_id <= y,
+                _ => false,
+            }
+        };
+        let removed: Vec<u32> = self
+            .placements
+            .iter()
+            .filter(|p| doomed(p))
+            .map(|p| p.image_id)
+            .collect();
+        self.placements.retain(|p| !doomed(p));
+        if free {
+            let mut candidates = removed;
+            if matches!(what, 'I' | 'N')
+                && let Some(image) = target_image
+            {
+                candidates.push(image);
+            }
+            if what == 'R' {
+                candidates.extend(self.images.range(x..=y.max(x)).map(|(id, _)| *id));
+            }
+            for image in candidates {
+                if !self.placements.iter().any(|p| p.image_id == image)
+                    && let Some(old) = self.images.remove(&image)
+                {
+                    self.total_bytes -= old.pixels.len();
+                }
+            }
+        }
     }
 
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.images.is_empty()
+    /// `CSI 2 J`: delete the placements on the current screen.
+    pub fn clear_screen(&mut self, at: &Cursor) {
+        let lines = at.lines as i64;
+        self.placements.retain(|p| {
+            let top = p.line_now(at.scrolled, at.pulled);
+            p.alt != at.alt || !(top + i64::from(p.rows) > 0 && top < lines)
+        });
     }
 
-    /// Query an image by ID.
-    pub fn query(&self, id: u32) -> Option<&Image> {
+    /// `CSI 3 J`: delete the placements in the scrollback.
+    pub fn clear_scrollback(&mut self, at: &Cursor) {
+        self.placements
+            .retain(|p| p.alt || p.line_now(at.scrolled, at.pulled) + i64::from(p.rows) > 0);
+    }
+
+    /// `ESC c`: delete every placement and image.
+    pub fn reset(&mut self) {
+        self.placements.clear();
+        self.images.clear();
+        self.total_bytes = 0;
+        self.chunk = None;
+    }
+
+    /// Drop the alternate screen's placements (it was left).
+    pub fn leave_alternate_screen(&mut self) {
+        self.placements.retain(|p| !p.alt);
+    }
+
+    /// The placements visible in a viewport `display_offset` lines into
+    /// the history, lowest z first; drops those scrolled out of a history
+    /// of `history` lines.
+    pub fn visible(
+        &mut self,
+        scrolled: u64,
+        pulled: u64,
+        display_offset: usize,
+        lines: usize,
+        history: usize,
+        alt: bool,
+    ) -> Vec<VisibleImage> {
+        let oldest = -(history as i64);
+        self.placements
+            .retain(|p| p.line_now(scrolled, pulled) + i64::from(p.rows) > oldest);
+        let mut shown: Vec<(&Placement, i64)> = self
+            .placements
+            .iter()
+            .filter(|p| p.alt == alt)
+            .map(|p| (p, p.line_now(scrolled, pulled) + display_offset as i64))
+            .filter(|(p, row)| *row < lines as i64 && row + i64::from(p.rows) > 0)
+            .collect();
+        shown.sort_by_key(|(p, _)| (p.z, p.image_id, p.serial));
+        shown
+            .into_iter()
+            .filter_map(|(p, row)| {
+                let image = self.images.get(&p.image_id)?;
+                Some(VisibleImage {
+                    image_id: image.id,
+                    generation: image.generation,
+                    width: image.width,
+                    height: image.height,
+                    pixels: Arc::clone(&image.pixels),
+                    row: row as i32,
+                    col: p.col as u32,
+                    offset: p.offset,
+                    source: p.source,
+                    size: p.size,
+                    cell: p.cell,
+                    z: p.z,
+                })
+            })
+            .collect()
+    }
+
+    /// The stored image `id`.
+    pub fn image(&self, id: u32) -> Option<&Image> {
         self.images.get(&id)
     }
 
-    /// Delete an image by ID, returning it if present.
-    pub fn delete(&mut self, id: u32) -> Option<Image> {
-        let image = self.images.remove(&id)?;
-        self.total_bytes -= image.byte_cost();
-        Some(image)
+    /// Number of stored images.
+    pub fn image_count(&self) -> usize {
+        self.images.len()
     }
 
-    /// Remove all images, returning the number removed.
-    pub fn clear(&mut self) -> usize {
-        let n = self.images.len();
-        self.total_bytes = 0;
-        self.images.clear();
-        n
-    }
-
-    /// The total byte cost of all images.
+    /// Decoded bytes held for all images.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
-    /// The capabilities this implementation advertises (the supported pixel
-    /// formats: `f=24` RGB and `f=32` RGBA; `f=100` PNG is a later slice).
-    pub fn capabilities() -> GraphicsCapabilities {
-        GraphicsCapabilities {
-            supported_formats: &[24, 32],
-            max_dimension: MAX_DIMENSION,
-            max_image_bytes: MAX_IMAGE_BYTES,
-            max_total_bytes: MAX_TOTAL_BYTES,
-            max_image_ids: MAX_IMAGE_IDS,
+    /// The placements, oldest first.
+    pub fn placements(&self) -> impl Iterator<Item = &Placement> {
+        self.placements.iter()
+    }
+}
+
+/// Read, decompress and decode a transmission to RGBA.
+fn decode(keys: &Keys) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let medium = keys.char("t", 'd');
+    let file_medium = matches!(medium, 'f' | 't');
+    let raw = match medium {
+        'd' => keys.0.data.clone(),
+        'f' | 't' => read_file(keys, medium == 't')?,
+        's' => return Err(Failure("EINVAL", "Shared memory is not supported")),
+        _ => return Err(Failure("EINVAL", "Unknown transmission medium")),
+    };
+    let decoded = decode_bytes(keys, raw);
+    // A file's contents must not be probed through the error: every
+    // failure with a file medium is the same EBADF.
+    if file_medium {
+        decoded.map_err(|_| EBADF)
+    } else {
+        decoded
+    }
+}
+
+fn decode_bytes(keys: &Keys, raw: Vec<u8>) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let data = if keys.str("o") == Some("z") {
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(raw.as_slice())
+            .take(MAX_TRANSFER_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| Failure("EINVAL", "Bad zlib data"))?;
+        if out.len() > MAX_TRANSFER_BYTES {
+            return Err(Failure("EFBIG", "Image data too large"));
         }
+        out
+    } else {
+        raw
+    };
+    match keys.u32("f") {
+        0 | 32 => raw_pixels(keys, data, 4),
+        24 => raw_pixels(keys, data, 3),
+        100 => png_pixels(&data),
+        _ => Err(Failure("EINVAL", "Unknown format")),
     }
 }
 
-/// An error from placing an image.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlacementError {
-    /// The placement count would exceed the maximum.
-    TooManyPlacements,
-    /// The placement dimensions are invalid (zero).
-    InvalidDimensions,
-}
-
-/// A placement: where an image is drawn on the screen (cell coordinates).
-///
-/// Placements are maintained separately from image IDs: a placement
-/// references an image, but deleting a placement does not delete the
-/// image, and vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Placement {
-    /// The placement ID (unique among placements).
-    pub id: u32,
-    /// The image ID this placement references.
-    pub image_id: u32,
-    /// The x position in columns (0-based, may be negative if offscreen).
-    pub x: i32,
-    /// The y position in rows (0-based, may be negative if offscreen).
-    pub y: i32,
-    /// The width in columns.
-    pub columns: u32,
-    /// The height in rows.
-    pub rows: u32,
-}
-
-/// The maximum number of placements.
-pub const MAX_PLACEMENTS: usize = 1024;
-
-/// A bounded store of placements (separate from image IDs).
-#[derive(Debug)]
-pub struct PlacementStore {
-    placements: HashMap<u32, Placement>,
-    next_id: u32,
-}
-
-impl Default for PlacementStore {
-    fn default() -> Self {
-        Self::new()
+fn check_size(width: u32, height: u32) -> Result<(), Failure> {
+    if width == 0 || height == 0 {
+        return Err(Failure("EINVAL", "Zero width or height"));
     }
+    if width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || width as usize * height as usize * 4 > MAX_IMAGE_BYTES
+    {
+        return Err(Failure("EFBIG", "Image too large"));
+    }
+    Ok(())
 }
 
-impl PlacementStore {
-    /// Create an empty store.
-    ///
-    /// Placement IDs are auto-assigned starting at 1 (0 is reserved for the
-    /// "clear all" delete sentinel).
-    pub fn new() -> Self {
-        Self {
-            placements: HashMap::new(),
-            next_id: 1,
+fn raw_pixels(keys: &Keys, data: Vec<u8>, channels: usize) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let (width, height) = (keys.u32("s"), keys.u32("v"));
+    check_size(width, height)?;
+    let count = width as usize * height as usize;
+    if data.len() < count * channels {
+        return Err(Failure("ENODATA", "Insufficient image data"));
+    }
+    let pixels = if channels == 4 {
+        let mut data = data;
+        data.truncate(count * 4);
+        data
+    } else {
+        let mut out = Vec::with_capacity(count * 4);
+        for rgb in data[..count * 3].as_chunks::<3>().0 {
+            out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
-    }
+        out
+    };
+    Ok((width, height, pixels))
+}
 
-    /// Place an image at (x, y) with the given size (in cells).
-    ///
-    /// The caller must ensure the image exists (the placement store does
-    /// not validate image IDs — images and placements are maintained
-    /// separately).
-    ///
-    /// Returns the placement ID on success.
-    pub fn place(
-        &mut self,
-        image_id: u32,
-        x: i32,
-        y: i32,
-        columns: u32,
-        rows: u32,
-    ) -> Result<u32, PlacementError> {
-        if columns == 0 || rows == 0 {
-            return Err(PlacementError::InvalidDimensions);
-        }
-        if self.placements.len() >= MAX_PLACEMENTS {
-            return Err(PlacementError::TooManyPlacements);
-        }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        self.placements.insert(
-            id,
-            Placement {
-                id,
-                image_id,
-                x,
-                y,
-                columns,
-                rows,
-            },
-        );
-        Ok(id)
-    }
-
-    /// Delete a placement by ID, returning it if present.
-    pub fn delete(&mut self, id: u32) -> Option<Placement> {
-        self.placements.remove(&id)
-    }
-
-    /// Scroll all placements up by `n` rows (positive = up).
-    ///
-    /// Placements entirely above the viewport (y + rows <= 0) are deleted.
-    /// Placements partially visible are kept (clipped when drawn).
-    pub fn scroll(&mut self, n: i32) {
-        let mut to_remove = Vec::new();
-        for p in self.placements.values_mut() {
-            p.y -= n;
-            if p.y + p.rows as i32 <= 0 {
-                to_remove.push(p.id);
+fn png_pixels(data: &[u8]) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let bad = |_| Failure("EBADPNG", "Failed to decode PNG");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    decoder.set_limits(png::Limits {
+        bytes: MAX_IMAGE_BYTES,
+    });
+    let mut reader = decoder.read_info().map_err(bad)?;
+    let (width, height) = reader.info().size();
+    check_size(width, height)?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or(Failure("EFBIG", "Image too large"))?;
+    let mut buffer = vec![0; size];
+    let info = reader.next_frame(&mut buffer).map_err(bad)?;
+    let bytes = &buffer[..info.buffer_size()];
+    let count = width as usize * height as usize;
+    let mut out = Vec::with_capacity(count * 4);
+    match info.color_type {
+        png::ColorType::Rgba => out.extend_from_slice(bytes),
+        png::ColorType::Rgb => {
+            for p in bytes.as_chunks::<3>().0 {
+                out.extend_from_slice(&[p[0], p[1], p[2], 255]);
             }
         }
-        for id in to_remove {
-            self.placements.remove(&id);
+        png::ColorType::GrayscaleAlpha => {
+            for p in bytes.as_chunks::<2>().0 {
+                out.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
         }
+        png::ColorType::Grayscale => {
+            for &g in bytes {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        png::ColorType::Indexed => return Err(Failure("EBADPNG", "Failed to decode PNG")),
     }
-
-    /// Clear all placements (alternate screen policy).
-    ///
-    /// Switching to the alternate screen clears all placements. Switching
-    /// back does not restore them (documented policy).
-    pub fn clear(&mut self) {
-        self.placements.clear();
+    if out.len() != count * 4 {
+        return Err(Failure("EBADPNG", "Failed to decode PNG"));
     }
-
-    /// Get a placement by ID.
-    pub fn get(&self, id: u32) -> Option<&Placement> {
-        self.placements.get(&id)
-    }
-
-    /// All placements (for drawing).
-    pub fn all(&self) -> impl Iterator<Item = &Placement> {
-        self.placements.values()
-    }
-
-    /// The number of placements.
-    pub fn len(&self) -> usize {
-        self.placements.len()
-    }
-
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.placements.is_empty()
-    }
+    Ok((width, height, out))
 }
 
-/// A clipped rectangle: the visible portion of a placement (in cells).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClippedRect {
-    /// The x position in columns (0-based).
-    pub x: i32,
-    /// The y position in rows (0-based).
-    pub y: i32,
-    /// The width in columns.
-    pub columns: u32,
-    /// The height in rows.
-    pub rows: u32,
+/// Read a file named by the payload (`t=f`, or `t=t` which is removed
+/// afterwards when it is a temporary file of this protocol). Regular files
+/// only; `/proc`, `/sys` and `/dev` are refused. Every failure is EBADF.
+fn read_file(keys: &Keys, temporary: bool) -> Result<Vec<u8>, Failure> {
+    let path = std::str::from_utf8(&keys.0.data).map_err(|_| EBADF)?;
+    let path = std::fs::canonicalize(path).map_err(|_| EBADF)?;
+    if ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|p| path.starts_with(p))
+    {
+        return Err(EBADF);
+    }
+    let file = std::fs::File::open(&path).map_err(|_| EBADF)?;
+    let meta = file.metadata().map_err(|_| EBADF)?;
+    if !meta.is_file() {
+        return Err(EBADF);
+    }
+    let offset = u64::from(keys.u32("O"));
+    let size = match keys.u32("S") {
+        0 => meta.len().saturating_sub(offset),
+        s => u64::from(s),
+    };
+    if size > MAX_TRANSFER_BYTES as u64 {
+        return Err(EBADF);
+    }
+    let mut data = Vec::with_capacity(size as usize);
+    let mut reader = std::io::BufReader::new(file);
+    std::io::copy(&mut (&mut reader).take(offset), &mut std::io::sink()).map_err(|_| EBADF)?;
+    reader
+        .take(size)
+        .read_to_end(&mut data)
+        .map_err(|_| EBADF)?;
+    if temporary && is_protocol_temp_file(&path) {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(data)
 }
 
-/// Clip a placement to the viewport (in cells).
-///
-/// Returns the visible portion, or `None` if the placement is entirely
-/// offscreen.
-pub fn clip(
-    x: i32,
-    y: i32,
-    columns: u32,
-    rows: u32,
-    viewport_cols: i32,
-    viewport_rows: i32,
-) -> Option<ClippedRect> {
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + columns as i32).min(viewport_cols);
-    let y1 = (y + rows as i32).min(viewport_rows);
-    if x1 <= x0 || y1 <= y0 {
-        return None; // Entirely offscreen.
+/// A `t=t` file is deleted only inside a temporary directory and only if
+/// its path says it belongs to this protocol.
+fn is_protocol_temp_file(path: &std::path::Path) -> bool {
+    let mut dirs = vec![
+        std::path::PathBuf::from("/tmp"),
+        std::path::PathBuf::from("/dev/shm"),
+    ];
+    if let Some(tmp) = std::env::var_os("TMPDIR") {
+        dirs.push(std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.into()));
     }
-    Some(ClippedRect {
-        x: x0,
-        y: y0,
-        columns: (x1 - x0) as u32,
-        rows: (y1 - y0) as u32,
-    })
-}
-
-/// A protocol handler that processes [`GraphicsEvent`]s against the image
-/// and placement stores and generates protocol replies.
-///
-/// The handler speaks the real kitty-graphics protocol (per ADR-011): a `G`
-/// command character followed by comma-separated `key=value` control data.
-/// The action is selected by the `a` key (`T` transmit [default], `p`
-/// placement, `q` query, `d` delete); `q=1` suppresses replies.
-///
-/// The reply format (documented subset) is an APC reusing the `G` command
-/// character: `ESC _ G <keys> ST`, where `<keys>` carries the image ID
-/// (`i`), the placement ID (`p`, for placement replies), the image
-/// dimensions (`s`/`v`, for query replies), and an `OK`/`ERR` status.
-///
-/// Chunked uploads (kitty spec): the first chunk carries the metadata plus
-/// `m=1`; subsequent chunks carry only `m=1` + data; the final chunk carries
-/// `m=0`. The handler accumulates the decoded data across chunks and
-/// processes the complete image only when the final chunk arrives.
-pub struct GraphicsHandler {
-    /// The uploaded images.
-    pub images: ImageStore,
-    /// The placements (separate from image IDs).
-    pub placements: PlacementStore,
-    /// In-progress chunked upload: the first chunk's event (metadata + first
-    /// data), with subsequent chunks' data appended to `data`. `None` when no
-    /// chunked upload is in flight. The client must finish a chunked upload
-    /// before sending other graphics escapes (kitty spec), so at most one is
-    /// in flight at a time.
-    in_progress: Option<crate::graphics_filter::GraphicsEvent>,
-}
-
-impl Default for GraphicsHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GraphicsHandler {
-    /// Create a handler with empty stores.
-    pub fn new() -> Self {
-        Self {
-            images: ImageStore::new(),
-            placements: PlacementStore::new(),
-            in_progress: None,
-        }
-    }
-
-    /// Process a graphics event, returning the reply string (if a reply is
-    /// due and not suppressed) or `None`.
-    ///
-    /// Chunked uploads (kitty spec): the first chunk carries the metadata
-    /// (`s`/`v`/`f`/`i`) plus `m=1`; subsequent chunks carry only `m=1` +
-    /// data; the final chunk carries `m=0`. The handler accumulates the
-    /// decoded data across chunks and processes the complete image only when
-    /// the final chunk (`m=0`) arrives (no reply before then). A `G` event
-    /// with no `m` key is a single (non-chunked) frame and is processed
-    /// immediately.
-    pub fn process(&mut self, event: &GraphicsEvent) -> Option<String> {
-        // The real protocol uses command 'G' with an 'a' action key.
-        if event.command != b'G' {
-            return None;
-        }
-        // Quiet mode: q=1 suppresses replies.
-        let quiet = event.get("q").is_some_and(|v| v == "1");
-        match event.get("m") {
-            Some("1") => {
-                // Chunked: first or subsequent chunk.
-                if self.in_progress.is_none() {
-                    // First chunk: start the accumulation (metadata + first data).
-                    self.in_progress = Some(event.clone());
-                } else if let Some(ref mut ip) = self.in_progress {
-                    // Subsequent chunk: append its data.
-                    ip.data.extend_from_slice(&event.data);
-                }
-                None // No reply until the final chunk (m=0).
-            }
-            Some("0") => {
-                // Final chunk: complete the accumulation and process.
-                let complete = if let Some(mut ip) = self.in_progress.take() {
-                    ip.data.extend_from_slice(&event.data);
-                    Some(ip)
-                } else {
-                    // Malformed (m=0 with no first chunk): treat as a single frame.
-                    Some(event.clone())
-                };
-                match complete {
-                    // The first chunk's parameters (including `q`) govern the
-                    // reply for the whole chunked upload.
-                    Some(ev) => {
-                        let quiet = ev.get("q").is_some_and(|v| v == "1");
-                        self.process_action(&ev, quiet)
-                    }
-                    None => None,
-                }
-            }
-            _ => self.process_action(event, quiet),
-        }
-    }
-
-    /// Dispatch a complete (non-chunked or fully-assembled) event to its
-    /// action handler.
-    fn process_action(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
-        // The action key defaults to transmit (a=T) when absent.
-        let action = event.get("a").unwrap_or("T");
-        match action {
-            "T" => self.process_transmit(event, quiet),
-            "p" => self.process_place(event, quiet),
-            "q" => self.process_query(event, quiet),
-            "d" => self.process_delete(event, quiet),
-            _ => None, // Unsupported action: not advertised, no reply.
-        }
-    }
-
-    /// Build a reply APC (`ESC _ G <keys> ST`), or `None` when quiet.
-    fn reply(&self, quiet: bool, keys: &str) -> Option<String> {
-        if quiet {
-            None
-        } else {
-            Some(format!("ESC _ G {keys} ST"))
-        }
-    }
-
-    /// Transmit (store) an image: `f` (format, default 32), `s`/`v`
-    /// (dimensions), `i` (image ID, optional). Replies only when `i` is
-    /// present (the real protocol) and not quiet.
-    fn process_transmit(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
-        let format = event.get_u32("f").unwrap_or(32);
-        let width = event.get_u32("s").unwrap_or(0);
-        let height = event.get_u32("v").unwrap_or(0);
-        let image_id = event.get_u32("i");
-        // Convert the payload to RGBA (validates format + data length).
-        let rgba = match convert_to_rgba(format, width, height, &event.data) {
-            Ok(rgba) => rgba,
-            Err(_) => {
-                let id = image_id.unwrap_or(0);
-                return self.reply(quiet, &format!("i={id};ERR"));
-            }
-        };
-        let result = self.images.upload_rgba(width, height, &rgba, image_id);
-        match result {
-            Ok(id) => {
-                // Reply only when an image ID was requested (real protocol).
-                if image_id.is_some() {
-                    self.reply(quiet, &format!("i={id};OK"))
-                } else {
-                    None
-                }
-            }
-            Err(_) => {
-                let id = image_id.unwrap_or(0);
-                self.reply(quiet, &format!("i={id};ERR"))
-            }
-        }
-    }
-
-    /// Place an image: `i` (image ID), `X`/`Y` (cell offsets), `c`/`r`
-    /// (destination columns/rows). Placement IDs are auto-assigned (1-based);
-    /// the `p` key is not yet supported in this subset.
-    fn process_place(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
-        let image_id = event.get_u32("i").unwrap_or(0);
-        let x = event.get_i32("X").unwrap_or(0);
-        let y = event.get_i32("Y").unwrap_or(0);
-        let columns = event.get_u32("c").unwrap_or(0);
-        let rows = event.get_u32("r").unwrap_or(0);
-        // The image must exist.
-        if self.images.query(image_id).is_none() {
-            return self.reply(quiet, &format!("i={image_id};ERR"));
-        }
-        let result = self.placements.place(image_id, x, y, columns, rows);
-        match result {
-            Ok(id) => self.reply(quiet, &format!("i={image_id},p={id};OK")),
-            Err(_) => self.reply(quiet, &format!("i={image_id};ERR")),
-        }
-    }
-
-    /// Query an image: `i` (image ID). Replies with the dimensions when
-    /// found, `ERR` when not.
-    fn process_query(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
-        let id = event.get_u32("i").unwrap_or(0);
-        match self.images.query(id) {
-            Some(image) => self.reply(
-                quiet,
-                &format!("i={id},s={},v={};OK", image.width, image.height),
-            ),
-            None => self.reply(quiet, &format!("i={id};ERR")),
-        }
-    }
-
-    /// Delete: `a=d` with a `d` variant.
-    /// - no `d` key: clear all visible placements.
-    /// - `d=i` (+ `i`): delete image(s); no `i`/`i=0` deletes all images.
-    /// - `d=p` (+ `p`): delete the placement with that ID.
-    ///
-    /// Other variants are not supported in this subset.
-    fn process_delete(&mut self, event: &GraphicsEvent, quiet: bool) -> Option<String> {
-        match event.get("d") {
-            None => {
-                // Clear all visible placements.
-                let had = !self.placements.is_empty();
-                self.placements.clear();
-                self.reply(quiet, if had { "i=0;OK" } else { "i=0;ERR" })
-            }
-            Some("i") => {
-                match event.get_u32("i") {
-                    Some(0) | None => {
-                        // Delete all images.
-                        let had = !self.images.is_empty();
-                        self.images.clear();
-                        self.reply(quiet, if had { "i=0;OK" } else { "i=0;ERR" })
-                    }
-                    Some(id) => {
-                        let found = self.images.delete(id).is_some();
-                        self.reply(
-                            quiet,
-                            &format!("i={id};{}", if found { "OK" } else { "ERR" }),
-                        )
-                    }
-                }
-            }
-            Some("p") => {
-                let id = event.get_u32("p").unwrap_or(0);
-                let found = self.placements.delete(id).is_some();
-                self.reply(
-                    quiet,
-                    &format!("p={id};{}", if found { "OK" } else { "ERR" }),
-                )
-            }
-            _ => self.reply(quiet, "ERR"),
-        }
-    }
+    dirs.iter().any(|dir| path.starts_with(dir))
+        && path.to_string_lossy().contains("tty-graphics-protocol")
 }
