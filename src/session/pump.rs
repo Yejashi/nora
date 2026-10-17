@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use super::pty::{DRAIN_TIMEOUT, LaunchSpec, PtySession, SessionEvent};
+use super::pty::{DRAIN_TIMEOUT, LaunchSpec, PasteSegment, PtySession, SessionEvent};
 use crate::engine::Snapshot;
 use crate::input::paste::{PasteValidation, validate_paste};
 use crate::render::term::is_noop_damage;
@@ -381,6 +381,72 @@ pub fn cancel_paste(pending_input: &mut Vec<u8>, paste_block: &mut Option<PasteB
     text_end - cut
 }
 
+/// [`cancel_paste`], but the bytes it keeps queued (the rest of a cut
+/// character or marker, a bracketed paste's end marker) stay tracked as
+/// the in-flight block, so replies still wait for the paste's end
+/// ([`paste_segment`]). Returns the count of bytes dropped.
+pub fn cancel_paste_keeping_tail(
+    pending_input: &mut Vec<u8>,
+    paste_block: &mut Option<PasteBlock>,
+) -> usize {
+    let before = *paste_block;
+    let dropped = cancel_paste(pending_input, paste_block);
+    if let Some(block) = before
+        && block.fed > 0
+        && block.end - block.start > dropped
+    {
+        *paste_block = Some(PasteBlock {
+            end: block.end - dropped,
+            ..block
+        });
+    }
+    dropped
+}
+
+/// Where the bytes fed so far leave the in-flight paste, for the
+/// session's protocol replies: [`PasteSegment::Open`] between two payload
+/// characters of a bracketed paste (or right after its start marker, or
+/// right before its end marker), [`PasteSegment::Hold`] inside a marker
+/// or a UTF-8 character, [`PasteSegment::Closed`] otherwise.
+pub fn paste_segment(pending_input: &[u8], paste_block: Option<PasteBlock>) -> PasteSegment {
+    let Some(block) = paste_block else {
+        return PasteSegment::Closed;
+    };
+    if !block.bracketed || block.fed == 0 {
+        return PasteSegment::Closed;
+    }
+    let total = block.total();
+    if block.fed < BRACKET_MARKER_LEN || block.fed > total.saturating_sub(BRACKET_MARKER_LEN) {
+        return PasteSegment::Hold;
+    }
+    if pending_input
+        .get(block.start)
+        .is_some_and(|&byte| byte & 0xC0 == 0x80)
+    {
+        return PasteSegment::Hold;
+    }
+    PasteSegment::Open
+}
+
+/// A reply closed the in-flight bracketed paste for good (the application
+/// turned bracketed paste off): drop the block's end marker, so the rest
+/// of the paste is sent as ordinary text.
+pub fn unbracket_paste(pending_input: &mut Vec<u8>, paste_block: &mut Option<PasteBlock>) {
+    let Some(block) = *paste_block else {
+        return;
+    };
+    if !block.bracketed || block.end - block.start < BRACKET_MARKER_LEN {
+        return;
+    }
+    pending_input.drain(block.end - BRACKET_MARKER_LEN..block.end);
+    let end = block.end - BRACKET_MARKER_LEN;
+    *paste_block = (end > block.start).then_some(PasteBlock {
+        end,
+        bracketed: false,
+        ..block
+    });
+}
+
 /// Whether `bytes` (one encoded key) cancel an in-flight paste: Ctrl+C
 /// (`0x03`, or kitty `CSI 99;5u`) or Escape (`0x1b`, or kitty `CSI 27u`),
 /// pressed (not repeated or released). Caps Lock and Num Lock are ignored
@@ -524,7 +590,7 @@ pub fn queue_key_input(
     bytes: &[u8],
 ) -> bool {
     if paste_block.is_some() && is_paste_cancel_key(bytes) {
-        let dropped = cancel_paste(pending_input, paste_block);
+        let dropped = cancel_paste_keeping_tail(pending_input, paste_block);
         if debug_enabled() {
             eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
         }
@@ -550,7 +616,16 @@ pub fn feed_pending(
     paste_block: &mut Option<PasteBlock>,
 ) -> usize {
     let mut fed = 0;
-    while !pending_input.is_empty() {
+    loop {
+        // A reply closed the paste for good: the rest goes unbracketed.
+        if session.take_paste_closed() {
+            unbracket_paste(pending_input, paste_block);
+        }
+        // Replies queued from here on go around the paste's markers.
+        session.set_paste_segment(paste_segment(pending_input, *paste_block));
+        if pending_input.is_empty() {
+            break;
+        }
         // Paste bytes enter the session only while it holds less than
         // `PASTE_WINDOW` (writer plus in flight), so the rest of a paste a
         // slow child is still reading stays here, where Ctrl+C or Escape
@@ -567,6 +642,8 @@ pub fn feed_pending(
             break;
         }
         match session.feed(&pending_input[..limit]) {
+            // Refused while a closed paste waits (handled above).
+            Ok(0) if session.paste_closed_pending() => {}
             Ok(0) => break,
             Ok(accepted) => {
                 pending_input.drain(..accepted);
@@ -579,6 +656,7 @@ pub fn feed_pending(
             Err(_) => {
                 pending_input.clear();
                 *paste_block = None;
+                session.set_paste_segment(PasteSegment::Closed);
                 break;
             }
         }
@@ -1373,8 +1451,10 @@ pub fn pump_thread(
                 }
                 PumpMsg::CancelPaste { pane } => {
                     if let Some(pane_pump) = sessions.get_mut(&pane) {
-                        let dropped =
-                            cancel_paste(&mut pane_pump.pending_input, &mut pane_pump.paste_block);
+                        let dropped = cancel_paste_keeping_tail(
+                            &mut pane_pump.pending_input,
+                            &mut pane_pump.paste_block,
+                        );
                         if debug_enabled() {
                             eprintln!("debug: pump: paste cancelled, dropped {dropped} byte(s)");
                         }

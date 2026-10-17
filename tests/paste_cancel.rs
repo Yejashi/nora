@@ -51,7 +51,8 @@ fn ctrl_c_cancels_the_rest_and_follows_the_end_marker() {
     assert!(queue_key_input(&mut pending, &mut block, b"k"));
     assert!(block.is_some(), "an ordinary key does not cancel");
     assert!(queue_key_input(&mut pending, &mut block, b"\x03"));
-    assert_eq!(block, None);
+    // The kept end marker stays tracked, so replies wait for it.
+    assert_eq!(block.map(|b| (b.start, b.end)), Some((0, 6)));
     assert_eq!(pending, b"\x1b[201~k\x03".to_vec());
 }
 
@@ -106,7 +107,7 @@ fn a_paste_to_a_child_that_does_not_read_stays_cancellable() {
     assert!(handed < 400 * 1024, "{handed} byte(s) left the pump");
 
     assert!(queue_key_input(&mut pending, &mut block, b"\x03"));
-    assert_eq!(block, None);
+    assert_eq!(block.map(|b| (b.start, b.end)), Some((0, 6)));
     assert_eq!(
         pending,
         b"\x1b[201~\x03".to_vec(),

@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, EventLoopSender, Msg};
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::tty::{self, Options, Shell};
 
 use crate::engine::{Engine, EventRecord};
@@ -185,6 +186,29 @@ pub enum SessionEvent {
     },
 }
 
+/// Where the input queued so far leaves a bracketed paste, for protocol
+/// replies (set by the pump with [`PtySession::set_paste_segment`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PasteSegment {
+    /// No bracketed paste is open: replies are queued as they come.
+    #[default]
+    Closed,
+    /// Between two payload characters of an open bracketed paste: replies
+    /// close the paste (`CSI 201 ~`), follow in order, and reopen it
+    /// (`CSI 200 ~`) while the application still asks for bracketed paste.
+    Open,
+    /// Inside a paste marker or a UTF-8 character: replies wait, in order,
+    /// until the next boundary.
+    Hold,
+}
+
+/// Most reply bytes a session holds while a paste segment is at
+/// [`PasteSegment::Hold`]; replies past it are dropped.
+const MAX_HELD_REPLIES: usize = 64 * 1024;
+
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
 /// A session bound to a real PTY child: N03 [`Engine`] + N04a
 /// [`BoundedWriter`] + the pinned event loop driven against the engine's
 /// shared term.
@@ -218,6 +242,16 @@ pub struct PtySession {
     /// Whether a synchronized update was pending after the PTY loop's
     /// last read (set by the vendored loop): its frame is half-applied.
     sync_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the queued input leaves a bracketed paste (see
+    /// [`PasteSegment`]).
+    paste_segment: PasteSegment,
+    /// Replies waiting for a paste boundary, oldest first, and their bytes.
+    held_replies: Vec<String>,
+    held_bytes: usize,
+    /// A reply closed the open paste for good (the application no longer
+    /// asks for bracketed paste): `feed` accepts nothing until the pump
+    /// takes this and drops the paste's end marker.
+    paste_closed: bool,
     /// The session loop thread (N12a): a wrapper around the pinned PTY
     /// reader that folds [`Lifecycle::Exiting`] on the wrapper's return
     /// (every exit path of the pinned loop funnels through it) and
@@ -384,6 +418,10 @@ impl PtySession {
             palette: options.palette,
             in_flight,
             sync_pending,
+            paste_segment: PasteSegment::Closed,
+            held_replies: Vec::new(),
+            held_bytes: 0,
+            paste_closed: false,
             #[cfg(unix)]
             child_pid,
             #[cfg(unix)]
@@ -472,13 +510,79 @@ impl PtySession {
 
     /// App bytes into the writer's app budget (partial acceptance,
     /// `BoundedWriter::enqueue` semantics). `Err(Closed)` when closed.
+    /// Accepts nothing while a closed paste waits for
+    /// [`Self::take_paste_closed`].
     pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, WriterError> {
         self.process_events();
+        if self.paste_closed {
+            return Ok(0);
+        }
         let accepted = self.writer.enqueue(bytes)?;
         if accepted > 0 {
             self.ledger.track_app(accepted);
         }
         Ok(accepted)
+    }
+
+    /// Say where the input fed so far leaves a bracketed paste (the pump
+    /// knows its paste's markers). Replies held for a boundary go out
+    /// once there is one.
+    pub fn set_paste_segment(&mut self, segment: PasteSegment) {
+        self.paste_segment = segment;
+        if segment != PasteSegment::Hold && !self.held_replies.is_empty() {
+            self.queue_replies(Vec::new());
+        }
+    }
+
+    /// Whether a reply closed the open bracketed paste for good, because
+    /// the application turned bracketed paste off (once; clears it). The
+    /// caller must then send the rest of the paste without its end marker.
+    pub fn take_paste_closed(&mut self) -> bool {
+        std::mem::take(&mut self.paste_closed)
+    }
+
+    /// Whether [`Self::take_paste_closed`] would report a closed paste.
+    pub fn paste_closed_pending(&self) -> bool {
+        self.paste_closed
+    }
+
+    /// Queue protocol replies, after any held ones, around the paste
+    /// segment (see [`PasteSegment`]).
+    fn queue_replies(&mut self, replies: Vec<String>) {
+        if self.paste_segment == PasteSegment::Hold {
+            for reply in replies {
+                if self.held_bytes + reply.len() <= MAX_HELD_REPLIES {
+                    self.held_bytes += reply.len();
+                    self.held_replies.push(reply);
+                }
+            }
+            return;
+        }
+        let mut all = std::mem::take(&mut self.held_replies);
+        self.held_bytes = 0;
+        all.extend(replies);
+        if all.is_empty() {
+            return;
+        }
+        match self.paste_segment {
+            PasteSegment::Open => {
+                let reopen = self.engine.modes().contains(TermMode::BRACKETED_PASTE);
+                let mut wrapped = String::from(PASTE_END);
+                wrapped.extend(all);
+                if reopen {
+                    wrapped.push_str(PASTE_START);
+                }
+                if self.ledger.accept(&mut self.writer, &wrapped) > 0 && !reopen {
+                    self.paste_segment = PasteSegment::Closed;
+                    self.paste_closed = true;
+                }
+            }
+            _ => {
+                for reply in all {
+                    self.ledger.accept(&mut self.writer, &reply);
+                }
+            }
+        }
     }
 
     /// Input bytes handed to the PTY loop and not yet written to the PTY
@@ -763,6 +867,7 @@ impl PtySession {
     /// rejections counted there, never dropped), `ChildExit` records
     /// the status, and other events are discarded.
     fn process_events(&mut self) {
+        let mut replies = Vec::new();
         for record in self.engine.drain_events() {
             // Fold presentation state on the main thread: latest title
             // wins; a reset clears it.
@@ -787,10 +892,13 @@ impl PtySession {
                     if let Some(reply) =
                         resolve_record(&self.engine, self.size, &self.palette, record)
                     {
-                        self.ledger.accept(&mut self.writer, &reply);
+                        replies.push(reply);
                     }
                 }
             }
+        }
+        if !replies.is_empty() {
+            self.queue_replies(replies);
         }
     }
 
