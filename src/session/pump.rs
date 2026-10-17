@@ -443,10 +443,30 @@ fn close_in_background(mut session: PtySession) -> Option<std::thread::JoinHandl
     }
 }
 
-/// Most input bytes a pane queues in the pump (2 MiB). With the writer
-/// budget and [`super::pty::MAX_IN_FLIGHT`] this bounds a pane's input
-/// memory end to end; past it, keys and pastes are refused.
+/// Most paste bytes a pane queues in the pump (2 MiB); a paste that would
+/// pass it is refused. Keyboard input may use [`INPUT_HEADROOM`] more, so
+/// keys such as Ctrl+C typed behind a large paste to a child that stopped
+/// reading are still accepted. With the writer budget and
+/// [`super::pty::MAX_IN_FLIGHT`] this bounds a pane's input memory end to
+/// end.
 pub const MAX_PENDING_INPUT: usize = 2 * 1024 * 1024;
+
+/// Extra queue bytes reserved for [`PumpMsg::Input`] (keys, mouse
+/// reports, accepted suggestions) beyond [`MAX_PENDING_INPUT`]: pastes
+/// can never use it.
+pub const INPUT_HEADROOM: usize = 16 * 1024;
+
+/// Queue `bytes` from a [`PumpMsg::Input`] in `pending_input`, unless that
+/// would pass `MAX_PENDING_INPUT + INPUT_HEADROOM`. Returns whether the
+/// bytes were accepted (refused input is never partly queued).
+pub fn accept_input(pending_input: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    if pending_input.len() + bytes.len() <= MAX_PENDING_INPUT + INPUT_HEADROOM {
+        pending_input.extend_from_slice(bytes);
+        true
+    } else {
+        false
+    }
+}
 
 pub fn feed_pending(
     session: &mut PtySession,
@@ -1127,9 +1147,8 @@ pub fn pump_thread(
                         pane_pump.input_seq = seq;
                         // Refused (never accepted, then dropped) when the
                         // pane's queue is full: the child stopped reading.
-                        if pane_pump.pending_input.len() + bytes.len() <= MAX_PENDING_INPUT {
-                            pane_pump.pending_input.extend(bytes);
-                        } else if debug_enabled() {
+                        // Keys keep a headroom pastes cannot fill.
+                        if !accept_input(&mut pane_pump.pending_input, &bytes) && debug_enabled() {
                             eprintln!("debug: pump: input refused, {pane:?} queue full");
                         }
                     }

@@ -362,3 +362,17 @@ fn paste_streams_to_pty_in_order() {
 
     session.close();
 }
+
+/// Keys typed behind a paste that filled the pane's queue (the child
+/// stopped reading) are still accepted, within a bounded headroom.
+#[test]
+fn keys_are_accepted_behind_a_full_paste_queue() {
+    use nora::session::pump::{INPUT_HEADROOM, MAX_PENDING_INPUT, accept_input};
+    let mut pending = vec![b'x'; MAX_PENDING_INPUT];
+    assert!(accept_input(&mut pending, b"\x03"), "Ctrl+C is accepted");
+    assert_eq!(pending.last(), Some(&0x03));
+    let room = MAX_PENDING_INPUT + INPUT_HEADROOM - pending.len();
+    assert!(accept_input(&mut pending, &vec![b'k'; room]));
+    assert!(!accept_input(&mut pending, b"k"), "the headroom is bounded");
+    assert_eq!(pending.len(), MAX_PENDING_INPUT + INPUT_HEADROOM);
+}
