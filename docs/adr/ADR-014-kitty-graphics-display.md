@@ -67,8 +67,10 @@ A conforming display needs, from the spec
   command with the loaded result. The parser keeps its state across the
   gap, so the bytes are still parsed in order and replies keep their
   place. `Engine::feed` runs the filter before it locks, so it loads
-  files there (up to 64 MiB decoded per chunk; past that, in place). A
-  path sent in chunks (`m=1`) is answered `EBADF` and never read.
+  files there (up to 64 MiB decoded per chunk; past that, in place). `m`
+  chunks direct data only; on a file, temporary-file or shared-memory
+  command it is ignored (the spec limits chunking to direct data, and
+  mpv's kitty output sends every shared-memory frame as `t=s,m=1`).
   Rejected: refusing network and FUSE filesystems by `fstatfs` magic
   (a local disk can also stall, and it blocks legitimate use).
 - **Dependencies.** `png` (0.18.1) and `flate2` (1.1.10) become direct

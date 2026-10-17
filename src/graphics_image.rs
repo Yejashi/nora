@@ -269,7 +269,7 @@ impl GraphicsState {
         }
         // Chunking: the first chunk carries the keys; later ones only `m`
         // (and perhaps `q`) and data. A delete aborts a transfer.
-        let more = event.get("m") == Some("1");
+        let more = chunks(event);
         let keys = Keys(event);
         if keys.char("a", 't') == 'd' && self.chunk.is_some() && event.get("m").is_none() {
             self.chunk = None;
@@ -285,10 +285,8 @@ impl GraphicsState {
             }
             let complete = self.chunk.take().expect("chunk in progress");
             let overflow = std::mem::take(&mut self.chunk_overflow);
-            // File media are not chunked: a path sent in chunks is never
-            // read (it would be read here, under the terminal lock).
-            let media = is_file_medium(&complete).then_some(LoadedMedia(Err(EBADF)));
-            return self.complete(&complete, at, overflow, media);
+            // Only direct data is chunked (see `chunks`).
+            return self.complete(&complete, at, overflow, None);
         }
         if more {
             self.chunk = Some(event.clone());
@@ -915,6 +913,15 @@ fn is_file_medium(event: &GraphicsEvent) -> bool {
     matches!(Keys(event).char("t", 'd'), 'f' | 't' | 's')
 }
 
+/// Whether `event` continues in a further chunk (`m=1`). Chunking is for
+/// direct data only (the spec: "only for the direct transmission
+/// medium"); a file, temporary file or shared-memory command is complete
+/// as it is, whatever its `m` says. mpv's kitty output sends every
+/// shared-memory frame as `t=s,...,m=1` with no final chunk.
+fn chunks(event: &GraphicsEvent) -> bool {
+    event.get("m") == Some("1") && !is_file_medium(event)
+}
+
 /// Follow a command through [`GraphicsState::handle`]'s chunking rules:
 /// `in_chunk` says whether a chunked transfer is in progress before the
 /// command and is updated past it. Returns whether handling the command
@@ -925,7 +932,7 @@ pub fn track_file_read(event: &GraphicsEvent, in_chunk: &mut bool) -> bool {
         return false;
     }
     let keys = Keys(event);
-    let more = event.get("m") == Some("1");
+    let more = chunks(event);
     if keys.char("a", 't') == 'd' && *in_chunk && event.get("m").is_none() {
         *in_chunk = false;
     }
@@ -1098,7 +1105,9 @@ fn read_file(keys: &Keys, temporary: bool) -> Result<Vec<u8>, Failure> {
 /// `/name` is `/dev/shm/name`.
 fn shared_memory_path(keys: &Keys) -> Option<std::path::PathBuf> {
     let name = std::str::from_utf8(&keys.0.data).ok()?;
-    let base = name.strip_prefix('/')?;
+    // `shm_open` takes the name with or without its leading slash (mpv
+    // sends `mpv-kitty-...`); any other slash is refused.
+    let base = name.strip_prefix('/').unwrap_or(name);
     if base.is_empty() || base.contains('/') || base.contains('\0') {
         return None;
     }
