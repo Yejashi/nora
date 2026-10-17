@@ -222,7 +222,7 @@ jobs:
             xvfb xdotool imagemagick xkb-data libxkbcommon0 libxkbcommon-x11-0 \
             libvulkan1 mesa-vulkan-drivers fonts-noto-core fonts-noto-cjk \
             vim neovim tmux htop zsh ibus dbus less openssh-client openssh-server \
-            x11-xkb-utils x11-xserver-utils
+            x11-xkb-utils x11-xserver-utils x11-utils
       - name: cargo build --release
         run: cargo build --release --locked
       - name: scripts/e2e-x11.sh

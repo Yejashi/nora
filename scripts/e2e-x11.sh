@@ -994,6 +994,7 @@ RC
 # suggestion while composing, and the commit reaches the shell once.
 scenario_ime() {
     have ibus-daemon ime || return
+    have xprop ime || return
     have dbus-daemon ime || return
     have dbus-monitor ime || return
     have zsh ime || return
@@ -1024,6 +1025,14 @@ RC
     local monitor_pid=$!
     stop_ime() { kill "$monitor_pid" "$ibus_pid" "$bus_pid" 2>/dev/null; unset DBUS_SESSION_BUS_ADDRESS; }
     [ "$engine" = set ] || { stop_ime; fail ime "ibus did not start"; return; }
+    # The XIM frontend registers on the display after the daemon is up;
+    # a client started before that falls back to no input method.
+    local xim=no
+    for _ in $(seq 1 100); do
+        xprop -root XIM_SERVERS 2>/dev/null | grep -q '@server=ibus' && { xim=yes; break; }
+        sleep 0.1
+    done
+    [ "$xim" = yes ] || { stop_ime; fail ime "ibus did not register its XIM server"; return; }
     XMODIFIERS=@im=ibus ZDOTDIR="$dir/zdot" NORA_TRACE_SHELL=1 launch ime zsh -d -i \
         || { stop_ime; fail ime "no window"; return; }
     for _ in $(seq 1 100); do
