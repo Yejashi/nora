@@ -6,7 +6,7 @@
 #                    binary under ~/.local/libexec/nora/)
 #   terminfo      -> ~/.terminfo (compiled from terminfo/nora.terminfo)
 #   desktop entry -> ~/.local/share/applications/nora.desktop
-#   icon          -> ~/.local/share/icons/hicolor/128x128/apps/nora.png
+#   icon          -> ~/.local/share/icons/hicolor/{128x128,scalable}/apps/nora.{png,svg}
 #
 # User config is preserved: an existing ~/.config/nora/config.toml is
 # never touched. When no config exists, the example config is copied in
@@ -110,6 +110,8 @@ echo "==> installing icon to $PREFIX/share/icons"
 ICON_DIR="$PREFIX/share/icons/hicolor/128x128/apps"
 mkdir -p "$ICON_DIR"
 install -m 0644 resources/nora.png "$ICON_DIR/nora.png"
+mkdir -p "$PREFIX/share/icons/hicolor/scalable/apps"
+install -m 0644 resources/nora.svg "$PREFIX/share/icons/hicolor/scalable/apps/nora.svg"
 
 echo "==> preserving user config"
 CONFIG_FILE="$CONFIG_DIR/config.toml"

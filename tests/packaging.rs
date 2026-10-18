@@ -213,6 +213,11 @@ fn install_script_runs() {
             .is_file(),
         "icon must be installed"
     );
+    assert!(
+        home.join(".local/share/icons/hicolor/scalable/apps/nora.svg")
+            .is_file(),
+        "scalable icon must be installed"
+    );
     // No prior config: the example config is installed as a starting point.
     let config = home.join(".config/nora/config.toml");
     assert!(
@@ -413,6 +418,12 @@ fn uninstall_preserves_config() {
             .join(".local/share/icons/hicolor/128x128/apps/nora.png")
             .exists(),
         "icon must be removed"
+    );
+    assert!(
+        !home
+            .join(".local/share/icons/hicolor/scalable/apps/nora.svg")
+            .exists(),
+        "scalable icon must be removed"
     );
     assert_eq!(
         std::fs::read(&config).expect("uninstall must preserve the user config"),

@@ -21,6 +21,7 @@ update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
 
 echo "==> removing icon"
 rm -f "$PREFIX/share/icons/hicolor/128x128/apps/nora.png"
+rm -f "$PREFIX/share/icons/hicolor/scalable/apps/nora.svg"
 
 echo "==> preserving user config"
 if [ -f "$CONFIG_DIR/config.toml" ]; then

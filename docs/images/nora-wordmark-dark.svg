@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 136" width="520" height="136">
+  <title>nora</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c2133"/>
+      <stop offset="1" stop-color="#0c0f18"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.22" cy="0.18" r="0.85">
+      <stop offset="0" stop-color="#4cc9f0" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#8b5cf6" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="aurora" x1="50" y1="80" x2="212" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5ef2b5"/>
+      <stop offset="0.5" stop-color="#4cc9f0"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="dot" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5ef2b5"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(4 4) scale(0.5)">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#glow)"/>
+    <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="2"/>
+    <path d="M58 86 L104 128 L58 170" fill="none" stroke="url(#aurora)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="118" y="152" width="38" height="20" rx="10" fill="url(#aurora)"/>
+    <rect x="164" y="152" width="28" height="20" rx="10" fill="#8b5cf6" fill-opacity="0.42"/>
+    <rect x="200" y="152" width="20" height="20" rx="10" fill="#8b5cf6" fill-opacity="0.18"/>
+  </g>
+  <g transform="translate(176 36)" fill="none" stroke="#eef1f8" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M0 0 V64 M0 30 a28 28 0 0 1 56 0 V64"/>
+    <circle cx="122" cy="32" r="32"/>
+    <path d="M188 0 V64 M188 34 a30 30 0 0 1 30 -30"/>
+    <circle cx="280" cy="32" r="32"/>
+    <path d="M312 0 V64"/>
+  </g>
+</svg>
