@@ -30,7 +30,7 @@
 <br>
 
 <p align="center">
-  <img src="docs/images/screenshot.png" alt="nora with two panes: zsh with a dim inline suggestion completing &quot;cargo t&quot; to &quot;cargo test --workspace&quot;, and vim" width="900">
+  <img src="docs/images/screenshot.png" alt="nora with three panes in a pastel theme: an anime-style twilight scene with a sakura tree and a full moon, shown with kitten icat; zsh with a dim inline suggestion completing &quot;kitten i&quot; from history; and vim showing nora's suggestion code" width="900">
 </p>
 
 ## Why nora?
