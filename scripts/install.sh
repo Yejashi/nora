@@ -83,7 +83,27 @@ fi
 
 echo "==> installing desktop entry to $PREFIX/share/applications"
 mkdir -p "$PREFIX/share/applications"
-install -m 0644 resources/nora.desktop "$PREFIX/share/applications/nora.desktop"
+# Launchers (KDE, Walker, rofi, ...) run Exec with the session's PATH,
+# which often lacks ~/.local/bin: name the installed binary by its full
+# path. Exec quotes it as the desktop entry spec asks (`\`, `"`, `` ` ``
+# and `$` escaped inside the quotes, then `\` doubled as in any string
+# value, `%` doubled); TryExec hides the entry if the binary is removed.
+exec_path=$(printf '%s' "$BIN_DIR/nora" \
+    | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')
+tryexec_path=$(printf '%s' "$BIN_DIR/nora" | sed -e 's/\\/\\\\/g')
+desktop_tmp="$PREFIX/share/applications/.nora.desktop.$$"
+while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+        Exec=*)
+            printf 'TryExec=%s\n' "$tryexec_path"
+            printf 'Exec="%s"\n' "$exec_path"
+            ;;
+        TryExec=*) ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+done < resources/nora.desktop > "$desktop_tmp"
+chmod 0644 "$desktop_tmp"
+mv -f "$desktop_tmp" "$PREFIX/share/applications/nora.desktop"
 update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
 
 echo "==> installing icon to $PREFIX/share/icons"

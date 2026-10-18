@@ -183,11 +183,31 @@ fn install_script_runs() {
         has_tic,
         "a compiled terminfo entry is installed exactly when tic exists"
     );
+    let desktop = home.join(".local/share/applications/nora.desktop");
+    assert!(desktop.is_file(), "desktop entry must be installed");
+    // Launchers run Exec with the session's PATH, which often lacks
+    // ~/.local/bin: the installed entry names the binary by its path.
+    let entry = std::fs::read_to_string(&desktop).expect("read the installed entry");
+    let installed_path = installed.to_string_lossy().into_owned();
     assert!(
-        home.join(".local/share/applications/nora.desktop")
-            .is_file(),
-        "desktop entry must be installed"
+        entry
+            .lines()
+            .any(|line| line == format!("Exec=\"{installed_path}\"")),
+        "Exec must name the installed binary:\n{entry}"
     );
+    assert!(
+        entry
+            .lines()
+            .any(|line| line == format!("TryExec={installed_path}")),
+        "TryExec must name the installed binary:\n{entry}"
+    );
+    if let Ok(output) = Command::new("desktop-file-validate").arg(&desktop).output() {
+        assert!(
+            output.status.success(),
+            "desktop-file-validate rejected the installed entry:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
     assert!(
         home.join(".local/share/icons/hicolor/128x128/apps/nora.png")
             .is_file(),
