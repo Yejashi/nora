@@ -99,8 +99,9 @@ pub fn fit_snapshot(snap: &Snapshot, rows: usize, cols: usize) -> Snapshot {
 impl Scene {
     /// Add one pane's snapshot at grid origin (`col0`, `row0`). The
     /// snapshot's colors must already be a full table (palette overlay).
-    /// `frame_bg` is the color the frame is cleared to; a pane whose
-    /// default background differs is filled with its own. The cursor is
+    /// `frame_bg` is the color the frame is cleared to, its alpha the
+    /// `[window] opacity`; a pane whose default background differs is
+    /// filled with its own at that opacity. The cursor is
     /// drawn when `cursor` is `Some(window_focused)` (the active pane);
     /// an unfocused window shows it hollow.
     pub fn add_pane(
@@ -108,19 +109,19 @@ impl Scene {
         snap: &Snapshot,
         col0: u32,
         row0: u32,
-        frame_bg: [u8; 3],
+        frame_bg: [u8; 4],
         cursor: Option<bool>,
         layout: &TermLayout,
     ) {
         let bg = default_bg(snap);
         let pane_bg = [bg.r, bg.g, bg.b];
-        if pane_bg != frame_bg {
+        if pane_bg != frame_bg[..3] {
             for row in 0..snap.rows as u32 {
                 self.fills.push(CellFill {
                     row: row0 + row,
                     col: col0,
                     span: snap.cols as u16,
-                    color: [bg.r, bg.g, bg.b, 255],
+                    color: [bg.r, bg.g, bg.b, frame_bg[3]],
                     cursor: false,
                 });
             }
@@ -634,14 +635,14 @@ mod tests {
 
     /// A snapshot of `bytes` fed to a fresh engine, colors overlaid with the
     /// default palette as the app does. Returns it with the frame color.
-    fn pane(bytes: &[u8], rows: usize, cols: usize) -> (Snapshot, [u8; 3]) {
+    fn pane(bytes: &[u8], rows: usize, cols: usize) -> (Snapshot, [u8; 4]) {
         let mut engine = nora::engine::Engine::new(rows, cols);
         engine.feed(bytes);
         let mut snap = engine.snapshot();
         let palette = nora::render::palette::Palette::default();
         snap.colors = palette.overlay(&snap.colors);
         let bg = palette.background();
-        (snap, [bg.r, bg.g, bg.b])
+        (snap, [bg.r, bg.g, bg.b, 255])
     }
 
     const LAYOUT: TermLayout = TermLayout {
@@ -670,6 +671,36 @@ mod tests {
                 .unwrap()
                 .style
                 .strikethrough
+        );
+    }
+
+    /// `[window] opacity`: a pane whose default background differs from the
+    /// frame's is filled at the frame's alpha; an explicitly colored cell
+    /// stays opaque.
+    #[test]
+    fn translucent_frame_keeps_explicit_cell_colors_opaque() {
+        let (snap, frame_bg) = pane(b"\x1b[41mX\x1b[0m", 1, 4);
+        let mut scene = Scene::default();
+        scene.add_pane(&snap, 0, 0, [1, 2, 3, 128], None, &LAYOUT);
+        let pane_fill = scene.fills.iter().find(|f| f.span == 4).unwrap();
+        assert_eq!(
+            pane_fill.color,
+            [frame_bg[0], frame_bg[1], frame_bg[2], 128]
+        );
+        let red = scene.fills.iter().find(|f| f.span == 1).unwrap();
+        assert_eq!(red.color[3], 255);
+        let mut same = Scene::default();
+        same.add_pane(
+            &snap,
+            0,
+            0,
+            [frame_bg[0], frame_bg[1], frame_bg[2], 128],
+            None,
+            &LAYOUT,
+        );
+        assert!(
+            same.fills.iter().all(|f| f.span == 1),
+            "no pane fill when the bg matches"
         );
     }
 
@@ -728,8 +759,7 @@ mod tests {
         assert_eq!(block.len(), 1);
         assert_eq!((block[0].row, block[0].col, block[0].color), (0, 0, cursor));
         // A preedit over the cursor covers the block, as it did before.
-        let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
-        scene.add_preedit("a", 0, 0, 10, cursor, bg);
+        scene.add_preedit("a", 0, 0, 10, cursor, frame_bg);
         assert!(!scene.fills.iter().any(|f| f.cursor));
     }
 

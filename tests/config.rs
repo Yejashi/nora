@@ -524,6 +524,8 @@ fn classify_change_covers_every_section() {
     });
     new.window.columns = Some(100);
     new.window.lines = Some(30);
+    new.window.opacity = Some(0.8);
+    new.window.blur = Some(true);
     new.cursor.style = nora::config::CursorShape::Beam;
     new.autocomplete.enabled = Some(false);
 
@@ -533,6 +535,8 @@ fn classify_change_covers_every_section() {
         ("scrolling.multiplier", ConfigChange::Immediate),
         ("window.columns", ConfigChange::NewSession),
         ("window.lines", ConfigChange::NewSession),
+        ("window.opacity", ConfigChange::Immediate),
+        ("window.blur", ConfigChange::Immediate),
         ("colors.background", ConfigChange::Immediate),
         ("colors.selection_background", ConfigChange::Immediate),
         ("colors.normal", ConfigChange::Immediate),
@@ -627,6 +631,8 @@ multiplier = 5
 [window]
 columns = 100
 lines = 30
+opacity = 0.85
+blur = true
 
 [cursor]
 style = "beam"
@@ -649,6 +655,8 @@ action = "new_tab"
     assert_eq!(c.history(), 20_000, "[scrolling] beats [terminal]");
     assert_eq!(c.scroll_multiplier(), 5);
     assert_eq!(c.window_cells(), (100, 30));
+    assert_eq!((c.window_opacity(), c.window_blur()), (0.85, true));
+    assert_eq!(nora::config::NoraConfig::default().window_opacity(), 1.0);
     assert_eq!(c.cursor.style, nora::config::CursorShape::Beam);
     assert_eq!(c.colors.normal.red.as_deref(), Some("#aa0000"));
     assert_eq!(c.binding_entries().len(), 2);
@@ -666,10 +674,16 @@ action = "copy"
 
 [window]
 columns = 1
+opacity = 1.5
 "##;
     let err = nora::config::parse_config(text).expect_err("invalid config");
     let message = err.to_string();
-    for needle in ["colors.bright.blue", "unknown key 'nope'", "window.columns"] {
+    for needle in [
+        "colors.bright.blue",
+        "unknown key 'nope'",
+        "window.columns",
+        "window.opacity",
+    ] {
         assert!(message.contains(needle), "missing {needle:?} in: {message}");
     }
 }

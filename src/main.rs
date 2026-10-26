@@ -391,6 +391,10 @@ fn run_windowed(
             .create_window(
                 winit::window::WindowAttributes::default()
                     .with_title("nora")
+                    // Always an alpha-capable window (an X11 visual is fixed
+                    // at creation), so `[window] opacity` applies on reload.
+                    .with_transparent(true)
+                    .with_blur(config.window_blur())
                     .with_inner_size(winit::dpi::LogicalSize::new(
                         f64::from(columns) * f64::from(base.cell_w),
                         f64::from(lines) * f64::from(base.cell_h),

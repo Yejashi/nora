@@ -229,6 +229,19 @@ fn selection_color(config: &nora::config::NoraConfig) -> [u8; 4] {
         .map_or(graphics::SELECTION_BG, |c| [c.r, c.g, c.b, 255])
 }
 
+/// `[window] opacity` as the alpha byte of the default background.
+fn opacity_alpha(config: &nora::config::NoraConfig) -> u8 {
+    (config.window_opacity().clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Tell the platform whether the window is translucent (Wayland drops its
+/// opaque region; X11 fixed the visual at creation) and whether to blur
+/// behind it (KDE Wayland).
+fn apply_window_translucency(window: &Window, config: &nora::config::NoraConfig) {
+    window.set_transparent(opacity_alpha(config) < 255);
+    window.set_blur(config.window_blur());
+}
+
 /// Poll the config file's modification time once a second and send
 /// `AppEvent::ConfigChanged` when it changes (also when it first appears).
 fn watch_config(path: std::path::PathBuf, proxy: winit::event_loop::EventLoopProxy<AppEvent>) {
@@ -542,6 +555,8 @@ struct WinApp {
     scroll_acc: ScrollAccumulator,
     /// Selection highlight color.
     selection_color: [u8; 4],
+    /// Default-background opacity (`[window] opacity`) as an alpha byte.
+    bg_alpha: u8,
     /// A transient message on the bottom row (config reload result),
     /// cleared by the next key press.
     notice: Option<String>,
@@ -803,6 +818,7 @@ pub fn run_windowed(
         scroll_lines: i32::from(config.scroll_multiplier()),
         scroll_acc: ScrollAccumulator::default(),
         selection_color: selection_color(config),
+        bg_alpha: opacity_alpha(config),
         notice: None,
         config_state: config_state.clone(),
         last_motion_cell: None,
@@ -1293,6 +1309,10 @@ impl WinApp {
         self.bindings = Bindings::with_config(&config.binding_entries());
         self.scroll_lines = i32::from(config.scroll_multiplier());
         self.selection_color = selection_color(&config);
+        self.bg_alpha = opacity_alpha(&config);
+        if let Some(window) = self.window.as_ref() {
+            apply_window_translucency(window, &config);
+        }
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.set_selection_color(self.selection_color);
         }
@@ -2121,7 +2141,7 @@ impl WinApp {
                     Some(snap) => default_bg(snap),
                     None => self.palette.background(),
                 };
-                let frame_bg = [frame_bg.r, frame_bg.g, frame_bg.b];
+                let frame_bg = [frame_bg.r, frame_bg.g, frame_bg.b, self.bg_alpha];
                 // The selection belongs to the active pane; its cells are
                 // offset to its origin. (Search matches are marked with the
                 // selection by the pump, so no separate search cells.)
@@ -2198,7 +2218,7 @@ impl WinApp {
                     let (row, col) = (u32::from(y) + row as u32, u32::from(x) + col as u32);
                     let preedit = self.ime.preedit();
                     let mut covered = 1;
-                    let bg = [frame_bg[0], frame_bg[1], frame_bg[2], 255];
+                    let bg = frame_bg;
                     let right = u32::from(x) + u32::from(w);
                     if !preedit.is_empty() {
                         let fg = self.palette.foreground();
@@ -2275,7 +2295,7 @@ impl WinApp {
                     &mut frame,
                     fonts,
                     &scene.cells,
-                    [frame_bg[0], frame_bg[1], frame_bg[2], 255],
+                    frame_bg,
                     &scene.fills,
                     &scene.rects,
                     &selection_cells,
@@ -2478,10 +2498,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
             return;
         }
         println!(
-            "surface: {:?} at {:?}, scale {:.2}",
+            "surface: {:?} at {:?}, scale {:.2}, alpha {:?}",
             graphics.format(),
             window.inner_size(),
             window.scale_factor(),
+            graphics.alpha_mode(),
         );
         println!("fonts: cell {}x{}", fonts.cell_w, fonts.cell_h());
 
@@ -2491,6 +2512,13 @@ impl ApplicationHandler<AppEvent> for WinApp {
         self.full_fonts = Some(fonts.spawn_full_system(move || {
             let _ = proxy.send_event(AppEvent::FontsReady);
         }));
+        apply_window_translucency(&window, &self.config_state.current);
+        if self.bg_alpha < 255 && !graphics.transparent() {
+            eprintln!(
+                "nora: window.opacity: the surface only presents opaque frames ({:?}); the background stays opaque",
+                graphics.alpha_mode()
+            );
+        }
         graphics.set_selection_color(self.selection_color);
         // Live reload when the config file changes (or first appears at
         // the default location).

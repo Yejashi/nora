@@ -108,12 +108,18 @@ impl AnsiColors {
     }
 }
 
-/// `[window]`: initial size in cells.
+/// `[window]`: initial size in cells, background opacity and blur.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowConfig {
     pub columns: Option<u16>,
     pub lines: Option<u16>,
+    /// Opacity of the default background, 0.0 (clear) to 1.0 (opaque).
+    /// Text and explicitly colored cells stay opaque.
+    pub opacity: Option<f32>,
+    /// Ask the compositor to blur what shows through a translucent
+    /// background (KDE Wayland only).
+    pub blur: Option<bool>,
 }
 
 /// Default window size in cells.
@@ -302,6 +308,16 @@ impl NoraConfig {
         self.scrolling.multiplier.unwrap_or(3)
     }
 
+    /// Effective background opacity (`[window] opacity`, default 1.0).
+    pub fn window_opacity(&self) -> f32 {
+        self.window.opacity.unwrap_or(1.0)
+    }
+
+    /// Whether the compositor is asked to blur the background.
+    pub fn window_blur(&self) -> bool {
+        self.window.blur.unwrap_or(false)
+    }
+
     /// Effective initial window size in cells (columns, lines).
     pub fn window_cells(&self) -> (u16, u16) {
         (
@@ -392,6 +408,11 @@ impl NoraConfig {
             {
                 errors.push(format!("window.{name}: {v} must be between 2 and 1000"));
             }
+        }
+        if let Some(o) = self.window.opacity
+            && !(0.0..=1.0).contains(&o)
+        {
+            errors.push(format!("window.opacity: {o} must be between 0.0 and 1.0"));
         }
         let colors = &self.colors;
         for (name, value) in [
@@ -807,6 +828,12 @@ pub fn classify_change(old: &NoraConfig, new: &NoraConfig) -> Vec<(&'static str,
     }
     if old.window.lines != new.window.lines {
         changes.push(("window.lines", ConfigChange::NewSession));
+    }
+    if old.window.opacity != new.window.opacity {
+        changes.push(("window.opacity", ConfigChange::Immediate));
+    }
+    if old.window.blur != new.window.blur {
+        changes.push(("window.blur", ConfigChange::Immediate));
     }
 
     // Font settings.

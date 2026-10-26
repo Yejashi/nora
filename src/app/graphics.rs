@@ -24,12 +24,12 @@ use glyphon::{
 };
 use wgpu::{
     Adapter, BlendState, BufferDescriptor, BufferUsages, ColorTargetState, CommandEncoder,
-    CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor, DeviceLostReason,
-    FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    PipelineCompilationOptions, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
-    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, StoreOp, Surface, SurfaceTexture,
-    TextureAspect, TextureFormat, TextureView, TextureViewDescriptor, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexState,
+    CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture, DeviceDescriptor,
+    DeviceLostReason, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
+    Operations, PipelineCompilationOptions, PrimitiveState, RenderPassColorAttachment,
+    RenderPassDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, StoreOp,
+    Surface, SurfaceTexture, TextureAspect, TextureFormat, TextureView, TextureViewDescriptor,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState,
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
@@ -193,7 +193,13 @@ struct DecoVertex {
 /// Build the fill pipeline shared by cell backgrounds, the cursor, the
 /// selection/search highlights and underline/strikethrough lines: solid
 /// per-vertex-colored rectangles in the surface format, no blending.
-fn decoration_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+/// `premultiply` scales the color by its alpha for a premultiplied
+/// compositor (a translucent background fill, `[window] opacity`).
+fn decoration_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    premultiply: bool,
+) -> wgpu::RenderPipeline {
     let module = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("nora decoration shader"),
         source: ShaderSource::Wgsl(
@@ -208,6 +214,10 @@ struct VSOut {
 // color is decoded to linear first (glyphon does the same for text).
 override SRGB_TARGET: bool = false;
 
+// Set when the compositor expects premultiplied alpha: the color is scaled
+// by its alpha in sRGB space, before decoding, as the clear color is.
+override PREMULTIPLY: bool = false;
+
 fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         return c / 12.92;
@@ -219,15 +229,19 @@ fn srgb_to_linear(c: f32) -> f32 {
 fn vs_main(@location(0) pos: vec2f, @location(1) color: vec4f) -> VSOut {
     var out: VSOut;
     out.pos = vec4f(pos, 0.0, 1.0);
+    var rgb = color.rgb;
+    if PREMULTIPLY {
+        rgb = rgb * color.a;
+    }
     if SRGB_TARGET {
         out.color = vec4f(
-            srgb_to_linear(color.r),
-            srgb_to_linear(color.g),
-            srgb_to_linear(color.b),
+            srgb_to_linear(rgb.r),
+            srgb_to_linear(rgb.g),
+            srgb_to_linear(rgb.b),
             color.a,
         );
     } else {
-        out.color = color;
+        out.color = vec4f(rgb, color.a);
     }
     return out;
 }
@@ -246,7 +260,10 @@ fn fs_main(@location(0) color: vec4f) -> @location(0) vec4f {
             module: &module,
             entry_point: Some("vs_main"),
             compilation_options: PipelineCompilationOptions {
-                constants: &[("SRGB_TARGET", if format.is_srgb() { 1.0 } else { 0.0 })],
+                constants: &[
+                    ("SRGB_TARGET", if format.is_srgb() { 1.0 } else { 0.0 }),
+                    ("PREMULTIPLY", if premultiply { 1.0 } else { 0.0 }),
+                ],
                 ..PipelineCompilationOptions::default()
             },
             buffers: &[Some(VertexBufferLayout {
@@ -332,12 +349,46 @@ fn push_deco_rect(out: &mut Vec<DecoVertex>, line: &DecoLine, frame_w: f32, fram
     out.extend([v(a), v(b), v(d), v(a), v(d), v(e)]);
 }
 
+/// How the compositor reads the frame's alpha channel (`[window] opacity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlphaOutput {
+    /// Alpha is ignored: the window is opaque whatever is drawn.
+    Opaque,
+    /// Colors are premultiplied by alpha.
+    Premultiplied,
+    /// Straight colors; the compositor multiplies them by alpha.
+    Straight,
+}
+
+/// The composite alpha mode for the surface: premultiplied when offered
+/// (Wayland), else post-multiplied, else inherit (X11 ARGB visuals, which
+/// compositors read as premultiplied), else opaque. Every pass blends
+/// "over" onto the cleared frame, so an opaque background still writes
+/// alpha 1 everywhere and a non-opaque mode changes nothing until the
+/// background is made translucent.
+fn pick_alpha_mode(modes: &[CompositeAlphaMode]) -> (CompositeAlphaMode, AlphaOutput) {
+    use CompositeAlphaMode::*;
+    [
+        (PreMultiplied, AlphaOutput::Premultiplied),
+        (PostMultiplied, AlphaOutput::Straight),
+        (Inherit, AlphaOutput::Premultiplied),
+    ]
+    .into_iter()
+    .find(|(mode, _)| modes.contains(mode))
+    .unwrap_or((Opaque, AlphaOutput::Opaque))
+}
+
 /// The frame clear color for an sRGB-space RGBA background: decoded to
 /// linear when the target is an `*Srgb` format (the hardware re-encodes on
-/// write), passed through otherwise.
-fn clear_color(rgba: [u8; 4], srgb_target: bool) -> wgpu::Color {
+/// write), passed through otherwise. `premultiply` scales the color by its
+/// alpha first, in sRGB space, which is what a compositor blends in.
+fn clear_color(rgba: [u8; 4], srgb_target: bool, premultiply: bool) -> wgpu::Color {
+    let alpha = f64::from(rgba[3]) / 255.0;
     let channel = |v: u8| {
-        let c = f64::from(v) / 255.0;
+        let mut c = f64::from(v) / 255.0;
+        if premultiply {
+            c *= alpha;
+        }
         if !srgb_target {
             c
         } else if c <= 0.04045 {
@@ -350,7 +401,7 @@ fn clear_color(rgba: [u8; 4], srgb_target: bool) -> wgpu::Color {
         r: channel(rgba[0]),
         g: channel(rgba[1]),
         b: channel(rgba[2]),
-        a: f64::from(rgba[3]) / 255.0,
+        a: alpha,
     }
 }
 
@@ -464,6 +515,9 @@ pub struct Graphics {
     deco_pipeline: wgpu::RenderPipeline,
     /// Kitty graphics (ADR-014).
     image_renderer: super::images::ImageRenderer,
+    /// Negotiated composite alpha mode and how frames encode alpha for it.
+    alpha_mode: CompositeAlphaMode,
+    alpha: AlphaOutput,
     /// Selection highlight color (`[colors] selection_background`).
     selection_bg: [u8; 4],
 }
@@ -506,6 +560,7 @@ impl Graphics {
         let caps = surface.get_capabilities(&adapter);
         let format = pick_surface_format(&caps.formats)
             .ok_or("surface reports no usable texture formats")?;
+        let (alpha_mode, alpha) = pick_alpha_mode(&caps.alpha_modes);
 
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor::default())
@@ -519,7 +574,8 @@ impl Graphics {
         let (atlas, renderer) = text_pipeline(&device, &queue, &cache, format);
         let swash = SwashCache::new();
         let viewport = Viewport::new(&device, &cache);
-        let deco_pipeline = decoration_pipeline(&device, format);
+        let deco_pipeline =
+            decoration_pipeline(&device, format, alpha == AlphaOutput::Premultiplied);
         let image_renderer = super::images::ImageRenderer::new(&device, format);
 
         Ok(Self {
@@ -539,6 +595,8 @@ impl Graphics {
             glyph_cache: GlyphCache::new(),
             deco_pipeline,
             image_renderer,
+            alpha_mode,
+            alpha,
             selection_bg: SELECTION_BG,
         })
     }
@@ -552,6 +610,17 @@ impl Graphics {
     #[allow(dead_code)]
     pub fn configured_size(&self) -> Option<PhysicalSize<u32>> {
         self.configured_size
+    }
+
+    /// Whether the compositor honors the frame's alpha, so a translucent
+    /// background shows what is behind the window.
+    pub fn transparent(&self) -> bool {
+        self.alpha != AlphaOutput::Opaque
+    }
+
+    /// The negotiated composite alpha mode.
+    pub fn alpha_mode(&self) -> CompositeAlphaMode {
+        self.alpha_mode
     }
 
     /// Texture format in use, once configured.
@@ -601,6 +670,7 @@ impl Graphics {
         // Force the negotiated presentation format; the default
         // config may pick another supported one (e.g. Bgra on radv).
         config.format = self.format.unwrap_or(config.format);
+        config.alpha_mode = self.alpha_mode;
         self.surface.configure(&self.device, &config);
         self.viewport.update(
             &self.queue,
@@ -772,6 +842,7 @@ impl Graphics {
                     load: LoadOp::Clear(clear_color(
                         background,
                         self.format.is_some_and(|f| f.is_srgb()),
+                        self.alpha == AlphaOutput::Premultiplied,
                     )),
                     store: StoreOp::default(),
                 },
@@ -1112,6 +1183,45 @@ mod tests {
             Some(Rgb10a2Unorm)
         );
         assert_eq!(pick_surface_format(&[]), None);
+    }
+
+    /// Premultiplied alpha is preferred, then post-multiplied, then
+    /// inherit (X11 ARGB visuals); only an opaque-only surface is opaque.
+    #[test]
+    fn alpha_mode_prefers_premultiplied() {
+        use CompositeAlphaMode::*;
+        assert_eq!(
+            pick_alpha_mode(&[Opaque, PreMultiplied, PostMultiplied]),
+            (PreMultiplied, AlphaOutput::Premultiplied)
+        );
+        assert_eq!(
+            pick_alpha_mode(&[Opaque, PostMultiplied]),
+            (PostMultiplied, AlphaOutput::Straight)
+        );
+        assert_eq!(
+            pick_alpha_mode(&[Inherit, Opaque]),
+            (Inherit, AlphaOutput::Premultiplied)
+        );
+        assert_eq!(pick_alpha_mode(&[Opaque]), (Opaque, AlphaOutput::Opaque));
+        assert_eq!(pick_alpha_mode(&[]), (Opaque, AlphaOutput::Opaque));
+    }
+
+    /// A translucent clear color is premultiplied in sRGB space before it is
+    /// decoded; an opaque one is unchanged by premultiplying.
+    #[test]
+    fn clear_color_premultiplies_in_srgb_space() {
+        let opaque = clear_color([0x80, 0x40, 0x20, 255], true, false);
+        assert_eq!(opaque, clear_color([0x80, 0x40, 0x20, 255], true, true));
+        let half = clear_color([255, 255, 0, 128], false, true);
+        let a = 128.0 / 255.0;
+        assert!((half.r - a).abs() < 1e-9 && (half.g - a).abs() < 1e-9);
+        assert_eq!((half.b, half.a), (0.0, a));
+        // sRGB target: decode(0.5 * 1.0), not 0.5 * decode(1.0).
+        let srgb = clear_color([255, 0, 0, 128], true, true);
+        let expected = ((a + 0.055) / 1.055_f64).powf(2.4);
+        assert!((srgb.r - expected).abs() < 1e-9, "{} vs {expected}", srgb.r);
+        let straight = clear_color([255, 0, 0, 128], false, false);
+        assert_eq!((straight.r, straight.a), (1.0, a));
     }
 
     /// Glyph colors are decoded to linear only for an sRGB target.

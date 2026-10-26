@@ -11,10 +11,10 @@
 #
 # What applies when:
 #   immediately       colors, cursor, key bindings, scrolling.multiplier,
-#                     autocomplete
+#                     autocomplete, window.opacity, window.blur
 #   immediately       font (fonts reload and every pane is resized)
 #   new panes/tabs    scrolling.history
-#   at startup        window
+#   at startup        window.columns, window.lines
 
 [font]
 # A fontconfig family name, e.g. "JetBrains Mono" or "FiraCode Nerd Font
@@ -59,6 +59,13 @@ size = 15.0
 # Initial size in cells (2..=1000).
 columns = 80
 lines = 24
+# Opacity of the default background (0.0..=1.0): the desktop shows through
+# it, while text and cells with an explicit background color stay opaque.
+# Needs a compositor; without one the window stays opaque.
+opacity = 1.0
+# Blur what shows through a translucent background. KDE Plasma on Wayland
+# only; other desktops ignore it.
+blur = false
 
 [cursor]
 # "block", "beam" or "underline": the shape until an application sets one.

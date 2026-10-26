@@ -269,7 +269,7 @@ action = "split_right"
 | --- | --- |
 | `[font]` | `family` (any fontconfig family), `size` (points, 4 to 200, default 15) |
 | `[colors]` | `foreground`, `background`, `cursor`, `selection_background`; `[colors.normal]` and `[colors.bright]` for the 16 ANSI colors |
-| `[window]` | `columns`, `lines`: the initial size in cells |
+| `[window]` | `columns`, `lines`: the initial size in cells; `opacity` (0.0 to 1.0, default 1.0): the default background's opacity, text and colored cells stay opaque; `blur`: blur what shows through (KDE Wayland) |
 | `[cursor]` | `style`: `block`, `beam` or `underline` |
 | `[scrolling]` | `history` (lines, default 10,000), `multiplier` (lines per wheel step) |
 | `[autocomplete]` | `enabled` (default `true`) |
