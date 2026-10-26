@@ -57,6 +57,9 @@ pub struct TabBar<'a> {
     /// One title per tab, in order; empty for a tab without one.
     pub titles: &'a [String],
     pub active: usize,
+    /// Where the active tab's background and accent are drawn, in tabs:
+    /// `active` at rest, a fraction while sliding there ([`TabSlide`]).
+    pub indicator: f32,
     /// The tab under the mouse pointer.
     pub hovered: Option<usize>,
     pub colors: TabColors,
@@ -80,6 +83,40 @@ pub fn tab_at(count: usize, cols: u32, col: u32) -> Option<usize> {
     }
     let index = (col / width) as usize;
     (index < count && (index as u32 + 1) * width <= cols).then_some(index)
+}
+
+/// How long the active tab takes to slide to a newly active one.
+pub const TAB_SLIDE: std::time::Duration = std::time::Duration::from_millis(150);
+/// The shortest time between two frames of the slide (at most ~120 fps,
+/// whether or not presentation waits for vblank).
+pub const TAB_SLIDE_FRAME: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// The active tab's background and accent sliding from where they were
+/// drawn to the newly active tab, easing out over [`TAB_SLIDE`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabSlide {
+    from: f32,
+    /// The tab it slides to.
+    pub to: usize,
+    start: std::time::Instant,
+}
+
+impl TabSlide {
+    pub fn new(from: f32, to: usize, start: std::time::Instant) -> Self {
+        Self { from, to, start }
+    }
+
+    /// The indicator position (in tabs) at `now`, and whether it is still
+    /// moving.
+    pub fn position(&self, now: std::time::Instant) -> (f32, bool) {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / TAB_SLIDE.as_secs_f32();
+        if t >= 1.0 {
+            return (self.to as f32, false);
+        }
+        // Ease-out cubic: quick to leave, gentle to arrive.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        (self.from + (self.to as f32 - self.from) * eased, true)
+    }
 }
 
 /// A tab label within `room` cells: the number, two spaces, then the title
@@ -369,7 +406,8 @@ impl Scene {
                 });
             }
         }
-        let x = (bar.active as u32 * width) as f32 * cw;
+        // The indicator may sit between tabs while it slides (TabSlide).
+        let x = bar.indicator.clamp(0.0, (count - 1) as f32) * width as f32 * cw;
         let w = width as f32 * cw;
         self.backdrops.push(PixelRect {
             x,
@@ -691,6 +729,7 @@ mod tests {
         let bar = TabBar {
             titles: &titles,
             active,
+            indicator: active as f32,
             hovered,
             colors: COLORS,
         };
@@ -777,6 +816,52 @@ mod tests {
         assert_eq!(tab_at(0, 40, 0), None);
     }
 
+    /// The slide starts where the indicator was, eases out (past the
+    /// halfway mark at half time), never overshoots, and rests on the
+    /// target once the duration is over.
+    #[test]
+    fn tab_slide_eases_to_the_target() {
+        let start = std::time::Instant::now();
+        let slide = TabSlide::new(0.0, 2, start);
+        assert_eq!(slide.position(start), (0.0, true));
+        let (half, moving) = slide.position(start + TAB_SLIDE / 2);
+        assert!(moving && half > 1.0 && half < 2.0, "{half}");
+        let mut last = 0.0;
+        for ms in 0..=150 {
+            let (pos, _) = slide.position(start + std::time::Duration::from_millis(ms));
+            assert!(pos >= last && pos <= 2.0, "{pos} after {last}");
+            last = pos;
+        }
+        assert_eq!(slide.position(start + TAB_SLIDE), (2.0, false));
+        let back = TabSlide::new(2.5, 0, start);
+        let (pos, _) = back.position(start + TAB_SLIDE / 3);
+        assert!(pos < 2.5 && pos > 0.0);
+    }
+
+    /// Mid-slide, the active tab's background and accent sit between tabs
+    /// while the labels already show the new active tab.
+    #[test]
+    fn tab_bar_draws_a_sliding_indicator() {
+        let titles = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut scene = Scene::default();
+        let bar = TabBar {
+            titles: &titles,
+            active: 2,
+            indicator: 1.5,
+            hovered: None,
+            colors: COLORS,
+        };
+        scene.add_tab_bar(&bar, 60, &LAYOUT);
+        let active = scene
+            .backdrops
+            .iter()
+            .find(|r| r.color == COLORS.bg)
+            .unwrap();
+        assert_eq!((active.x, active.w), (300.0, 200.0));
+        let label = scene.cells.iter().find(|c| c.text.as_str() == "c").unwrap();
+        assert!(label.style.bold);
+    }
+
     /// Titles are cut by display width with an ellipsis; without room for
     /// a title the number stands alone.
     #[test]
@@ -822,6 +907,7 @@ mod tests {
         let bar = TabBar {
             titles: &titles,
             active: 0,
+            indicator: 0.0,
             hovered: None,
             colors: translucent,
         };

@@ -560,6 +560,12 @@ struct WinApp {
     bg_alpha: u8,
     /// The tab under the mouse pointer, while it is over the tab bar.
     hovered_tab: Option<usize>,
+    /// The active tab and where its indicator was last drawn (in tabs),
+    /// and the slide under way to a newly active tab.
+    tab_indicator: Option<(usize, f32)>,
+    tab_slide: Option<scene::TabSlide>,
+    /// When the sliding indicator's next frame is due.
+    slide_frame_at: Option<Instant>,
     /// A transient message on the bottom row (config reload result),
     /// cleared by the next key press.
     notice: Option<String>,
@@ -823,6 +829,9 @@ pub fn run_windowed(
         selection_color: selection_color(config),
         bg_alpha: opacity_alpha(config),
         hovered_tab: None,
+        tab_indicator: None,
+        tab_slide: None,
+        slide_frame_at: None,
         notice: None,
         config_state: config_state.clone(),
         last_motion_cell: None,
@@ -2221,10 +2230,27 @@ impl WinApp {
                         })
                         .collect();
                     let index = tabs.iter().position(|t| *t == active.tab).unwrap_or(0);
+                    // A new active tab starts a slide from wherever the
+                    // indicator was last drawn, mid-slide included.
+                    let now = std::time::Instant::now();
+                    if let Some((last, at)) = self.tab_indicator
+                        && last != index
+                    {
+                        self.tab_slide = Some(scene::TabSlide::new(at, index, now));
+                    }
+                    let (indicator, moving) = match self.tab_slide.filter(|s| s.to == index) {
+                        Some(slide) => slide.position(now),
+                        None => (index as f32, false),
+                    };
+                    if !moving {
+                        self.tab_slide = None;
+                    }
+                    self.tab_indicator = Some((index, indicator));
                     let opaque = |c: alacritty_terminal::vte::ansi::Rgb| [c.r, c.g, c.b, 255];
                     let tab_bar = TabBar {
                         titles: &titles,
                         active: index,
+                        indicator,
                         hovered: self.hovered_tab,
                         colors: TabColors {
                             bg: frame_bg,
@@ -2234,6 +2260,9 @@ impl WinApp {
                         },
                     };
                     scene.add_tab_bar(&tab_bar, u32::from(grid_cols), &layout);
+                } else {
+                    self.tab_indicator = None;
+                    self.tab_slide = None;
                 }
                 // IME composition: the preedit is drawn at the active pane's
                 // cursor, and the input method is told where that is so its
@@ -2335,6 +2364,9 @@ impl WinApp {
                 let t_drawn = std::time::Instant::now();
                 let allocs_drawn = nora::trace::thread_allocations();
                 graphics.present(frame);
+                // A sliding tab indicator draws its next step, paced (see
+                // `about_to_wait`); idle stays at zero frames once it rests.
+                self.slide_frame_at = self.tab_slide.map(|_| t_start + scene::TAB_SLIDE_FRAME);
                 if self.frames == 0 {
                     nora::trace::stage("first frame presented");
                 }
@@ -2566,11 +2598,25 @@ impl ApplicationHandler<AppEvent> for WinApp {
 
     /// A clipboard read that never answers is abandoned at its deadline
     /// (input held behind it goes out), not only at the next key: the
-    /// loop wakes then while a read is in flight.
+    /// loop wakes then while a read is in flight. A sliding tab indicator
+    /// asks for its next frame here, no sooner than its pace allows.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let actions = self.paste_gate.poll(Instant::now());
+        let now = Instant::now();
+        let actions = self.paste_gate.poll(now);
         self.run_paste_actions(actions);
-        event_loop.set_control_flow(match self.paste_gate.deadline() {
+        if let Some(at) = self.slide_frame_at
+            && at <= now
+        {
+            self.slide_frame_at = None;
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+        let deadline = [self.paste_gate.deadline(), self.slide_frame_at]
+            .into_iter()
+            .flatten()
+            .min();
+        event_loop.set_control_flow(match deadline {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
             None => ControlFlow::Wait,
         });
