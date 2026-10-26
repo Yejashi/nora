@@ -28,17 +28,100 @@ pub struct PixelRect {
 pub struct Scene {
     pub cells: Vec<DrawCell>,
     pub fills: Vec<CellFill>,
+    /// Pixel rectangles over everything else (separators, cursor outlines).
     pub rects: Vec<PixelRect>,
+    /// Pixel rectangles under the text, after the cell fills (the tab bar).
+    pub backdrops: Vec<PixelRect>,
     /// Kitty graphics placements (ADR-014), lowest z first per pane.
     pub images: Vec<super::images::ImageDraw>,
 }
 
-/// Separator and inactive-tab colors.
+/// Pane separator color.
 const SEPARATOR: [u8; 4] = [0x55, 0x55, 0x55, 255];
-const TAB_BAR_BG: [u8; 4] = [0x26, 0x26, 0x26, 255];
-const TAB_FG: [u8; 4] = [0xb0, 0xb0, 0xb0, 255];
-const TAB_ACTIVE_BG: [u8; 4] = [0x44, 0x66, 0x88, 255];
-const TAB_ACTIVE_FG: [u8; 4] = [0xff, 0xff, 0xff, 255];
+/// Search bar text color.
+const BAR_FG: [u8; 4] = [0xff, 0xff, 0xff, 255];
+/// The widest a tab grows, in cells.
+const TAB_MAX_COLS: u32 = 28;
+
+/// The tab bar's colors, from the theme: the terminal background (its
+/// alpha the `[window] opacity`), the foreground and an accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabColors {
+    pub bg: [u8; 4],
+    pub fg: [u8; 4],
+    pub accent: [u8; 4],
+}
+
+/// What the tab bar shows.
+pub struct TabBar<'a> {
+    /// One title per tab, in order; empty for a tab without one.
+    pub titles: &'a [String],
+    pub active: usize,
+    /// The tab under the mouse pointer.
+    pub hovered: Option<usize>,
+    pub colors: TabColors,
+}
+
+/// Each tab's width in cells: the bar shared out evenly, at most
+/// [`TAB_MAX_COLS`], at least one cell; 0 with no tabs or no columns. Tabs
+/// start at column 0, so tab `i` covers `i * width` up to the next one.
+pub fn tab_width(count: usize, cols: u32) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    (cols / count as u32).clamp(1, TAB_MAX_COLS).min(cols)
+}
+
+/// The tab at grid column `col` of the tab bar, if any.
+pub fn tab_at(count: usize, cols: u32, col: u32) -> Option<usize> {
+    let width = tab_width(count, cols);
+    if width == 0 || col >= cols {
+        return None;
+    }
+    let index = (col / width) as usize;
+    (index < count && (index as u32 + 1) * width <= cols).then_some(index)
+}
+
+/// A tab label within `room` cells: the number, two spaces, then the title
+/// cut with an ellipsis when it does not fit. The number alone when there
+/// is no title or no room for one.
+fn tab_label(number: &str, title: &str, room: u32) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let title = title.trim();
+    let left = room.saturating_sub(number.len() as u32 + 2);
+    if title.is_empty() || left < 2 {
+        return number.to_string();
+    }
+    let mut label = format!("{number}  ");
+    let total: u32 = title.chars().map(|c| c.width().unwrap_or(0) as u32).sum();
+    if total <= left {
+        label.push_str(title);
+        return label;
+    }
+    let mut used = 0;
+    for c in title.chars() {
+        let w = c.width().unwrap_or(0) as u32;
+        if used + w + 1 > left {
+            break;
+        }
+        label.push(c);
+        used += w;
+    }
+    label.truncate(label.trim_end().len());
+    label.push('…');
+    label
+}
+
+/// `a` moved `t` of the way to `b` (RGB); `a`'s alpha is kept.
+fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    [
+        channel(a[0], b[0]),
+        channel(a[1], b[1]),
+        channel(a[2], b[2]),
+        a[3],
+    ]
+}
 
 /// `snap` cut or padded to `rows` x `cols`: the stand-in drawn for a pane
 /// whose latest snapshot predates a resize until the pump sends one at the
@@ -233,44 +316,104 @@ impl Scene {
         }
     }
 
-    /// The tab bar on grid row 0: one label per tab, the active one
-    /// highlighted, the rest of the row in the bar color.
-    pub fn add_tab_bar(&mut self, labels: &[String], active: usize, cols: u32) {
+    /// The tab bar on grid row 0, `cols` wide: equal tabs ([`tab_width`])
+    /// on a strip tinted from the theme. The active tab takes the terminal
+    /// background, so it reads as joined to the pane below, with an accent
+    /// line along its top; the others are dimmed, the hovered one lifted.
+    /// Labels are the tab number and title, centered and cut with an
+    /// ellipsis.
+    pub fn add_tab_bar(&mut self, bar: &TabBar, cols: u32, layout: &TermLayout) {
+        let count = bar.titles.len();
+        let width = tab_width(count, cols);
+        if width == 0 {
+            return;
+        }
+        let TabColors { bg, fg, accent } = bar.colors;
+        let opaque = |c: [u8; 4]| [c[0], c[1], c[2], 255];
+        let (cw, ch) = (layout.cell_w, layout.cell_h);
+        let strip = mix(bg, fg, 0.07);
         self.fills.push(CellFill {
             row: 0,
             col: 0,
             span: cols.min(u32::from(u16::MAX)) as u16,
-            color: TAB_BAR_BG,
+            color: strip,
             cursor: false,
         });
-        let mut col = 0u32;
-        for (index, label) in labels.iter().enumerate() {
-            let (fg, bg) = if index == active {
-                (TAB_ACTIVE_FG, TAB_ACTIVE_BG)
-            } else {
-                (TAB_FG, TAB_BAR_BG)
-            };
-            let (glyphs, width) = layout_line(&format!(" {} ", label), cols.saturating_sub(col));
-            if width == 0 {
-                break;
-            }
+        if let Some(hovered) = bar.hovered.filter(|&h| h != bar.active && h < count) {
             self.fills.push(CellFill {
                 row: 0,
-                col,
+                col: hovered as u32 * width,
                 span: width as u16,
-                color: bg,
+                color: mix(bg, fg, 0.13),
                 cursor: false,
             });
-            for (at, ch, w) in glyphs {
+        }
+        // Under the text, in order: the strip's bottom border, hairlines
+        // between quiet tabs, then the active tab covering both.
+        self.backdrops.push(PixelRect {
+            x: 0.0,
+            y: ch - 1.0,
+            w: cols as f32 * cw,
+            h: 1.0,
+            color: mix(bg, fg, 0.16),
+        });
+        let quiet = |i: usize| i != bar.active && Some(i) != bar.hovered;
+        for i in 1..count.min((cols / width) as usize) {
+            if quiet(i - 1) && quiet(i) {
+                self.backdrops.push(PixelRect {
+                    x: (i as u32 * width) as f32 * cw,
+                    y: (ch * 0.28).round(),
+                    w: 1.0,
+                    h: (ch * 0.44).round(),
+                    color: mix(bg, fg, 0.22),
+                });
+            }
+        }
+        let x = (bar.active as u32 * width) as f32 * cw;
+        let w = width as f32 * cw;
+        self.backdrops.push(PixelRect {
+            x,
+            y: 0.0,
+            w,
+            h: ch,
+            color: bg,
+        });
+        self.backdrops.push(PixelRect {
+            x,
+            y: 0.0,
+            w,
+            h: (ch / 12.0).round().max(2.0),
+            color: opaque(accent),
+        });
+        for (index, title) in bar.titles.iter().enumerate() {
+            let start = index as u32 * width;
+            if start + width > cols {
+                break;
+            }
+            let (number_fg, title_fg, cell_bg) = if index == bar.active {
+                (accent, fg, bg)
+            } else if Some(index) == bar.hovered {
+                (mix(fg, bg, 0.45), mix(fg, bg, 0.15), mix(bg, fg, 0.13))
+            } else {
+                (mix(fg, bg, 0.6), mix(fg, bg, 0.4), strip)
+            };
+            let number = (index + 1).to_string();
+            // One cell of padding on each side.
+            let room = width.saturating_sub(2);
+            let label = tab_label(&number, title, room);
+            let (glyphs, used) = layout_line(&label, room);
+            let left = start + 1 + (room - used) / 2;
+            for (at, c, w) in glyphs {
+                let in_number = (at as usize) < number.len();
+                let color = if in_number { number_fg } else { title_fg };
                 self.cells.push(DrawCell {
                     row: 0,
-                    col: col + at,
-                    text: ch.into(),
-                    style: tab_style(fg, bg, index == active),
+                    col: left + at,
+                    text: c.into(),
+                    style: tab_style(opaque(color), cell_bg, index == bar.active),
                     width: w,
                 });
             }
-            col += width + 1;
         }
     }
 
@@ -318,6 +461,8 @@ impl Scene {
         self.cells.retain(|cell| cell.row != row);
         self.fills.retain(|fill| fill.row != row);
         let (top, bottom) = (row as f32 * cell_h, (row + 1) as f32 * cell_h);
+        self.backdrops
+            .retain(|rect| rect.y + rect.h <= top || rect.y >= bottom);
         self.rects.retain_mut(|rect| {
             if rect.y >= top && rect.y < bottom {
                 return false;
@@ -343,7 +488,7 @@ impl Scene {
                 row,
                 col,
                 text: ch.into(),
-                style: tab_style(TAB_ACTIVE_FG, SEARCH_BAR_BG, false),
+                style: tab_style(BAR_FG, SEARCH_BAR_BG, false),
                 width,
             });
         }
@@ -534,22 +679,69 @@ mod tests {
         assert_eq!(fit_snapshot(&snap, 1, 1).cursor, None, "cursor cut off");
     }
 
+    const COLORS: TabColors = TabColors {
+        bg: [0x10, 0x10, 0x10, 255],
+        fg: [0xf0, 0xf0, 0xf0, 255],
+        accent: [0x40, 0x80, 0xff, 255],
+    };
+
+    fn tab_bar(titles: &[&str], active: usize, hovered: Option<usize>, cols: u32) -> Scene {
+        let titles: Vec<String> = titles.iter().map(|t| t.to_string()).collect();
+        let mut scene = Scene::default();
+        let bar = TabBar {
+            titles: &titles,
+            active,
+            hovered,
+            colors: COLORS,
+        };
+        scene.add_tab_bar(&bar, cols, &LAYOUT);
+        scene
+    }
+
+    /// Equal tabs: labels centered in each, the active tab drawn in the
+    /// terminal background with an accent line on top, its number in the
+    /// accent and its title bold.
     #[test]
     fn tab_bar_labels_and_highlight() {
-        let mut scene = Scene::default();
-        scene.add_tab_bar(&["1".to_string(), "2 vim".to_string()], 1, 40);
-        let text: String = scene.cells.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(text, "12vim");
-        let active_fill = scene.fills.iter().find(|f| f.color == TAB_ACTIVE_BG);
-        assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((4, 7)));
+        let scene = tab_bar(&["", "vim"], 1, None, 40);
+        let placed: Vec<(u32, &str)> = scene
+            .cells
+            .iter()
+            .map(|c| (c.col, c.text.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(9, "1"), (27, "2"), (30, "v"), (31, "i"), (32, "m")]
+        );
+        let active = scene
+            .backdrops
+            .iter()
+            .find(|r| r.color == COLORS.bg)
+            .unwrap();
+        assert_eq!((active.x, active.w, active.h), (200.0, 200.0, 20.0));
+        let accent = scene
+            .backdrops
+            .iter()
+            .find(|r| r.color == COLORS.accent)
+            .unwrap();
+        assert_eq!((accent.x, accent.y, accent.h), (200.0, 0.0, 2.0));
+        let number = scene.cells.iter().find(|c| c.col == 27).unwrap();
+        assert_eq!(number.style.fg, COLORS.accent);
+        assert!(
+            scene
+                .cells
+                .iter()
+                .filter(|c| c.col >= 27)
+                .all(|c| c.style.bold)
+        );
+        assert!(!scene.cells[0].style.bold);
     }
 
     /// Wide characters take two columns in tab labels and the search bar,
     /// and one that would cross the edge is left out.
     #[test]
     fn bars_lay_out_by_display_width() {
-        let mut scene = Scene::default();
-        scene.add_tab_bar(&["1 日本".to_string(), "2".to_string()], 0, 40);
+        let scene = tab_bar(&["日本", ""], 0, None, 40);
         let placed: Vec<(u32, &str, u16)> = scene
             .cells
             .iter()
@@ -557,15 +749,85 @@ mod tests {
             .collect();
         assert_eq!(
             placed,
-            vec![(1, "1", 1), (3, "日", 2), (5, "本", 2), (10, "2", 1)]
+            vec![(6, "1", 1), (9, "日", 2), (11, "本", 2), (29, "2", 1)]
         );
-        let active_fill = scene.fills.iter().find(|f| f.color == TAB_ACTIVE_BG);
-        assert_eq!(active_fill.map(|f| (f.col, f.span)), Some((0, 8)));
 
         let mut bar = Scene::default();
         bar.add_search_bar("a日本", 5, 4, 10.0);
         let placed: Vec<(u32, u16)> = bar.cells.iter().map(|c| (c.col, c.width)).collect();
         assert_eq!(placed, vec![(0, 1), (1, 2)]);
+    }
+
+    /// Tabs share the bar evenly up to a cap; a click maps back to the tab
+    /// drawn there, and the leftover columns belong to no tab.
+    #[test]
+    fn tab_geometry_and_hit_testing() {
+        assert_eq!(tab_width(0, 80), 0);
+        assert_eq!(tab_width(2, 80), 28, "capped");
+        assert_eq!(tab_width(3, 40), 13);
+        assert_eq!(tab_width(50, 40), 1, "at least one cell");
+        assert_eq!(tab_width(1, 0), 0);
+        assert_eq!(tab_at(2, 80, 0), Some(0));
+        assert_eq!(tab_at(2, 80, 28), Some(1));
+        assert_eq!(tab_at(2, 80, 55), Some(1));
+        assert_eq!(tab_at(2, 80, 56), None, "past the last tab");
+        assert_eq!(tab_at(3, 40, 39), None, "the leftover column");
+        assert_eq!(tab_at(50, 40, 39), Some(39));
+        assert_eq!(tab_at(50, 40, 40), None);
+        assert_eq!(tab_at(0, 40, 0), None);
+    }
+
+    /// Titles are cut by display width with an ellipsis; without room for
+    /// a title the number stands alone.
+    #[test]
+    fn tab_labels_fit_their_room() {
+        assert_eq!(tab_label("1", "vim", 18), "1  vim");
+        assert_eq!(tab_label("1", "a very long title here", 10), "1  a very…");
+        assert_eq!(tab_label("1", "日本語", 7), "1  日…");
+        assert_eq!(tab_label("12", "  ", 18), "12");
+        assert_eq!(tab_label("1", "vim", 4), "1");
+    }
+
+    /// The hovered tab is lifted; hairlines separate only quiet neighbours;
+    /// the strip keeps the background's alpha while text stays opaque.
+    #[test]
+    fn tab_bar_hover_separators_and_opacity() {
+        let scene = tab_bar(&["a", "b", "c", "d"], 0, Some(2), 80);
+        let hover = mix(COLORS.bg, COLORS.fg, 0.13);
+        let lifted = scene.fills.iter().find(|f| f.color == hover).unwrap();
+        assert_eq!((lifted.col, lifted.span), (40, 20));
+        let hairlines: Vec<f32> = scene
+            .backdrops
+            .iter()
+            .filter(|r| r.w == 1.0)
+            .map(|r| r.x)
+            .collect();
+        assert!(
+            hairlines.is_empty(),
+            "every gap touches the active or hovered tab"
+        );
+        let scene = tab_bar(&["a", "b", "c", "d"], 0, None, 80);
+        let hairlines: Vec<f32> = scene
+            .backdrops
+            .iter()
+            .filter(|r| r.w == 1.0)
+            .map(|r| r.x)
+            .collect();
+        assert_eq!(hairlines, vec![400.0, 600.0]);
+
+        let mut translucent = COLORS;
+        translucent.bg[3] = 128;
+        let titles = vec!["a".to_string(), "b".to_string()];
+        let mut scene = Scene::default();
+        let bar = TabBar {
+            titles: &titles,
+            active: 0,
+            hovered: None,
+            colors: translucent,
+        };
+        scene.add_tab_bar(&bar, 40, &LAYOUT);
+        assert_eq!(scene.fills[0].color[3], 128, "the strip");
+        assert!(scene.cells.iter().all(|c| c.style.fg[3] == 255));
     }
 
     #[test]
@@ -575,7 +837,7 @@ mod tests {
             row: 3,
             col: 0,
             text: "x".into(),
-            style: tab_style(TAB_FG, TAB_BAR_BG, false),
+            style: tab_style(BAR_FG, SEARCH_BAR_BG, false),
             width: 1,
         });
         let rect = |y, h| PixelRect {

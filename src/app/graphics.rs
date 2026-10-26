@@ -754,6 +754,7 @@ impl Graphics {
         background: [u8; 4],
         fills: &[CellFill],
         rects: &[super::scene::PixelRect],
+        backdrops: &[super::scene::PixelRect],
         selection_cells: &[(u32, u32)],
         search_cells: &[(u32, u32)],
         images: &[super::images::ImageDraw],
@@ -876,6 +877,19 @@ impl Graphics {
                     y: y0,
                     thickness: cell_h,
                     color: fill.color,
+                };
+                push_deco_rect(&mut out, &line, size.width as f32, size.height as f32);
+            }
+            // Pixel backdrops (the tab bar) after the cell fills, in order.
+            for r in backdrops.iter().filter(|_| !cursor) {
+                let line = DecoLine {
+                    x0: r.x,
+                    x1: r.x + r.w,
+                    top: r.y,
+                    bottom: r.y + r.h,
+                    y: r.y,
+                    thickness: r.h,
+                    color: r.color,
                 };
                 push_deco_rect(&mut out, &line, size.width as f32, size.height as f32);
             }

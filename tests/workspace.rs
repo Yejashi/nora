@@ -189,6 +189,10 @@ fn workspace_tab_shortcuts() {
     // Ctrl+Shift+Tab (Prev): step to the previous tab, wrapping from t1 to t2.
     assert_eq!(ws.apply_tab_command(TabCommand::Prev), Some(t2));
     assert_eq!(ws.active_tab(), Some(t2));
+    // A tab bar click (Goto): the tab at that index; out of range is a no-op.
+    assert_eq!(ws.apply_tab_command(TabCommand::Goto(0)), Some(t1));
+    assert_eq!(ws.apply_tab_command(TabCommand::Goto(5)), Some(t1));
+    assert_eq!(ws.apply_tab_command(TabCommand::Goto(1)), Some(t2));
     // Ctrl+W (Close): close the active tab (t2); active falls back to t1.
     assert_eq!(ws.apply_tab_command(TabCommand::Close), Some(t1));
     assert_eq!(ws.active_tab(), Some(t1));

@@ -89,8 +89,8 @@ Open **Nora** from your application launcher, or run `nora`.
   <tr>
     <td valign="top">
       <h4>Tabs, splits and search</h4>
-      A tab bar once there is more than one tab, panes split right or
-      below, and search across 10,000 lines of scrollback.
+      A themed tab bar once there is more than one tab (click to
+      switch), panes split right or below, and search across 10,000 lines of scrollback.
     </td>
     <td valign="top">
       <h4>Images and video</h4>
@@ -211,7 +211,7 @@ program it ran.
 | Action | Keys |
 | --- | --- |
 | Copy / paste | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd> / <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd> |
-| New tab / next / previous | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd> / <kbd>Ctrl</kbd><kbd>PgDn</kbd> / <kbd>Ctrl</kbd><kbd>PgUp</kbd> |
+| New tab / next / previous | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd> / <kbd>Ctrl</kbd><kbd>PgDn</kbd> / <kbd>Ctrl</kbd><kbd>PgUp</kbd>, or click a tab |
 | Split right / below | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Enter</kbd> / <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>\\</kbd> |
 | Focus a pane | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Arrow</kbd>, or click it |
 | Close pane | <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd> |

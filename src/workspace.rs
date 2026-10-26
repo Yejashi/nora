@@ -40,6 +40,9 @@ pub enum TabCommand {
     Next,
     /// Ctrl+Shift+Tab: switch to the previous tab (wrapping).
     Prev,
+    /// A click on the tab bar: switch to the tab at this index (in
+    /// [`Workspace::tabs`] order); out of range leaves focus unchanged.
+    Goto(usize),
 }
 
 /// A coalescing snapshot slot (N23b).
@@ -226,6 +229,12 @@ impl Workspace {
             }
             TabCommand::Next => self.step_tab(1),
             TabCommand::Prev => self.step_tab(-1),
+            TabCommand::Goto(index) => {
+                if let Some(&tab) = self.tabs.get(index) {
+                    self.active_tab = Some(tab);
+                }
+                self.active_tab
+            }
         }
     }
 

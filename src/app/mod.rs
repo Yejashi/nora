@@ -29,7 +29,7 @@ use winit::{
 };
 
 use self::graphics::Graphics;
-use self::scene::Scene;
+use self::scene::{Scene, TabBar, TabColors};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use nora::clipboard::{ClipboardBackend, ClipboardKind, clipboard_kind, create_clipboard};
@@ -433,6 +433,7 @@ impl ApplicationHandler for App {
                     &[],
                     &[],
                     &[],
+                    &[],
                 ) {
                     eprintln!("smoke: live frame draw failed: {message}");
                 }
@@ -557,6 +558,8 @@ struct WinApp {
     selection_color: [u8; 4],
     /// Default-background opacity (`[window] opacity`) as an alpha byte.
     bg_alpha: u8,
+    /// The tab under the mouse pointer, while it is over the tab bar.
+    hovered_tab: Option<usize>,
     /// A transient message on the bottom row (config reload result),
     /// cleared by the next key press.
     notice: Option<String>,
@@ -819,6 +822,7 @@ pub fn run_windowed(
         scroll_acc: ScrollAccumulator::default(),
         selection_color: selection_color(config),
         bg_alpha: opacity_alpha(config),
+        hovered_tab: None,
         notice: None,
         config_state: config_state.clone(),
         last_motion_cell: None,
@@ -1137,8 +1141,12 @@ impl WinApp {
                     }
                 }
             }
-            nora::workspace::TabCommand::Next | nora::workspace::TabCommand::Prev => {
-                if let Some(tab) = new_active {
+            nora::workspace::TabCommand::Next
+            | nora::workspace::TabCommand::Prev
+            | nora::workspace::TabCommand::Goto(_) => {
+                if let Some(tab) = new_active
+                    && Some(tab) != prev_active
+                {
                     if let (Some(prev), Some(prev_pane)) = (prev_active, prev_active_pane) {
                         self.save_active_pane(prev_pane);
                         self.tab_layouts.insert(prev, self.layout.clone());
@@ -1982,6 +1990,19 @@ impl WinApp {
             .then(|| (usize::from(row - py), usize::from(col - px)))
     }
 
+    /// The tab drawn at physical pixel (`x`, `y`) when the tab bar is shown
+    /// (more than one tab) and the point is on it.
+    fn tab_bar_hit(&self, window: &Window, x: f64, y: f64) -> Option<usize> {
+        let count = self.workspace.tab_count();
+        let fonts = self.fonts.as_ref()?;
+        if count < 2 || x < 0.0 || y < 0.0 || y >= f64::from(fonts.cell_h()) {
+            return None;
+        }
+        let (cols, _) = window_grid(window, fonts);
+        let col = (x / f64::from(fonts.cell_w)) as u32;
+        scene::tab_at(count, u32::from(cols), col)
+    }
+
     /// Encode one mouse event against the engine's live mouse mode and
     /// the current window grid, and send the bytes to the PTY (N16b).
     /// No-op when Shift is held (the event belongs to local selection),
@@ -2186,28 +2207,33 @@ impl WinApp {
                 }
                 if bar == 1 {
                     let tabs = self.workspace.tabs().to_vec();
-                    let labels: Vec<String> = tabs
+                    let titles: Vec<String> = tabs
                         .iter()
-                        .enumerate()
-                        .map(|(i, tab)| {
+                        .map(|tab| {
                             let pane = if *tab == active.tab {
                                 Some(active.pane)
                             } else {
                                 self.tab_layouts.get(tab).map(|l| l.active_pane())
                             };
-                            let title = pane.and_then(|pane| {
-                                self.pane_titles.get(&PaneKey { tab: *tab, pane })
-                            });
-                            match title {
-                                Some(t) => {
-                                    format!("{} {}", i + 1, t.chars().take(24).collect::<String>())
-                                }
-                                None => format!("{}", i + 1),
-                            }
+                            pane.and_then(|pane| self.pane_titles.get(&PaneKey { tab: *tab, pane }))
+                                .cloned()
+                                .unwrap_or_default()
                         })
                         .collect();
                     let index = tabs.iter().position(|t| *t == active.tab).unwrap_or(0);
-                    scene.add_tab_bar(&labels, index, u32::from(grid_cols));
+                    let opaque = |c: alacritty_terminal::vte::ansi::Rgb| [c.r, c.g, c.b, 255];
+                    let tab_bar = TabBar {
+                        titles: &titles,
+                        active: index,
+                        hovered: self.hovered_tab,
+                        colors: TabColors {
+                            bg: frame_bg,
+                            fg: opaque(self.palette.foreground()),
+                            // Bright blue: the theme's own accent.
+                            accent: opaque(self.palette.get(12)),
+                        },
+                    };
+                    scene.add_tab_bar(&tab_bar, u32::from(grid_cols), &layout);
                 }
                 // IME composition: the preedit is drawn at the active pane's
                 // cursor, and the input method is told where that is so its
@@ -2298,6 +2324,7 @@ impl WinApp {
                     frame_bg,
                     &scene.fills,
                     &scene.rects,
+                    &scene.backdrops,
                     &selection_cells,
                     &search_cells,
                     &scene.images,
@@ -2999,6 +3026,11 @@ impl ApplicationHandler<AppEvent> for WinApp {
                 // Physical pixels, like the cell metrics and the grid.
                 let (x, y) = (position.x, position.y);
                 self.cursor = (x, y);
+                let hovered = self.tab_bar_hit(&window, x, y);
+                if hovered != self.hovered_tab {
+                    self.hovered_tab = hovered;
+                    window.request_redraw();
+                }
                 if let Some((start_row, start_col)) = self.selection
                     && self.pressed_buttons.contains(&0)
                     && let Some((end_row, end_col)) = self.grid_cell_at(&window, x, y)
@@ -3046,7 +3078,24 @@ impl ApplicationHandler<AppEvent> for WinApp {
                     );
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                if self.hovered_tab.take().is_some() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::MouseInput { button, state, .. } => {
+                // A left press on the tab bar switches to that tab and goes
+                // no further (no selection, nothing reported to the pane).
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.pressed_buttons.is_empty()
+                    && self.mouse_grab.is_none()
+                    && let Some(index) = self.tab_bar_hit(&window, self.cursor.0, self.cursor.1)
+                {
+                    self.on_tab_command(nora::workspace::TabCommand::Goto(index));
+                    window.request_redraw();
+                    return;
+                }
                 // A press in another pane of the visible tab focuses it
                 // first; the click then belongs to that pane. Not while
                 // another button is held or a press holds the grab: the
